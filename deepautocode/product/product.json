@@ -1,0 +1,45 @@
+{
+  "nameShort": "DeepAutoCode",
+  "nameLong": "DeepAutoCode AI IDE",
+  "applicationName": "deepautocode",
+  "dataFolderName": ".deepautocode",
+  "win32MutexName": "deepautocode",
+  "licenseName": "MIT",
+  "licenseUrl": "https://github.com/deepautocode/deepautocode/blob/main/LICENSE",
+  "serverApplicationName": "deepautocode-server",
+  "serverDataFolderName": ".deepautocode-server",
+  "darwinBundleIdentifier": "org.deepautocode.ide",
+  "linuxIconName": "deepautocode",
+  "win32DirName": "DeepAutoCode",
+  "win32NameVersion": "DeepAutoCode",
+  "win32RegValueName": "DeepAutoCode",
+  "win32AppUserModelId": "DeepAutoCode.IDE",
+  "win32ShellNameShort": "DeepAutoCode",
+  "urlProtocol": "deepautocode",
+  "Version": "1.1.0",
+  "codeOssBaselineVersion": "1.95.0",
+  "clineSdkLockedVersion": "0.2.0",
+  "defaultProvider": "deepseek",
+  "extensionsGallery": {
+    "serviceUrl": "https://open-vsx.org/vscode/gallery",
+    "itemUrl": "https://open-vsx.org/vscode/item",
+    "resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
+    "controlUrl": "",
+    "nlsBaseUrl": ""
+  },
+  "builtInExtensions": [
+    {
+      "name": "deepautocode.deepautocode-ai",
+      "version": "1.1.0",
+      "repo": "https://github.com/deepautocode/deepautocode",
+      "metadata": {
+        "id": "deepautocode-ai",
+        "publisherDisplayName": "DeepAutoCode"
+      }
+    }
+  ],
+  "extensionAllowedProposedApi": [
+    "deepautocode.deepautocode-ai"
+  ]
+}
+

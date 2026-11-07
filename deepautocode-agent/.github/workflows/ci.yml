@@ -1,0 +1,32 @@
+name: OPS-AG-001 Agent CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: Install Exact Locked Dependencies
+        run: npm ci
+      - name: Verify @cline/sdk Exact Version Lock (No floating latest)
+        run: node -e "const pkg=require('./package.json'); if(pkg.dependencies['@cline/sdk']!=='0.2.0') process.exit(1);"
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+      - name: Phase 0 PoC Verification (PoC-L1 & PoC-L2)
+        run: npm run test:poc
+      - name: Provider Smoke Test (DeepSeek & OpenAI-Compatible)
+        run: npm run test:smoke
+      - name: Unit & Integration Tests
+        run: npm test
+

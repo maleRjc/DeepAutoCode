@@ -1,0 +1,36 @@
+{
+  "name": "deepautocode",
+  "version": "1.1.0",
+  "description": "DeepAutoCode Open-Source AI IDE (Code - OSS Workbench + Cline SDK Runtime Bridge)",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build:webview": "vite build --config webview/vite.config.ts",
+    "build:host": "tsc -p tsconfig.json",
+    "build": "npm run build:webview && npm run build:host",
+    "dev:workbench": "tsx src/workbench-server/server.ts",
+    "desktop": "tsx src/desktop/main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "verify:brand": "node scripts/verify-brand-assets.mjs"
+  },
+  "dependencies": {
+    "@deepautocode/agent": "file:../deepautocode-agent",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "ws": "8.18.0",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.6",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@types/ws": "8.5.13",
+    "@vitejs/plugin-react": "4.3.3",
+    "electron": "32.2.0",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "vite": "5.4.10",
+    "vitest": "2.1.5"
+  }
+}

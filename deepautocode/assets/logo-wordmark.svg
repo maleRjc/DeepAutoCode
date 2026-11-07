@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 160" width="640" height="160" fill="none" role="img" aria-label="DeepAutoCode">
+  <title>DeepAutoCode</title>
+  <defs>
+    <linearGradient id="lg-bg" x1="16" y1="8" x2="144" y2="152" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#16233F"/>
+      <stop offset="52%" stop-color="#0A1122"/>
+      <stop offset="100%" stop-color="#04060D"/>
+    </linearGradient>
+    <linearGradient id="lg-rim" x1="40" y1="8" x2="120" y2="152" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7DD3FC" stop-opacity="0.70"/>
+      <stop offset="45%" stop-color="#3B82F6" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0.50"/>
+    </linearGradient>
+    <linearGradient id="lg-cyan" x1="28" y1="52" x2="132" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00F5FF"/>
+      <stop offset="50%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#2563EB"/>
+    </linearGradient>
+    <linearGradient id="lg-violet" x1="47" y1="62" x2="113" y2="98" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="50%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+    <radialGradient id="lg-core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#E0F2FE" stop-opacity="1"/>
+      <stop offset="35%" stop-color="#00F0FF" stop-opacity="0.85"/>
+      <stop offset="75%" stop-color="#3B82F6" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#3B82F6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="lg-word" x1="168" y1="60" x2="470" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8FAFC"/>
+      <stop offset="100%" stop-color="#CBD5E1"/>
+    </linearGradient>
+    <linearGradient id="lg-accent" x1="470" y1="60" x2="620" y2="100" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#A78BFA"/>
+    </linearGradient>
+    <filter id="lg-glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#00E5FF" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Mark: squircle badge (scaled 512 -> 160 box) -->
+  <g transform="translate(8 8) scale(0.28125)">
+    <rect x="28" y="28" width="456" height="456" rx="108" fill="url(#lg-bg)" stroke="url(#lg-rim)" stroke-width="8"/>
+    <rect x="44" y="44" width="424" height="424" rx="94" stroke="#93C5FD" stroke-opacity="0.12" stroke-width="2"/>
+    <g filter="url(#lg-glow)">
+      <path d="M188 164 L96 256 L188 348" stroke="url(#lg-cyan)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M324 164 L416 256 L324 348" stroke="url(#lg-cyan)" stroke-width="24" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M196 196 C228 196, 284 316, 316 316 C348 316, 368 288, 368 256 C368 224, 348 196, 316 196 C284 196, 228 316, 196 316 C164 316, 144 288, 144 256 C144 224, 164 196, 196 196 Z"
+            stroke="url(#lg-violet)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <circle cx="256" cy="256" r="56" fill="url(#lg-core)"/>
+    <path d="M256 172 L267 245 L340 256 L267 267 L256 340 L245 267 L172 256 L245 245 Z" fill="#E0F2FE"/>
+    <circle cx="256" cy="256" r="14" fill="#FFFFFF"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="176" y="86" font-family="'Segoe UI', 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="46" font-weight="700" letter-spacing="-1.2">
+    <tspan fill="url(#lg-word)">Deep</tspan><tspan fill="url(#lg-accent)">Auto</tspan><tspan fill="url(#lg-word)">Code</tspan>
+  </text>
+  <text x="178" y="116" font-family="'Segoe UI', 'Inter', 'Helvetica Neue', Arial, sans-serif" font-size="15" font-weight="500" letter-spacing="3.4" fill="#7DD3FC" fill-opacity="0.85">AI NATIVE IDE</text>
+</svg>

@@ -1,0 +1,51 @@
+{
+  "name": "deepautocode-ai",
+  "displayName": "DeepAutoCode AI Agent",
+  "description": "Built-in DeepAutoCode AI Agent Extension Host Bridge (Cline SDK v0.2.0 Integration)",
+  "version": "1.1.0",
+  "publisher": "deepautocode",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:deepautocode.aiPanel"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "deepautocode-sidebar",
+          "title": "DeepAutoCode AI",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "views": {
+      "deepautocode-sidebar": [
+        {
+          "type": "webview",
+          "id": "deepautocode.aiPanel",
+          "name": "AI Agent"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "deepautocode.newSession",
+        "title": "DeepAutoCode: New AI Session"
+      },
+      {
+        "command": "deepautocode.openSettings",
+        "title": "DeepAutoCode: Configure Model Provider"
+      },
+      {
+        "command": "deepautocode.exportDiagnostics",
+        "title": "DeepAutoCode: Export Redacted Diagnostics"
+      }
+    ]
+  }
+}
