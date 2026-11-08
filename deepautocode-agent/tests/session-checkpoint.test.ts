@@ -59,7 +59,7 @@ describe('SessionCheckpoint + model routing locks', () => {
       selfHealCount: 2,
       routingMode: 'force-fast',
     });
-    expect(fast.effectiveModelId).toBe('deepseek-chat');
+    expect(fast.effectiveModelId).toBe('deepseek-flash');
 
     const reasoner = resolveTieredModelForTurn({
       configuredModelId: 'deepseek-auto',
@@ -69,6 +69,6 @@ describe('SessionCheckpoint + model routing locks', () => {
       selfHealCount: 0,
       routingMode: 'force-reasoner',
     });
-    expect(reasoner.effectiveModelId).toBe('deepseek-reasoner');
+    expect(reasoner.effectiveModelId).toBe('deepseek-v4-pro');
   });
 });

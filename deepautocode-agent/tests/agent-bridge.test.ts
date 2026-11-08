@@ -122,7 +122,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       title: 'Write & Diff Test',
       workspaceRoot: workspaceDir,
       providerId: 'deepseek',
-      modelId: 'deepseek-chat',
+      modelId: 'deepseek-flash',
       executionMode: 'manual',
     });
 
@@ -245,7 +245,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
     const pm = new ProviderManager();
     const active = await pm.getActiveProviderWithKeyStatus();
     expect(active.provider.providerId).toBe('deepseek');
-    expect(active.model.modelId).toBe('deepseek-chat');
+    expect(active.model.modelId).toBe('deepseek-flash');
 
     const smoke = await pm.runSmokeTest({
       providerId: 'openai-compatible',
@@ -336,7 +336,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       await bridge.providerManager.configureProvider({
         providerId: 'deepseek',
         apiEndpoint: mockEndpoint,
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         apiKey: 'sk-test-cline-sdk-key',
       });
 
@@ -344,7 +344,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         title: 'Cline SDK Agent Test',
         workspaceRoot: workspaceDir,
         providerId: 'deepseek',
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         executionMode: 'auto',
       });
 
@@ -524,7 +524,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       await bridge.providerManager.configureProvider({
         providerId: 'deepseek',
         apiEndpoint: mockEndpoint,
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         apiKey: 'sk-test-antigravity-engine',
       });
 
@@ -532,7 +532,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         title: 'Antigravity Engine Test',
         workspaceRoot: workspaceDir,
         providerId: 'deepseek',
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         executionMode: 'auto',
       });
 
@@ -650,7 +650,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       await bridge.providerManager.configureProvider({
         providerId: 'deepseek',
         apiEndpoint: mockEndpoint,
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         apiKey: 'sk-test-dedup-engine',
       });
 
@@ -658,7 +658,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         title: 'Dedup & Persistent Nudge Test',
         workspaceRoot: workspaceDir,
         providerId: 'deepseek',
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         executionMode: 'auto',
       });
 
@@ -764,7 +764,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       await bridge.providerManager.configureProvider({
         providerId: 'deepseek',
         apiEndpoint: mockEndpoint,
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         apiKey: 'sk-test-r1-engine',
       });
 
@@ -772,7 +772,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         title: 'DeepSeek R1 Test',
         workspaceRoot: workspaceDir,
         providerId: 'deepseek',
-        modelId: 'deepseek-chat',
+        modelId: 'deepseek-flash',
         executionMode: 'auto',
       });
 
@@ -785,7 +785,9 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       });
 
       expect(llmCalls).toBe(2);
-      expect(turn2RequestBody.model).toBe('deepseek-reasoner');
+      expect(turn2RequestBody.model).toBe('deepseek-v4-pro');
+      expect(turn2RequestBody.thinking).toEqual({ type: 'enabled' });
+      expect(turn2RequestBody.reasoning_effort).toBe('high');
       expect(turn2RequestBody.temperature).toBeUndefined();
       const assistantToolMsg = turn2RequestBody.messages.find(
         (m: any) => m.role === 'assistant' && Array.isArray(m.tool_calls)
@@ -859,12 +861,12 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       hasReadFiles: false,
       hasEditedFiles: false,
     });
-    expect(turn1Discovery.effectiveModelId).toBe('deepseek-chat');
+    expect(turn1Discovery.effectiveModelId).toBe('deepseek-flash');
     expect(turn1Discovery.tier).toBe('fast-tool');
 
     // Phase 2: Turn 2 root-cause diagnosis once source files are read into context -> automatically promotes to deepseek-reasoner
     const turn2Diagnosis = resolveTieredModelForTurn({
-      configuredModelId: 'deepseek-chat',
+      configuredModelId: 'deepseek-flash',
       providerId: 'deepseek',
       userPrompt: 'sendrecv_perf -b 4 -e 32 -f 2 还是不对，分析一下根因',
       turnIndex: 2,
@@ -872,12 +874,12 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       hasReadFiles: true,
       hasEditedFiles: false,
     });
-    expect(turn2Diagnosis.effectiveModelId).toBe('deepseek-reasoner');
+    expect(turn2Diagnosis.effectiveModelId).toBe('deepseek-v4-pro');
     expect(turn2Diagnosis.tier).toBe('deep-reasoner');
 
     // Phase 3: Turn 3 post-edit compilation & test verification -> automatically uses fast deepseek-chat
     const turn3Verify = resolveTieredModelForTurn({
-      configuredModelId: 'deepseek-reasoner',
+      configuredModelId: 'deepseek-v4-pro',
       providerId: 'deepseek',
       userPrompt: 'sendrecv_perf -b 4 -e 32 -f 2 还是不对，分析一下根因',
       turnIndex: 3,
@@ -886,12 +888,12 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       hasEditedFiles: true,
       hasBuildOrTestFailure: false,
     });
-    expect(turn3Verify.effectiveModelId).toBe('deepseek-chat');
+    expect(turn3Verify.effectiveModelId).toBe('deepseek-flash');
     expect(turn3Verify.tier).toBe('fast-tool');
 
     // Phase 4: Self-heal turn when build or test fails -> automatically promotes to deepseek-reasoner
     const turn4SelfHeal = resolveTieredModelForTurn({
-      configuredModelId: 'deepseek-chat',
+      configuredModelId: 'deepseek-flash',
       providerId: 'deepseek',
       userPrompt: '修复编译问题',
       turnIndex: 4,
@@ -900,7 +902,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
       hasEditedFiles: true,
       hasBuildOrTestFailure: true,
     });
-    expect(turn4SelfHeal.effectiveModelId).toBe('deepseek-reasoner');
+    expect(turn4SelfHeal.effectiveModelId).toBe('deepseek-v4-pro');
     expect(turn4SelfHeal.tier).toBe('deep-reasoner');
 
     // Smart Intent Classifier: distinguishes query-only vs auto-action
@@ -1009,14 +1011,14 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         await bridge.providerManager.configureProvider({
           providerId: 'deepseek',
           apiEndpoint: `http://127.0.0.1:${llmPort}/v1`,
-          modelId: 'deepseek-chat',
+          modelId: 'deepseek-flash',
           apiKey: 'sk-test-browser-key',
         });
         const created = await bridge.sessionBridge.createSession({
           title: 'Browser Action Test',
           workspaceRoot: workspaceDir,
           providerId: 'deepseek',
-          modelId: 'deepseek-chat',
+          modelId: 'deepseek-flash',
           executionMode: 'auto',
         });
         const assistantMsg = await bridge.sessionBridge.sendPrompt({

@@ -28,7 +28,8 @@ describe('ContextCompaction', () => {
       tokenBudget: 100_000,
       tokensUsed: 90_000,
     });
-    expect(critical.reason).toBe('critical-context-pressure');
+    expect(critical.reason).toMatch(/critical-(?:provider-token-|context-)pressure/);
+    expect(critical.trigger).toBe('provider_tokens');
     expect(critical.keepRecentMessages).toBe(2);
     expect(estimateTokensFromChars(400)).toBe(100);
   });

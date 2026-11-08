@@ -12,11 +12,19 @@ export interface CompactionPlan {
   minCharsToSummarize: number;
   /** Soft max length of a summary */
   summaryMaxChars: number;
+  /** Soft per-tool result cap before summarization (chars) */
+  perToolMaxChars: number;
   /** Estimated tool-result tokens in the conversation */
   estimatedToolTokens: number;
   /** 0-1 fill ratio when a budget is known; otherwise based on soft caps */
   fillRatio: number;
+  /** True when fillRatio crosses the 80% warning threshold */
+  warnBudget: boolean;
   reason: string;
+  /** Ladder stage for Trace / UI */
+  stage: 'none' | 'moderate' | 'high' | 'critical';
+  /** What primarily drove the fill ratio this turn */
+  trigger: 'none' | 'provider_tokens' | 'tool_chars' | 'hybrid';
 }
 
 export interface ResolveCompactionPlanParams {
@@ -44,15 +52,36 @@ export function resolveCompactionPlan(params: ResolveCompactionPlanParams): Comp
   const used = Math.max(0, params.tokensUsed || 0);
 
   let fillRatio = 0;
+  let providerRatio = 0;
+  let toolRatio = 0;
   if (budget) {
-    fillRatio = Math.min(1, Math.max(used / budget, estimatedToolTokens / Math.max(budget * 0.6, 1)));
+    providerRatio = used / budget;
+    toolRatio = estimatedToolTokens / Math.max(budget * 0.6, 1);
+    fillRatio = Math.min(1, Math.max(providerRatio, toolRatio));
   } else {
     // Soft ladders without an explicit budget
     if (toolChars >= 140_000) fillRatio = 0.95;
     else if (toolChars >= 80_000) fillRatio = 0.75;
     else if (toolChars >= 36_000) fillRatio = 0.55;
     else fillRatio = toolChars / 36_000;
+    toolRatio = fillRatio;
   }
+
+  const warnBudget = fillRatio >= 0.8;
+  const trigger: CompactionPlan['trigger'] =
+    fillRatio < 0.45 && toolChars < 36_000
+      ? 'none'
+      : budget && providerRatio >= 0.45 && providerRatio >= toolRatio * 0.95
+        ? toolRatio >= 0.45
+          ? 'hybrid'
+          : 'provider_tokens'
+        : toolRatio >= 0.45 || toolChars >= 36_000
+          ? budget && providerRatio >= 0.45
+            ? 'hybrid'
+            : 'tool_chars'
+          : budget && providerRatio >= 0.45
+            ? 'provider_tokens'
+            : 'none';
 
   if (fillRatio < 0.45 && toolChars < 36_000) {
     return {
@@ -60,9 +89,13 @@ export function resolveCompactionPlan(params: ResolveCompactionPlanParams): Comp
       keepRecentMessages: 4,
       minCharsToSummarize: 1600,
       summaryMaxChars: 1800,
+      perToolMaxChars: 12_000,
       estimatedToolTokens,
       fillRatio,
+      warnBudget,
       reason: 'below-compaction-threshold',
+      stage: 'none',
+      trigger,
     };
   }
 
@@ -72,9 +105,16 @@ export function resolveCompactionPlan(params: ResolveCompactionPlanParams): Comp
       keepRecentMessages: 2,
       minCharsToSummarize: 400,
       summaryMaxChars: 900,
+      perToolMaxChars: 2_500,
       estimatedToolTokens,
       fillRatio,
-      reason: 'critical-context-pressure',
+      warnBudget,
+      reason:
+        trigger === 'provider_tokens'
+          ? 'critical-provider-token-pressure'
+          : 'critical-context-pressure',
+      stage: 'critical',
+      trigger,
     };
   }
   if (fillRatio >= 0.65 || toolChars >= 80_000) {
@@ -83,9 +123,16 @@ export function resolveCompactionPlan(params: ResolveCompactionPlanParams): Comp
       keepRecentMessages: 3,
       minCharsToSummarize: 800,
       summaryMaxChars: 1200,
+      perToolMaxChars: 4_000,
       estimatedToolTokens,
       fillRatio,
-      reason: 'high-context-pressure',
+      warnBudget,
+      reason:
+        trigger === 'provider_tokens'
+          ? 'high-provider-token-pressure'
+          : 'high-context-pressure',
+      stage: 'high',
+      trigger,
     };
   }
   return {
@@ -93,8 +140,15 @@ export function resolveCompactionPlan(params: ResolveCompactionPlanParams): Comp
     keepRecentMessages: 4,
     minCharsToSummarize: 1600,
     summaryMaxChars: 1800,
+    perToolMaxChars: 8_000,
     estimatedToolTokens,
     fillRatio,
-    reason: 'moderate-context-pressure',
+    warnBudget,
+    reason:
+      trigger === 'provider_tokens'
+        ? 'moderate-provider-token-pressure'
+        : 'moderate-context-pressure',
+    stage: 'moderate',
+    trigger,
   };
 }

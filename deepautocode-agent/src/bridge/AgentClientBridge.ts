@@ -480,6 +480,46 @@ export class AgentClientBridge {
         });
       }
 
+      case 'trace.get': {
+        return this.sessionBridge.getTrace({
+          taskId: typeof payload.taskId === 'string' ? payload.taskId : undefined,
+          sessionId:
+            (typeof payload.sessionId === 'string' ? payload.sessionId : undefined) ||
+            sessionId ||
+            undefined,
+        });
+      }
+
+      case 'trace.list': {
+        const limit =
+          typeof payload.limit === 'number' && Number.isFinite(payload.limit)
+            ? payload.limit
+            : 20;
+        return this.sessionBridge.listTraces(limit);
+      }
+
+      case 'completion.fim': {
+        const { completeDeepSeekFim, DEEPSEEK_FLASH } = await import('../core/index.js');
+        const apiKey = await this.providerManager.resolveApiKey();
+        if (!apiKey) {
+          return { ok: false, text: '', model: DEEPSEEK_FLASH, error: 'missing_api_key' };
+        }
+        const prompt = String(payload.prompt ?? payload.prefix ?? '');
+        const suffix = String(payload.suffix ?? '');
+        if (!prompt.trim()) {
+          return { ok: false, text: '', model: DEEPSEEK_FLASH, error: 'empty_prompt' };
+        }
+        return completeDeepSeekFim({
+          apiKey,
+          prompt: prompt.slice(-4000),
+          suffix: suffix.slice(0, 1500),
+          model: DEEPSEEK_FLASH,
+          maxTokens: Math.max(16, Math.min(256, Number(payload.maxTokens ?? 128))),
+          temperature: 0,
+          timeoutMs: 8_000,
+        });
+      }
+
       default:
         throw new Error(`UNKNOWN_REQUEST_TYPE: "${type}"`);
     }

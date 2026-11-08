@@ -270,6 +270,12 @@ export class CapabilityRegistry {
       const cwd = ctx.canonicalPath ?? ctx.workspaceRoot;
       const cmdText = String(input.command ?? '').trim();
 
+      // Plan/readonly: block mutating shells (Cline CommandGuard). Defense in depth vs policy gate.
+      if (ctx.executionMode === 'plan' && cmdText) {
+        const { assertCommandAllowedInPlanMode } = await import('../core/CommandGuard.js');
+        assertCommandAllowedInPlanMode(cmdText);
+      }
+
       // Safety Guard: Never allow indiscriminate killing of all node/electron/tsx processes,
       // which would terminate the DeepAutoCode IDE backend itself.
       const killsIdeProcessPattern =
@@ -434,6 +440,47 @@ export class CapabilityRegistry {
   }
 
   /**
+   * Explicit user approval for AgentLoop `ask` policies / hard RULE_ASK hits
+   * without executing a capability.
+   */
+  async requestUserApproval(input: {
+    sessionId: string;
+    toolName: string;
+    summary: string;
+    risk?: RiskLevel;
+    targetPath?: string;
+    command?: string;
+    arguments?: Record<string, unknown>;
+  }): Promise<{ approved: boolean; approvalId?: string; reason?: string }> {
+    if (!this.approvalHandler) {
+      return { approved: false, reason: 'No approval handler registered' };
+    }
+    const tool = String(input.toolName || '').toLowerCase();
+    const capability: CapabilityName = /run|shell|build|test|command/.test(tool)
+      ? 'run-build'
+      : /read|outline|list|search|explore|open/.test(tool)
+        ? 'read-file'
+        : 'write-file';
+    const decision = await this.approvalHandler({
+      sessionId: input.sessionId,
+      capability,
+      summary: input.summary || `Approve tool '${input.toolName}'`,
+      risk: input.risk || 'high',
+      targetPath: input.targetPath,
+      command: input.command,
+      arguments: sanitizeObjectForLog({
+        ...(input.arguments ?? {}),
+        _requestedTool: input.toolName,
+      }),
+    });
+    return {
+      approved: decision.approved,
+      approvalId: decision.approvalId,
+      reason: decision.reason,
+    };
+  }
+
+  /**
    * Section 9.3: Validated, Authorized, Audited Capability Invocation
    */
   async invoke<TOutput = unknown>(
@@ -505,6 +552,8 @@ export class CapabilityRegistry {
       command: input.command,
       targetPath: pathTarget,
       workspaceRoot: context.workspaceRoot,
+      permissionRuleset: context.permissionRuleset,
+      args: input as Record<string, unknown>,
     });
 
     if (!policy.allowedToProceed) {
@@ -531,9 +580,15 @@ export class CapabilityRegistry {
         sessionId: context.sessionId,
         capability: name,
         summary:
-          name === 'run-build'
-            ? `Run command: ${input.command}`
-            : `Modify file: ${input.filePath}`,
+          policy.ruleEffect === 'ask'
+            ? `Rule requires approval (${policy.ruleSource || 'workspace rule'}): ${
+                name === 'run-build'
+                  ? `Run command: ${input.command}`
+                  : `Modify file: ${input.filePath}`
+              }`
+            : name === 'run-build'
+              ? `Run command: ${input.command}`
+              : `Modify file: ${input.filePath}`,
         risk: policy.risk,
         targetPath: canonicalPath ?? input.filePath,
         command: input.command,

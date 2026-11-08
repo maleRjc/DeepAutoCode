@@ -262,7 +262,7 @@ describe('DeepAutoCode IDE Repository Suite (v1.1)', () => {
           payload: {
             providerId: 'deepseek',
             apiEndpoint: 'https://api.deepseek.com/v1',
-            modelId: 'deepseek-chat',
+            modelId: 'deepseek-flash',
             apiKey: 'sk-test-persisted-deepseek-key',
           },
         }),

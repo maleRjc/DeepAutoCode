@@ -4,6 +4,11 @@
 
 DeepAutoCode 是 **Agent-first 自动编码工作台**，不是完整 Cursor / VS Code 替代品。
 
+> DeepSeek 增强路线图使用独立命名空间 **DS-P0…DS-P4**（Trace / 缓存 / Planner / Critic 等），
+> 与本文 **P0/P1/P2** 产品必赢清单含义不同。详见
+> [DEEPSEEK-ENHANCEMENT-ROADMAP.md](./DEEPSEEK-ENHANCEMENT-ROADMAP.md)；
+> 已落地代码说明见 [DEEPSEEK-IMPLEMENTATION.md](./DEEPSEEK-IMPLEMENTATION.md)。
+
 必赢场景：
 
 1. 远端/本地仓库自主修编译与测试失败  

@@ -82,25 +82,46 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
     displayName: 'DeepSeek (Default)',
     protocol: 'deepseek',
     apiEndpoint: 'https://api.deepseek.com/v1',
-    defaultModelId: 'deepseek-chat',
+    defaultModelId: 'deepseek-flash',
     secretKeyRef: 'deepautocode.provider.deepseek.apiKey',
     timeoutMs: 60000,
     models: [
       {
-        modelId: 'deepseek-chat',
-        displayName: 'DeepSeek V3 (deepseek-chat)',
-        contextWindow: 64000,
-        maxOutputTokens: 8192,
+        modelId: 'deepseek-flash',
+        displayName: 'DeepSeek Flash (deepseek-flash)',
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: true,
+        supportsReasoning: true,
+      },
+      {
+        modelId: 'deepseek-v4-pro',
+        displayName: 'DeepSeek V4 Pro (deepseek-v4-pro)',
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
         supportsToolCalls: true,
         supportsStreaming: true,
         supportsVision: false,
-        supportsReasoning: false,
+        supportsReasoning: true,
+      },
+      // Legacy aliases (retired API names) — kept for persisted sessions / UI migration
+      {
+        modelId: 'deepseek-chat',
+        displayName: 'Legacy alias → Flash (deepseek-chat)',
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: true,
+        supportsReasoning: true,
       },
       {
         modelId: 'deepseek-reasoner',
-        displayName: 'DeepSeek R1 (deepseek-reasoner)',
-        contextWindow: 64000,
-        maxOutputTokens: 8192,
+        displayName: 'Legacy alias → Pro thinking (deepseek-reasoner)',
+        contextWindow: 1_000_000,
+        maxOutputTokens: 384_000,
         supportsToolCalls: true,
         supportsStreaming: true,
         supportsVision: false,
@@ -316,7 +337,8 @@ export function diagnoseProviderError(error: unknown, provider: ProviderConfig, 
       code: 'TOOL_CALL_UNSUPPORTED',
       httpStatus: status ?? 400,
       userMessage: `Model "${modelId}" on "${provider.displayName}" rejected tool calling parameters.`,
-      remediation: 'Switch to a model with `supportsToolCalls: true` (e.g., deepseek-chat) or use Plan/Chat mode.',
+      remediation:
+        'Switch to a model with `supportsToolCalls: true` (e.g., deepseek-flash) or use Plan/Chat mode.',
     };
   }
 
@@ -339,7 +361,7 @@ export function diagnoseProviderError(error: unknown, provider: ProviderConfig, 
 export class ProviderManager {
   private providers = new Map<string, ProviderConfig>();
   private activeProviderId = 'deepseek';
-  private activeModelId = 'deepseek-chat';
+  private activeModelId = 'deepseek-flash';
   private readonly secrets: SecretStorageAdapter;
 
   constructor(secrets: SecretStorageAdapter = new InMemorySecretStorage()) {

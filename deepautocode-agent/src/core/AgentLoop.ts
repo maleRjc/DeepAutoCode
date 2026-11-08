@@ -4,6 +4,8 @@ import {
   summarizeToolOutput,
 } from './ToolResultSummarizer.js';
 import { resolveCompactionPlan } from './ContextCompaction.js';
+import { MistakeTracker } from './MistakeTracker.js';
+import { LoopDetection } from './LoopDetection.js';
 
 export interface AgentMessagePartText {
   type: 'text';
@@ -81,12 +83,26 @@ export interface AgentOptions {
    * outputs are summarized more aggressively as fillRatio rises.
    */
   getContextBudget?: () => { tokensUsed: number; tokenBudget: number | null };
+  /** Optional shared mistake tracker (Runtime wires Trace/circuit). */
+  mistakeTracker?: MistakeTracker;
+  /** Optional shared loop detector. */
+  loopDetection?: LoopDetection;
+  /**
+   * Called when tool policy is `ask` (including hard workspace rules).
+   * Return false / throw to block the tool.
+   */
+  requestToolApproval?: (input: {
+    toolName: string;
+    args: Record<string, unknown>;
+    summary: string;
+  }) => Promise<{ approved: boolean; reason?: string }>;
   hooks?: {
     onEvent?: (event: { type: string; text?: string; [key: string]: unknown }) => Promise<void> | void;
     onBeforeFinish?: (context: {
       assistantText: string;
       iterations: number;
       messages: AgentMessage[];
+      consecutiveMistakes?: number;
     }) => Promise<{ shouldContinue: boolean; prompt?: string } | void>;
   };
 }
@@ -148,9 +164,14 @@ export class Agent {
   private readonly options: AgentOptions;
   private readonly abortController = new AbortController();
   private abortReason = 'Aborted';
+  private readonly mistakeTracker: MistakeTracker;
+  private readonly loopDetection: LoopDetection;
+  private lastCompactionStage: string = 'none';
 
   constructor(options: AgentOptions) {
     this.options = options;
+    this.mistakeTracker = options.mistakeTracker ?? new MistakeTracker();
+    this.loopDetection = options.loopDetection ?? new LoopDetection();
   }
 
   public abort(reason = 'Task cancelled by user'): void {
@@ -185,6 +206,18 @@ export class Agent {
       tokenBudget: budget.tokenBudget,
       tokensUsed: budget.tokensUsed,
     });
+    if (plan.warnBudget || (plan.shouldCompact && plan.stage !== this.lastCompactionStage)) {
+      void this.options.hooks?.onEvent?.({
+        type: 'context.pressure',
+        fillRatio: plan.fillRatio,
+        stage: plan.stage,
+        reason: plan.reason,
+        trigger: plan.trigger,
+        estimatedToolTokens: plan.estimatedToolTokens,
+        warnBudget: plan.warnBudget,
+      });
+    }
+    this.lastCompactionStage = plan.stage;
     if (!plan.shouldCompact) {
       return;
     }
@@ -241,6 +274,47 @@ export class Agent {
         isError: true,
       };
     }
+    if (policy === 'ask') {
+      if (!this.options.requestToolApproval) {
+        return {
+          type: 'tool-result',
+          toolCallId: tc.toolCallId,
+          toolName: tc.toolName,
+          output: {
+            error: `APPROVAL_REQUIRED: Tool '${tc.toolName}' requires approval but no approval handler is registered.`,
+          },
+          isError: true,
+        };
+      }
+      try {
+        const decision = await this.options.requestToolApproval({
+          toolName: tc.toolName,
+          args: tc.input,
+          summary: `Approve tool '${tc.toolName}'`,
+        });
+        if (!decision.approved) {
+          return {
+            type: 'tool-result',
+            toolCallId: tc.toolCallId,
+            toolName: tc.toolName,
+            output: {
+              error: `USER_REJECTED: ${decision.reason || 'User rejected tool call'}`,
+            },
+            isError: true,
+          };
+        }
+      } catch (err) {
+        return {
+          type: 'tool-result',
+          toolCallId: tc.toolCallId,
+          toolName: tc.toolName,
+          output: {
+            error: `USER_REJECTED: ${err instanceof Error ? err.message : String(err)}`,
+          },
+          isError: true,
+        };
+      }
+    }
 
     const toolDef = toolMap.get(tc.toolName);
     if (!toolDef) {
@@ -286,16 +360,52 @@ export class Agent {
       };
     }
 
+    const loopHit = this.loopDetection.observeToolCall(tc.toolName, tc.input);
+    if (loopHit) {
+      this.mistakeTracker.recordMistake('wrong_tool', loopHit.reason);
+      void this.options.hooks?.onEvent?.({
+        type: 'agent.loop',
+        kind: loopHit.kind,
+        reason: loopHit.reason,
+        count: loopHit.count,
+        toolName: tc.toolName,
+        consecutiveMistakes: this.mistakeTracker.getConsecutiveMistakes(),
+      });
+      return {
+        type: 'tool-result',
+        toolCallId: tc.toolCallId,
+        toolName: tc.toolName,
+        output: {
+          error: `LOOP_DETECTED: ${loopHit.reason}. Stop repeating the same tool call; change strategy (different args, different tool, or summarize failure).`,
+        },
+        isError: true,
+      };
+    }
+
     try {
       const output = await toolDef.execute(tc.input, {
         signal: this.abortController.signal,
       });
+      const isErrObj =
+        typeof output === 'object' &&
+        output !== null &&
+        (Boolean((output as any).error) ||
+          (typeof (output as any).exitCode === 'number' && (output as any).exitCode !== 0));
+      if (isErrObj) {
+        const count = this.mistakeTracker.recordMistake(
+          'tool_error',
+          typeof (output as any).error === 'string' ? (output as any).error : tc.toolName
+        );
+        void this.options.hooks?.onEvent?.({
+          type: 'agent.mistake',
+          kind: 'tool_error',
+          toolName: tc.toolName,
+          consecutiveMistakes: count,
+        });
+      } else if (MUTATING_TOOLS.has(tc.toolName) || tc.toolName === 'run_command' || tc.toolName === 'run_commands') {
+        this.mistakeTracker.recordSuccess();
+      }
       if (cacheKey) {
-        const isErrObj =
-          typeof output === 'object' &&
-          output !== null &&
-          (Boolean((output as any).error) ||
-            (typeof (output as any).exitCode === 'number' && (output as any).exitCode !== 0));
         if (!isErrObj) {
           executedReadCache.set(cacheKey, { output, count: 1 });
         }
@@ -305,9 +415,17 @@ export class Agent {
         toolCallId: tc.toolCallId,
         toolName: tc.toolName,
         output,
+        isError: isErrObj || undefined,
       };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
+      const count = this.mistakeTracker.recordMistake('tool_error', errMsg);
+      void this.options.hooks?.onEvent?.({
+        type: 'agent.mistake',
+        kind: 'tool_error',
+        toolName: tc.toolName,
+        consecutiveMistakes: count,
+      });
       return {
         type: 'tool-result',
         toolCallId: tc.toolCallId,
@@ -395,11 +513,32 @@ export class Agent {
         }
 
         if (pendingToolCalls.length === 0) {
+          if (!assistantText.trim()) {
+            const count = this.mistakeTracker.recordMistake('empty_response');
+            void this.options.hooks?.onEvent?.({
+              type: 'agent.mistake',
+              kind: 'empty_response',
+              consecutiveMistakes: count,
+            });
+          } else {
+            const contentLoop = this.loopDetection.observeAssistantContent(assistantText);
+            if (contentLoop) {
+              this.mistakeTracker.recordMistake('empty_response', contentLoop.reason);
+              void this.options.hooks?.onEvent?.({
+                type: 'agent.loop',
+                kind: contentLoop.kind,
+                reason: contentLoop.reason,
+                count: contentLoop.count,
+                consecutiveMistakes: this.mistakeTracker.getConsecutiveMistakes(),
+              });
+            }
+          }
           if (this.options.hooks?.onBeforeFinish && iterations < maxIterations) {
             const decision = await this.options.hooks.onBeforeFinish({
               assistantText,
               iterations,
               messages,
+              consecutiveMistakes: this.mistakeTracker.getConsecutiveMistakes(),
             });
             if (decision?.shouldContinue && decision.prompt) {
               messages.push({

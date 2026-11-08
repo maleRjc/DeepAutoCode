@@ -9,6 +9,7 @@ import type { ApprovalBridge } from './ApprovalBridge.js';
 import type { EventBridge } from './EventBridge.js';
 import type { IClineCoreInstance } from '../runtime/RuntimeFactory.js';
 import type { ResourceManager } from '../runtime/ResourceManager.js';
+import { globalTaskTraceStore } from '../core/trace/TaskTrace.js';
 
 export interface ResumedSessionSnapshot {
   manifest: SessionManifest;
@@ -105,6 +106,9 @@ export class SessionBridge {
         case 'goal_usage':
           this.eventBridge.emit(ev.sessionId, 'goal.usage', ev.payload);
           break;
+        case 'trace_updated':
+          this.eventBridge.emit(ev.sessionId, 'trace.updated', ev.payload);
+          break;
       }
     });
 
@@ -197,7 +201,7 @@ export class SessionBridge {
         title: 'AI Session',
         config: {
           providerId: 'deepseek',
-          modelId: 'deepseek-chat',
+          modelId: 'deepseek-flash',
           cwd: process.cwd(),
           workspaceRoot: process.cwd(),
           executionMode: 'auto',
@@ -327,6 +331,20 @@ export class SessionBridge {
     this.eventBridge.clearSession(sessionId);
     this.createdInCurrentInstance.delete(sessionId);
     return this.runtime.delete(sessionId);
+  }
+
+  getTrace(params: { taskId?: string; sessionId?: string }) {
+    if (params.taskId) {
+      return globalTaskTraceStore.get(params.taskId);
+    }
+    if (params.sessionId) {
+      return globalTaskTraceStore.getBySession(params.sessionId);
+    }
+    return null;
+  }
+
+  listTraces(limit = 20) {
+    return globalTaskTraceStore.list(limit);
   }
 }
 

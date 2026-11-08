@@ -28,7 +28,7 @@ export const SETTINGS_MESSAGES: Record<AppLocale, Dict> = {
     'settings.models.endpoint.hint': 'Base URL for chat completions and tool calling.',
     'settings.models.modelId': 'Default Model ID',
     'settings.models.modelId.hint':
-      'e.g. deepseek-chat, deepseek-reasoner, qwen2.5-coder:14b',
+      'e.g. deepseek-flash, deepseek-v4-pro, qwen2.5-coder:14b',
     'settings.models.apiKey': 'API Key (OS Credential Storage)',
     'settings.models.apiKey.hint':
       'Never written to plaintext config or logs. Click "⚡ Test AI Key" to verify live model connectivity.',
@@ -169,7 +169,7 @@ export const SETTINGS_MESSAGES: Record<AppLocale, Dict> = {
     'settings.models.endpoint.hint': '聊天补全与工具调用的 Base URL。',
     'settings.models.modelId': '默认模型 ID',
     'settings.models.modelId.hint':
-      '例如 deepseek-chat、deepseek-reasoner、qwen2.5-coder:14b',
+      '例如 deepseek-flash、deepseek-v4-pro、qwen2.5-coder:14b',
     'settings.models.apiKey': 'API Key（系统凭证库）',
     'settings.models.apiKey.hint':
       '不会写入明文配置或日志。点击「⚡ 测试 AI Key」验证模型连通性。',
@@ -306,7 +306,7 @@ export const SETTINGS_MESSAGES: Record<AppLocale, Dict> = {
     'settings.models.endpoint.hint': '聊天補全與工具呼叫的 Base URL。',
     'settings.models.modelId': '預設模型 ID',
     'settings.models.modelId.hint':
-      '例如 deepseek-chat、deepseek-reasoner、qwen2.5-coder:14b',
+      '例如 deepseek-flash、deepseek-v4-pro、qwen2.5-coder:14b',
     'settings.models.apiKey': 'API Key（系統認證庫）',
     'settings.models.apiKey.hint':
       '不會寫入明文組態或記錄。點擊「⚡ 測試 AI Key」驗證模型連通性。',

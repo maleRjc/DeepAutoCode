@@ -15,6 +15,8 @@ import {
   McpHost,
   parseBuildDiagnostics,
   rankDefinitionCandidates,
+  completeDeepSeekFim,
+  DEEPSEEK_FLASH,
   type BuildDiagnostic,
 } from '@deepautocode/agent';
 import { buildWebviewCspHeader, generateCspNonce } from '../csp.js';
@@ -1896,7 +1898,7 @@ export async function createWorkbenchServer(options?: {
       return;
     }
 
-    // Antigravity Ghost Text / Inline Code Autocomplete API (LRU-cached heuristics)
+    // Ghost Text / Inline Code Autocomplete — DeepSeek FIM with heuristic fallback
     const autocompleteCache = ((globalThis as any).__dacAutocompleteCache ??= new Map()) as Map<
       string,
       string
@@ -1923,30 +1925,68 @@ export async function createWorkbenchServer(options?: {
         }
 
         let completion = '';
-        const lines = prefix.split(/\r?\n/);
-        const lastLine = lines[lines.length - 1] || '';
-        const trimmed = lastLine.trim();
+        let source: 'fim' | 'heuristic' = 'heuristic';
 
-        if (trimmed.endsWith('{') && !suffix.trim().startsWith('}')) {
-          completion = '\n  \n}';
-        } else if (trimmed.startsWith('import ') && !trimmed.includes('from') && trimmed.includes('{')) {
-          completion = filePath.endsWith('.tsx') || filePath.endsWith('.ts') ? " from './components';" : " from './utils';";
-        } else if (/^const\s+\[[a-zA-Z0-9_]+,\s*set[a-zA-Z0-9_]*\]\s*=\s*$/.test(trimmed)) {
-          completion = 'useState(false);';
-        } else if (/^interface\s+[a-zA-Z0-9_]+\s*$/.test(trimmed)) {
-          completion = '{\n  id: string;\n  name: string;\n}';
-        } else if (/^export\s+function\s+[a-zA-Z0-9_]+\s*\([^)]*\)\s*$/.test(trimmed)) {
-          completion = '{\n  return null;\n}';
-        } else if (/^if\s*\([^)]+\)\s*$/.test(trimmed)) {
-          completion = '{\n  \n}';
-        } else if (trimmed.endsWith('console.log(')) {
-          completion = "'Debug:', );";
-        } else if (trimmed.endsWith(': React.')) {
-          completion = 'ReactNode';
-        } else if (/^(?:async\s+)?function\s+[a-zA-Z0-9_]+\s*\([^)]*\)\s*$/.test(trimmed)) {
-          completion = '{\n  \n}';
-        } else if (/^export\s+const\s+[a-zA-Z0-9_]+\s*=\s*$/.test(trimmed)) {
-          completion = '() => {\n  return null;\n};';
+        // Prefer DeepSeek Flash FIM (non-thinking) when API key is available
+        try {
+          const apiKey = await bridge.providerManager.resolveApiKey('deepseek');
+          if (apiKey && prefix.trim().length >= 8) {
+            const fim = await completeDeepSeekFim({
+              apiKey,
+              prompt: prefix.slice(-3500),
+              suffix: suffix.slice(0, 1200),
+              model: DEEPSEEK_FLASH,
+              maxTokens: 128,
+              temperature: 0,
+              timeoutMs: 6_000,
+            });
+            if (fim.ok && fim.text.trim()) {
+              completion = fim.text.replace(/\r\n/g, '\n');
+              // Cap multi-line suggestions so ghost text stays readable
+              const lines = completion.split('\n');
+              if (lines.length > 8) {
+                completion = lines.slice(0, 8).join('\n');
+              }
+              source = 'fim';
+            }
+          }
+        } catch {
+          // silent degrade to heuristics
+        }
+
+        if (!completion) {
+          const lines = prefix.split(/\r?\n/);
+          const lastLine = lines[lines.length - 1] || '';
+          const trimmed = lastLine.trim();
+
+          if (trimmed.endsWith('{') && !suffix.trim().startsWith('}')) {
+            completion = '\n  \n}';
+          } else if (
+            trimmed.startsWith('import ') &&
+            !trimmed.includes('from') &&
+            trimmed.includes('{')
+          ) {
+            completion =
+              filePath.endsWith('.tsx') || filePath.endsWith('.ts')
+                ? " from './components';"
+                : " from './utils';";
+          } else if (/^const\s+\[[a-zA-Z0-9_]+,\s*set[a-zA-Z0-9_]*\]\s*=\s*$/.test(trimmed)) {
+            completion = 'useState(false);';
+          } else if (/^interface\s+[a-zA-Z0-9_]+\s*$/.test(trimmed)) {
+            completion = '{\n  id: string;\n  name: string;\n}';
+          } else if (/^export\s+function\s+[a-zA-Z0-9_]+\s*\([^)]*\)\s*$/.test(trimmed)) {
+            completion = '{\n  return null;\n}';
+          } else if (/^if\s*\([^)]+\)\s*$/.test(trimmed)) {
+            completion = '{\n  \n}';
+          } else if (trimmed.endsWith('console.log(')) {
+            completion = "'Debug:', );";
+          } else if (trimmed.endsWith(': React.')) {
+            completion = 'ReactNode';
+          } else if (/^(?:async\s+)?function\s+[a-zA-Z0-9_]+\s*\([^)]*\)\s*$/.test(trimmed)) {
+            completion = '{\n  \n}';
+          } else if (/^export\s+const\s+[a-zA-Z0-9_]+\s*=\s*$/.test(trimmed)) {
+            completion = '() => {\n  return null;\n};';
+          }
         }
 
         if (autocompleteCache.size > 200) {
@@ -1956,7 +1996,7 @@ export async function createWorkbenchServer(options?: {
         autocompleteCache.set(cacheKey, completion);
 
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, completion, cached: false }));
+        res.end(JSON.stringify({ ok: true, completion, cached: false, source }));
       } catch (err) {
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, error: (err as Error).message }));

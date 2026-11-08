@@ -273,9 +273,9 @@ export function App() {
   >(null);
   const [promptInput, setPromptInput] = useState<string>('');
   const [attachActiveFile, setAttachActiveFile] = useState<boolean>(true);
-  const [aiTab, setAiTab] = useState<'composer' | 'artifacts' | 'sessions' | 'changes'>(
-    'composer'
-  );
+  const [aiTab, setAiTab] = useState<
+    'composer' | 'artifacts' | 'sessions' | 'changes' | 'trace'
+  >('composer');
   const [contextChips, setContextChips] = useState<
     Array<{ id: string; kind: string; label: string; value: string }>
   >([]);
@@ -284,12 +284,20 @@ export function App() {
     effectiveModelId?: string;
     tier?: string;
     reason?: string;
+    thinkingEnabled?: boolean;
+    reasoningEffort?: string | null;
+    peakHour?: boolean;
   } | null>(null);
   const [goalTokenUsage, setGoalTokenUsage] = useState<{
     tokensUsed: number;
     tokenBudget: number;
     remaining: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    estimatedCostCnyTotal: number;
+    peakHour: boolean;
   } | null>(null);
+  const [activeTaskTrace, setActiveTaskTrace] = useState<any | null>(null);
   const [pendingPromptQueue, setPendingPromptQueue] = useState<
     Array<{ prompt: string; mode?: 'plan' | 'auto' | 'manual' }>
   >([]);
@@ -332,7 +340,7 @@ export function App() {
   const [providerData, setProviderData] = useState<any>(null);
   const [selectedProviderId, setSelectedProviderId] = useState<string>('deepseek');
   const [endpointInput, setEndpointInput] = useState<string>('https://api.deepseek.com/v1');
-  const [modelInput, setModelInput] = useState<string>('deepseek-chat');
+  const [modelInput, setModelInput] = useState<string>('deepseek-flash');
   const [apiKeyInput, setApiKeyInput] = useState<string>('');
   const [smokeResult, setSmokeResult] = useState<any>(null);
   const [isTestingKey, setIsTestingKey] = useState<boolean>(false);
@@ -1891,6 +1899,12 @@ export function App() {
           effectiveModelId: String(ev.payload.effectiveModelId || ''),
           tier: String(ev.payload.tier || ''),
           reason: String(ev.payload.reason || ''),
+          thinkingEnabled: Boolean(ev.payload.thinkingEnabled),
+          reasoningEffort:
+            ev.payload.reasoningEffort == null
+              ? null
+              : String(ev.payload.reasoningEffort),
+          peakHour: Boolean(ev.payload.peakHour),
         });
         if (
           typeof ev.payload.tokensUsed === 'number' ||
@@ -1903,6 +1917,10 @@ export function App() {
               tokensUsed: used,
               tokenBudget: budget,
               remaining: Math.max(0, budget - used),
+              cacheReadTokens: prev?.cacheReadTokens ?? 0,
+              cacheWriteTokens: prev?.cacheWriteTokens ?? 0,
+              estimatedCostCnyTotal: prev?.estimatedCostCnyTotal ?? 0,
+              peakHour: Boolean(ev.payload.peakHour ?? prev?.peakHour),
             };
           });
         }
@@ -1910,13 +1928,38 @@ export function App() {
       case 'goal.usage': {
         const used = Number(ev.payload.tokensUsed ?? 0);
         const budget = Number(ev.payload.tokenBudget ?? 180000);
-        setGoalTokenUsage({
-          tokensUsed: used,
-          tokenBudget: budget,
-          remaining: Number(
-            ev.payload.remaining ?? Math.max(0, budget - used)
-          ),
+        setGoalTokenUsage((prev) => {
+          const turnCacheRead = Number(ev.payload.cacheReadTokens ?? 0);
+          const turnCacheWrite = Number(ev.payload.cacheWriteTokens ?? 0);
+          const totalRead =
+            typeof ev.payload.cacheReadTokensTotal === 'number'
+              ? Number(ev.payload.cacheReadTokensTotal)
+              : (prev?.cacheReadTokens ?? 0) + turnCacheRead;
+          const totalWrite =
+            typeof ev.payload.cacheWriteTokensTotal === 'number'
+              ? Number(ev.payload.cacheWriteTokensTotal)
+              : (prev?.cacheWriteTokens ?? 0) + turnCacheWrite;
+          const costTotal =
+            typeof ev.payload.estimatedCostCnyTotal === 'number'
+              ? Number(ev.payload.estimatedCostCnyTotal)
+              : (prev?.estimatedCostCnyTotal ?? 0) +
+                Number(ev.payload.estimatedCostCny ?? 0);
+          return {
+            tokensUsed: used,
+            tokenBudget: budget,
+            remaining: Number(ev.payload.remaining ?? Math.max(0, budget - used)),
+            cacheReadTokens: totalRead,
+            cacheWriteTokens: totalWrite,
+            estimatedCostCnyTotal: costTotal,
+            peakHour: Boolean(ev.payload.peakHour ?? prev?.peakHour),
+          };
         });
+        break;
+      }
+      case 'trace.updated': {
+        if (isActive && ev.payload?.snapshot) {
+          setActiveTaskTrace(ev.payload.snapshot);
+        }
         break;
       }
       case 'checkpoint.created':
@@ -2458,6 +2501,20 @@ export function App() {
       setSessionCheckpoints(Array.isArray(list) ? list : []);
     } catch {
       setSessionCheckpoints([]);
+    }
+  }
+
+  async function refreshTaskTrace(sessionId?: string) {
+    const sid = sessionId || activeSessionId;
+    if (!sid) {
+      setActiveTaskTrace(null);
+      return;
+    }
+    try {
+      const snap = await bridge.request<any>('trace.get', { sessionId: sid }, sid);
+      setActiveTaskTrace(snap || null);
+    } catch {
+      setActiveTaskTrace(null);
     }
   }
 
@@ -8975,6 +9032,19 @@ export function App() {
                 <span>🕒 {t('dock.history')}</span>
                 <span className="ai-dock-count">{sessions.length}</span>
               </button>
+              <button
+                type="button"
+                className={`ai-dock-tab ${aiTab === 'trace' ? 'active' : ''}`}
+                onClick={() => {
+                  setAiTab('trace');
+                  void refreshTaskTrace();
+                }}
+              >
+                <span>📡 {t('dock.trace')}</span>
+                <span className="ai-dock-count">
+                  {Array.isArray(activeTaskTrace?.events) ? activeTaskTrace.events.length : 0}
+                </span>
+              </button>
             </div>
             <div className="ai-dock-actions">
               <button
@@ -9528,6 +9598,108 @@ export function App() {
                     </button>
                   </div>
                 ))
+              )}
+            </div>
+          ) : aiTab === 'trace' ? (
+            <div className="ai-messages-stream">
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 700 }}>{t('dock.trace')}</span>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ padding: '3px 8px', fontSize: 11 }}
+                  onClick={() => void refreshTaskTrace()}
+                >
+                  {t('trace.refresh')}
+                </button>
+              </div>
+              {!activeTaskTrace ? (
+                <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                  {t('trace.empty')}
+                </div>
+              ) : (
+                <>
+                  <div className="chat-bubble" style={{ marginBottom: 8 }}>
+                    <div style={{ fontWeight: 700, fontSize: 12 }}>
+                      {activeTaskTrace.taskId}{' '}
+                      <span className="badge info" style={{ fontSize: 9 }}>
+                        {activeTaskTrace.status}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
+                      {activeTaskTrace.promptSummary}
+                    </div>
+                    <div style={{ fontSize: 11, marginTop: 6, color: 'var(--text-secondary)' }}>
+                      turns {activeTaskTrace.totalTurns} · tok{' '}
+                      {formatCompactTokens(Number(activeTaskTrace.tokensUsed || 0))}/
+                      {formatCompactTokens(Number(activeTaskTrace.tokenBudget || 180000))} ·{' '}
+                      {t('trace.cache')}{' '}
+                      {formatCompactTokens(Number(activeTaskTrace.cacheReadTokens || 0))}
+                    </div>
+                  </div>
+                  {(Array.isArray(activeTaskTrace.events) ? activeTaskTrace.events : [])
+                    .slice()
+                    .reverse()
+                    .map((evt: any, idx: number) => (
+                      <div
+                        key={`${evt.ts || idx}-${evt.kind}-${idx}`}
+                        className="chat-bubble"
+                        style={{ marginTop: 6, fontSize: 11.5 }}
+                      >
+                        <div style={{ fontWeight: 600 }}>
+                          {evt.kind}{' '}
+                          <span style={{ color: 'var(--text-secondary)', fontWeight: 400 }}>
+                            {evt.ts ? String(evt.ts).slice(11, 19) : ''}
+                          </span>
+                        </div>
+                        {evt.kind === 'llm.turn' && (
+                          <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>
+                            #{evt.turnIndex} · {evt.modelId} · {evt.latencyMs}ms · in{' '}
+                            {formatCompactTokens(evt.inputTokens)} / out{' '}
+                            {formatCompactTokens(evt.outputTokens)} · {t('trace.cache')}{' '}
+                            {formatCompactTokens(evt.cacheReadTokens)}
+                          </div>
+                        )}
+                        {evt.kind === 'tool.call' && (
+                          <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>
+                            {evt.ok ? 'ok' : 'fail'} · {evt.toolName} · {evt.durationMs}ms ·{' '}
+                            {evt.resultBytes}B
+                            {evt.argDigest ? (
+                              <div style={{ marginTop: 2, opacity: 0.85 }}>
+                                {String(evt.argDigest).slice(0, 160)}
+                              </div>
+                            ) : null}
+                            {evt.error ? (
+                              <div style={{ marginTop: 2, color: '#f87171' }}>{evt.error}</div>
+                            ) : null}
+                          </div>
+                        )}
+                        {evt.kind === 'verify.result' && (
+                          <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>
+                            {evt.passed ? 'PASS' : 'FAIL'} · {evt.summary}
+                          </div>
+                        )}
+                        {evt.kind === 'agent.signal' && (
+                          <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>
+                            {evt.signal} · {evt.summary}
+                          </div>
+                        )}
+                        {evt.kind === 'task.start' && (
+                          <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>
+                            mode {evt.mode}
+                            {evt.modelId ? ` · ${evt.modelId}` : ''}
+                          </div>
+                        )}
+                        {evt.kind === 'task.end' && (
+                          <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>
+                            {evt.status}
+                            {evt.reason ? ` · ${evt.reason}` : ''} · cache{' '}
+                            {formatCompactTokens(evt.cacheReadTokens || 0)}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                </>
               )}
             </div>
           ) : (
@@ -10678,9 +10850,11 @@ export function App() {
                       onChange={(e) => setModelInput(e.target.value)}
                       title="AI Model Routing: Auto / Force Fast / Force Reasoner"
                     >
-                      <option value="deepseek-auto">⚡ Auto Router</option>
-                      <option value="deepseek-chat">Force Fast (chat)</option>
-                      <option value="deepseek-reasoner">Force Reasoner (R1)</option>
+                      <option value="deepseek-auto">⚡ Auto Router (Flash/Pro)</option>
+                      <option value="deepseek-flash">Force Flash</option>
+                      <option value="deepseek-v4-pro">Force V4-Pro</option>
+                      <option value="deepseek-chat">Legacy → Flash (chat)</option>
+                      <option value="deepseek-reasoner">Legacy → Pro (reasoner)</option>
                       <option value="qwen2.5-coder:14b">qwen2.5-coder</option>
                       <option value="claude-3-7-sonnet-latest">claude-3.7-sonnet</option>
                     </select>
@@ -10690,7 +10864,11 @@ export function App() {
                         title={lastModelTier.reason || ''}
                         style={{ fontSize: 10 }}
                       >
-                        {lastModelTier.tier}:{lastModelTier.effectiveModelId}
+                        {lastModelTier.effectiveModelId}
+                        {lastModelTier.thinkingEnabled
+                          ? `·think${lastModelTier.reasoningEffort ? `:${lastModelTier.reasoningEffort}` : ''}`
+                          : ''}
+                        {lastModelTier.peakHour ? '·peak' : ''}
                       </span>
                     )}
                     {goalTokenUsage && (
@@ -10700,11 +10878,17 @@ export function App() {
                             ? 'warning'
                             : 'success'
                         }`}
-                        title={`Goal tokens used ${goalTokenUsage.tokensUsed.toLocaleString()} / budget ${goalTokenUsage.tokenBudget.toLocaleString()} (remaining ${goalTokenUsage.remaining.toLocaleString()})`}
+                        title={`Goal tokens used ${goalTokenUsage.tokensUsed.toLocaleString()} / budget ${goalTokenUsage.tokenBudget.toLocaleString()} (remaining ${goalTokenUsage.remaining.toLocaleString()}; cache hit ${goalTokenUsage.cacheReadTokens.toLocaleString()}; est ¥${goalTokenUsage.estimatedCostCnyTotal.toFixed(4)})`}
                         style={{ fontSize: 10 }}
                       >
                         tok {formatCompactTokens(goalTokenUsage.tokensUsed)}/
                         {formatCompactTokens(goalTokenUsage.tokenBudget)}
+                        {goalTokenUsage.cacheReadTokens > 0
+                          ? ` · ${t('trace.cache')} ${formatCompactTokens(goalTokenUsage.cacheReadTokens)}`
+                          : ''}
+                        {goalTokenUsage.estimatedCostCnyTotal > 0
+                          ? ` · ¥${goalTokenUsage.estimatedCostCnyTotal < 0.01 ? goalTokenUsage.estimatedCostCnyTotal.toFixed(4) : goalTokenUsage.estimatedCostCnyTotal.toFixed(3)}`
+                          : ''}
                       </span>
                     )}
                   </div>
@@ -11537,9 +11721,22 @@ export function App() {
           <span>🌿 {gitState.branch}*</span>
           <span>ⓘ 0 Errors</span>
           <span>Backend: {backendStatus?.diagnostics?.effectiveMode ?? 'local'}</span>
+          {lastModelTier?.effectiveModelId && (
+            <span
+              title={lastModelTier.reason || 'Active DeepSeek route'}
+              style={{
+                color: lastModelTier.peakHour ? '#fbbf24' : '#67e8f9',
+                fontWeight: 600,
+              }}
+            >
+              {lastModelTier.effectiveModelId}
+              {lastModelTier.thinkingEnabled ? '·think' : ''}
+              {lastModelTier.peakHour ? ' · peak' : ' · off-peak'}
+            </span>
+          )}
           {goalTokenUsage && (
             <span
-              title={`Remaining ${goalTokenUsage.remaining.toLocaleString()} tokens`}
+              title={`Remaining ${goalTokenUsage.remaining.toLocaleString()} tokens; cache hit ${goalTokenUsage.cacheReadTokens.toLocaleString()}; est ¥${goalTokenUsage.estimatedCostCnyTotal.toFixed(4)}`}
               style={{
                 color:
                   goalTokenUsage.tokensUsed / Math.max(1, goalTokenUsage.tokenBudget) > 0.85
@@ -11550,6 +11747,12 @@ export function App() {
             >
               Tokens: {formatCompactTokens(goalTokenUsage.tokensUsed)}/
               {formatCompactTokens(goalTokenUsage.tokenBudget)}
+              {goalTokenUsage.cacheReadTokens > 0
+                ? ` · ${t('trace.cache')} ${formatCompactTokens(goalTokenUsage.cacheReadTokens)}`
+                : ''}
+              {goalTokenUsage.estimatedCostCnyTotal > 0
+                ? ` · ¥${goalTokenUsage.estimatedCostCnyTotal < 0.01 ? goalTokenUsage.estimatedCostCnyTotal.toFixed(4) : goalTokenUsage.estimatedCostCnyTotal.toFixed(3)}`
+                : ''}
             </span>
           )}
           <span>Status: {statusNotice}</span>

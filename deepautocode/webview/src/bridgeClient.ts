@@ -24,6 +24,7 @@ export interface UIEventMessage {
   | 'artifact.created'
   | 'model.tier'
   | 'goal.usage'
+  | 'trace.updated'
   | 'checkpoint.created'
   | 'diff.proposed'
   | 'diff.updated';

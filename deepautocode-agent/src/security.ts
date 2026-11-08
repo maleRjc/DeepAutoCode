@@ -1,6 +1,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { AgentExecutionMode, RiskLevel } from './types.js';
+import {
+  evaluatePermissionRules,
+  resolveToolResource,
+  toolNameToAction,
+  type PermissionRuleset,
+} from './core/RulePermission.js';
+import {
+  findFileEditingCommand,
+  formatPlanModeBlockedCommandError,
+} from './core/CommandGuard.js';
 
 /**
  * Section 9.1: Secret Redaction & Credential Store Interface
@@ -233,6 +243,9 @@ export interface PolicyEvaluation {
   requiresApproval: boolean;
   risk: RiskLevel;
   reason: string;
+  /** When a hard workspace rule forced ask/deny */
+  ruleEffect?: 'allow' | 'deny' | 'ask';
+  ruleSource?: string;
 }
 
 export function classifyCommandRisk(command: string): RiskLevel {
@@ -256,8 +269,20 @@ export function evaluateToolPolicy(params: {
   command?: string;
   targetPath?: string;
   workspaceRoot: string;
+  /** Compiled hard rules from workspace rule docs (forbid/ask beat Auto allow). */
+  permissionRuleset?: PermissionRuleset;
+  args?: Record<string, unknown>;
 }): PolicyEvaluation {
-  const { toolName, executionMode, isReadOnlyTool, command, targetPath, workspaceRoot } = params;
+  const {
+    toolName,
+    executionMode,
+    isReadOnlyTool,
+    command,
+    targetPath,
+    workspaceRoot,
+    permissionRuleset,
+    args,
+  } = params;
 
   // Validate workspace path if targetPath is supplied
   if (targetPath) {
@@ -276,14 +301,70 @@ export function evaluateToolPolicy(params: {
     }
   }
 
-  // Section 9.2: Plan mode strictly stays read-only
+  // Section 9.2: Plan mode stays read-only, with CommandGuard allowing investigation shells
   if (executionMode === 'plan' && !isReadOnlyTool) {
+    const isShellTool = /^(run-build|run_command|run_commands|auto_build_and_test)$/i.test(
+      toolName
+    );
+    if (isShellTool && command) {
+      const mutateReason = findFileEditingCommand(command);
+      if (mutateReason) {
+        return {
+          allowedToProceed: false,
+          requiresApproval: false,
+          risk: 'high',
+          reason: formatPlanModeBlockedCommandError(mutateReason),
+        };
+      }
+      // Non-mutating investigation shell (ls/cat/git status/npm test, etc.)
+      return {
+        allowedToProceed: true,
+        requiresApproval: false,
+        risk: 'low',
+        reason: 'Plan mode allows read-only investigation shells (CommandGuard)',
+      };
+    }
     return {
       allowedToProceed: false,
       requiresApproval: false,
       risk: 'high',
       reason: `Plan mode is strictly read-only. Tool "${toolName}" is blocked until switched to Auto or Manual mode.`,
     };
+  }
+
+  // Hard workspace rules (DS-P3): forbid/ask beat Auto allowlists
+  if (permissionRuleset && permissionRuleset.length > 0) {
+    const resource = resolveToolResource({
+      toolName,
+      targetPath,
+      command,
+      args,
+    });
+    const decision = evaluatePermissionRules(
+      toolNameToAction(toolName),
+      resource,
+      permissionRuleset
+    );
+    if (decision.effect === 'deny') {
+      return {
+        allowedToProceed: false,
+        requiresApproval: false,
+        risk: 'critical',
+        reason: `RULE_FORBID: ${decision.reason}`,
+        ruleEffect: 'deny',
+        ruleSource: decision.matched?.source,
+      };
+    }
+    if (decision.effect === 'ask') {
+      return {
+        allowedToProceed: true,
+        requiresApproval: true,
+        risk: 'high',
+        reason: `RULE_ASK: ${decision.reason}`,
+        ruleEffect: 'ask',
+        ruleSource: decision.matched?.source,
+      };
+    }
   }
 
   if (isReadOnlyTool) {

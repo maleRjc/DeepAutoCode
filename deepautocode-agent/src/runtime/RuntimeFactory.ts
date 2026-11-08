@@ -164,6 +164,22 @@ import {
   saveSessionCheckpoint,
   type SessionCheckpoint,
 } from '../core/SessionCheckpoint.js';
+import {
+  globalTaskTraceStore,
+  type TraceTerminalStatus,
+} from '../core/trace/TaskTrace.js';
+import {
+  DEEPSEEK_FLASH,
+  buildDeepSeekRequestControls,
+  deepSeekChatBodyExtras,
+  estimateDeepSeekTurnCostCny,
+  isDeepSeekPeakHour,
+  isDeepSeekModelId,
+} from '../core/DeepSeekModels.js';
+import {
+  compileRulesFromDocuments,
+  type PermissionRuleset,
+} from '../core/RulePermission.js';
 import { BackendManager } from './BackendManager.js';
 
 export interface ClineRuntimeEvent {
@@ -182,7 +198,8 @@ export interface ClineRuntimeEvent {
     | 'sandbox_branch_created'
     | 'circuit_breaker_triggered'
     | 'artifact_created'
-    | 'goal_usage';
+    | 'goal_usage'
+    | 'trace_updated';
   sessionId: string;
   payload: Record<string, unknown>;
 }
@@ -551,6 +568,29 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     const toolCalls: ToolCallRecord[] = [];
     const diffIds: string[] = [];
     let assistantContent = '';
+    const taskId = `trc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    let traceTerminal: TraceTerminalStatus = 'success';
+    let circuitTriggered = false;
+    const emitTraceUpdated = (event: unknown) => {
+      this.emit({
+        type: 'trace_updated',
+        sessionId: input.sessionId,
+        payload: {
+          taskId,
+          event,
+          snapshot: globalTaskTraceStore.get(taskId),
+        },
+      });
+    };
+    const startEvt = globalTaskTraceStore.startTask({
+      taskId,
+      sessionId: input.sessionId,
+      mode: manifest.executionMode || 'auto',
+      prompt: input.prompt,
+      modelId: manifest.modelId,
+      workspaceRoot: manifest.workspaceRoot,
+    });
+    emitTraceUpdated(startEvt);
 
     try {
       // Execute intelligent agent workflow with capability invocations
@@ -560,18 +600,28 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         signal: abortController.signal,
         toolCalls,
         diffIds,
+        taskId,
+        onCircuitTriggered: () => {
+          circuitTriggered = true;
+        },
+        emitTraceUpdated,
       });
       assistantContent = result.content;
       manifest.status = 'completed';
+      if (circuitTriggered) {
+        traceTerminal = 'circuit';
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (abortController.signal.aborted || msg.includes('CANCELLED') || msg.includes('aborted')) {
         manifest.status = 'cancelled';
+        traceTerminal = 'abort';
         assistantContent = assistantContent
           ? `${assistantContent}\n\n[Task cancelled by user]`
           : '[Task cancelled by user]';
       } else {
         manifest.status = 'error';
+        traceTerminal = 'error';
         assistantContent = `Task encountered error: ${msg}`;
         this.emit({
           type: 'error',
@@ -581,6 +631,21 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       }
     } finally {
       this.activeAborts.delete(input.sessionId);
+      const endEvt = globalTaskTraceStore.endTask({
+        workspaceRoot: manifest.workspaceRoot,
+        sessionId: input.sessionId,
+        taskId,
+        status: circuitTriggered ? 'circuit' : traceTerminal,
+        reason:
+          circuitTriggered
+            ? 'circuit_breaker'
+            : traceTerminal === 'abort'
+              ? 'cancelled'
+              : traceTerminal === 'error'
+                ? 'runtime_error'
+                : undefined,
+      });
+      if (endEvt) emitTraceUpdated(endEvt);
     }
 
     const assistantSeq = (await this.readMessages(input.sessionId)).length + 1;
@@ -657,8 +722,20 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     signal: AbortSignal;
     toolCalls: ToolCallRecord[];
     diffIds: string[];
+    taskId?: string;
+    onCircuitTriggered?: () => void;
+    emitTraceUpdated?: (event: unknown) => void;
   }): Promise<{ content: string }> {
-    const { manifest, prompt, signal, toolCalls, diffIds } = params;
+    const {
+      manifest,
+      prompt,
+      signal,
+      toolCalls,
+      diffIds,
+      taskId,
+      onCircuitTriggered,
+      emitTraceUpdated,
+    } = params;
     const sessionId = manifest.sessionId;
     const chunks: string[] = [];
 
@@ -678,12 +755,37 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       }
     };
 
+    const policyGate: {
+      executionMode: AgentExecutionMode;
+      permissionRuleset: PermissionRuleset;
+    } = {
+      executionMode: manifest.executionMode,
+      permissionRuleset: [],
+    };
+    try {
+      const { discoverWorkspaceCustomizations } = await import('../core/index.js');
+      if (typeof discoverWorkspaceCustomizations === 'function') {
+        const customs = await discoverWorkspaceCustomizations(manifest.workspaceRoot);
+        policyGate.permissionRuleset = compileRulesFromDocuments(
+          (customs?.rules || []).map((r: any) => ({
+            path: r.path,
+            name: r.name,
+            content: r.content,
+            raw: r.content,
+          }))
+        );
+      }
+    } catch {
+      // non-fatal: soft rules still inject via PromptBuilder
+    }
+
     const runCapabilityTool = async (
       capability: CapabilityName,
       args: Record<string, unknown>,
       risk: ToolCallRecord['risk'] = 'low'
     ) => {
       const toolCallId = `tc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const toolStartedAt = Date.now();
       const record: ToolCallRecord = {
         toolCallId,
         toolName: capability,
@@ -704,7 +806,8 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         const output = await this.capabilityRegistry.invoke(capability, args, {
           sessionId,
           workspaceRoot: manifest.workspaceRoot,
-          executionMode: manifest.executionMode,
+          executionMode: policyGate.executionMode,
+          permissionRuleset: policyGate.permissionRuleset,
           signal,
         });
         record.status = 'completed';
@@ -715,6 +818,18 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           sessionId,
           payload: { ...record },
         });
+        const toolEvt = globalTaskTraceStore.recordToolCall({
+          workspaceRoot: manifest.workspaceRoot,
+          sessionId,
+          taskId,
+          toolCallId,
+          toolName: capability,
+          args,
+          result: output,
+          durationMs: Date.now() - toolStartedAt,
+          ok: true,
+        });
+        if (toolEvt) emitTraceUpdated?.(toolEvt);
         return output;
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -730,6 +845,18 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           sessionId,
           payload: { ...record },
         });
+        const toolEvt = globalTaskTraceStore.recordToolCall({
+          workspaceRoot: manifest.workspaceRoot,
+          sessionId,
+          taskId,
+          toolCallId,
+          toolName: capability,
+          args,
+          durationMs: Date.now() - toolStartedAt,
+          ok: false,
+          error: errMsg,
+        });
+        if (toolEvt) emitTraceUpdated?.(toolEvt);
         throw err;
       }
     };
@@ -808,6 +935,10 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           streamText,
           runCapabilityTool,
           diffIds,
+          taskId,
+          onCircuitTriggered,
+          emitTraceUpdated,
+          policyGate,
         });
       } catch (llmErr) {
         const errMsg = llmErr instanceof Error ? llmErr.message : String(llmErr);
@@ -1191,9 +1322,28 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       risk?: ToolCallRecord['risk']
     ) => Promise<unknown>;
     diffIds: string[];
+    taskId?: string;
+    onCircuitTriggered?: () => void;
+    emitTraceUpdated?: (event: unknown) => void;
+    policyGate?: {
+      executionMode: AgentExecutionMode;
+      permissionRuleset: PermissionRuleset;
+    };
   }): Promise<{ content: string }> {
-    const { manifest, prompt, apiKey, signal, chunks, streamText, runCapabilityTool, diffIds } =
-      params;
+    const {
+      manifest,
+      prompt,
+      apiKey,
+      signal,
+      chunks,
+      streamText,
+      runCapabilityTool,
+      diffIds,
+      taskId,
+      onCircuitTriggered,
+      emitTraceUpdated,
+      policyGate,
+    } = params;
     const sessionId = manifest.sessionId;
     const { provider } = this.providerManager.getActiveProvider();
     const endpoint = `${provider.apiEndpoint.replace(/\/$/, '')}/chat/completions`;
@@ -1223,6 +1373,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       enrichPromptWithMentions,
       expandSlashCommandPrompt,
       createToolPoliciesWithPreset,
+      overlayToolPoliciesWithHardRules,
       FileStateCache,
       WorkspaceFileIndex,
       searchIndexedFiles,
@@ -1263,6 +1414,9 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       digestTextToMemorySummary,
       MAX_SELF_HEAL_ATTEMPTS,
       MAX_VERIFY_NUDGES,
+      MistakeTracker,
+      LoopDetection,
+      getShadowGitCheckpoint,
     } = sdk;
     const selfHealBudget =
       typeof MAX_SELF_HEAL_ATTEMPTS === 'number' ? MAX_SELF_HEAL_ATTEMPTS : 5;
@@ -1339,6 +1493,11 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       slashExpanded.suggestedMode === 'plan' ||
       manifest.executionMode === 'plan' ||
       (!promptIntent.allowFileMutations && slashExpanded.suggestedMode !== 'auto');
+    // Hard Plan/readonly: CapabilityRegistry must see executionMode=plan even when
+    // manifest stays auto (intent-classified read-only turns).
+    if (policyGate && isReadOnlyTurn) {
+      policyGate.executionMode = 'plan';
+    }
 
     // 0. Reuse @cline/sdk native workspace metadata & @file mention enricher
     let workspaceInfo: any = { rootPath: manifest.workspaceRoot, hint: path.basename(manifest.workspaceRoot) };
@@ -1447,6 +1606,11 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     let sandboxBranchEnsured = false;
     let circuitBroken = false;
     let circuitBreakerNotified = false;
+    const mistakeTracker =
+      typeof MistakeTracker === 'function' ? new MistakeTracker() : null;
+    const loopDetection =
+      typeof LoopDetection === 'function' ? new LoopDetection() : null;
+    let shadowCheckpointCount = 0;
     const sessionTodos =
       typeof SessionTodoList === 'function' ? new SessionTodoList() : null;
 
@@ -1611,6 +1775,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             ? extractFailedTestHints(combinedOut, 6)
             : [];
         sessionTodos?.ensureVerifyTodo(preferredVerifyCommand);
+        mistakeTracker?.recordMistake('verify_fail', cmd.slice(0, 120));
       } else {
         activeGoal.consecutiveBlockedTurns = 0;
         activeGoal.verifiedByCommand = true;
@@ -1619,7 +1784,53 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         lastSemanticFailed = false;
         lastSemanticDiagSnippet = '';
         sessionTodos?.completeMatching((c) => /verify|test|build|编译|测试|验证/i.test(c));
+        mistakeTracker?.recordSuccess();
+        // DS-P3: shadow-git step checkpoint only after verify pass
+        void (async () => {
+          try {
+            if (typeof getShadowGitCheckpoint !== 'function') return;
+            const shadow = getShadowGitCheckpoint(manifest.workspaceRoot);
+            shadowCheckpointCount += 1;
+            const label = `verify-pass #${shadowCheckpointCount} · ${
+              isBuildCmd ? 'build' : 'test'
+            } · ${cmd.slice(0, 80)}`;
+            const ckpt = await shadow.create(label);
+            const signalEvt = globalTaskTraceStore.recordSignal?.({
+              workspaceRoot: manifest.workspaceRoot,
+              sessionId,
+              taskId,
+              signal: 'checkpoint',
+              summary: ckpt.ok
+                ? `shadow-git ${ckpt.skipped ? 'unchanged' : 'commit'} ${ckpt.commit?.slice(0, 8) || ''} · ${label}`
+                : `shadow-git failed: ${ckpt.reason || 'unknown'}`,
+              detail: { commit: ckpt.commit, skipped: ckpt.skipped, ok: ckpt.ok },
+            });
+            if (signalEvt) emitTraceUpdated?.(signalEvt);
+            this.emit({
+              type: 'checkpoint_created',
+              sessionId,
+              payload: {
+                kind: 'shadow-git',
+                ok: ckpt.ok,
+                skipped: ckpt.skipped,
+                commit: ckpt.commit,
+                message: label,
+                reason: ckpt.reason,
+              },
+            });
+          } catch {
+            // non-fatal
+          }
+        })();
       }
+      const verifyEvt = globalTaskTraceStore.recordVerify({
+        workspaceRoot: manifest.workspaceRoot,
+        sessionId,
+        taskId,
+        passed: !hasRuntimeOrCompileFailure,
+        summary: `${isBuildCmd ? 'build' : 'test'} exit=${res.exitCode} · ${cmd}`,
+      });
+      if (verifyEvt) emitTraceUpdated?.(verifyEvt);
     };
 
     const runPostEditDiagnostics = async (
@@ -1852,8 +2063,10 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     const builtinTools = createBuiltinTools({
       cwd: manifest.workspaceRoot,
       shell: isSshMirrorWorkspace ? '/bin/bash' : undefined,
-      enableEditor: manifest.executionMode !== 'plan',
+      enableEditor: manifest.executionMode !== 'plan' && !isReadOnlyTurn,
       enableApplyPatch: false,
+      executionMode:
+        manifest.executionMode === 'plan' || isReadOnlyTurn ? 'plan' : manifest.executionMode,
       ...(workspaceFileIndex ? { fileIndex: workspaceFileIndex } : {}),
       executors: {
         search: async (query: string, subDir?: string, contextLines = 3) => {
@@ -3168,7 +3381,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                       },
                       body: {
                         model: /deepseek/i.test(manifest.modelId || provider.defaultModelId)
-                          ? 'deepseek-chat'
+                          ? DEEPSEEK_FLASH
                           : manifest.modelId || provider.defaultModelId,
                         messages: [
                           {
@@ -3366,7 +3579,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                       },
                       body: {
                         model: /deepseek/i.test(manifest.modelId || provider.defaultModelId)
-                          ? 'deepseek-chat'
+                          ? DEEPSEEK_FLASH
                           : manifest.modelId || provider.defaultModelId,
                         messages: [
                           {
@@ -3402,7 +3615,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                       },
                       body: {
                         model: /deepseek/i.test(manifest.modelId || provider.defaultModelId)
-                          ? 'deepseek-chat'
+                          ? DEEPSEEK_FLASH
                           : manifest.modelId || provider.defaultModelId,
                         messages: [
                           {
@@ -3819,7 +4032,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       effectivePrompt = `${effectivePrompt}\n\n[Prior Session Executed Tools Audit (do NOT repeat this tag in output): ${priorToolAuditLines.join(' | ')}]`;
     }
     if (isReadOnlyTurn) {
-      effectivePrompt = `${effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '')}\n\n[Smart Intent Router: READ-ONLY QUERY & ANALYSIS MODE — Use read_file / outline_file / search_codebase / explore_codebase to inspect the code and answer the user's question/analysis concisely with clickable file:line references. Do NOT modify any files or run compilation in this turn.]`;
+      effectivePrompt = `${effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '')}\n\n[Smart Intent Router: READ-ONLY QUERY & ANALYSIS MODE — Use read_file / outline_file / search_codebase / explore_codebase, and investigation shells (ls/cat/git status/npm test). Mutating shells (rm/mv/git commit/npm install/redirects) are blocked by CommandGuard. Do NOT edit files in this turn.]`;
     } else {
       effectivePrompt = effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '');
     }
@@ -3828,6 +4041,8 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     let modelTurnIndex = 0;
     const maxToolCallingTurns = 90;
     let lastOpenAiMessages: Array<Record<string, any>> = [];
+    let llmTurnStartedAt = Date.now();
+    let sessionCostCny = 0;
     const emitRuntimeEvent = (event: ClineRuntimeEvent) => this.emit(event);
 
     const clineModelAdapter = {
@@ -3838,12 +4053,15 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         }
 
         modelTurnIndex += 1;
+        llmTurnStartedAt = Date.now();
         const allowToolsThisTurn = modelTurnIndex <= maxToolCallingTurns;
 
         const configuredModelId = manifest.modelId || provider.defaultModelId;
-        const routingMode = /force-reasoner|deepseek-reasoner/i.test(configuredModelId)
+        const routingMode = /force-reasoner|deepseek-reasoner|deepseek-v4-pro/i.test(
+          configuredModelId
+        )
           ? ('force-reasoner' as const)
-          : /force-fast|^deepseek-chat$/i.test(configuredModelId)
+          : /force-fast|^deepseek-chat$|^deepseek-flash$/i.test(configuredModelId)
             ? ('force-fast' as const)
             : ('auto' as const);
         const uniqueEdited = new Set(sessionWrittenFiles);
@@ -3862,12 +4080,31 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           routingMode: configuredModelId === 'deepseek-auto' ? 'auto' : routingMode,
         });
         const activeModelId = tierDecision.effectiveModelId;
+        const thinkingEnabled = Boolean(
+          (tierDecision as { thinkingEnabled?: boolean }).thinkingEnabled ??
+            /reasoner|r1|pro/i.test(activeModelId)
+        );
+        const reasoningEffort =
+          (tierDecision as { reasoningEffort?: 'low' | 'high' | 'max' | null })
+            .reasoningEffort ?? (thinkingEnabled ? 'high' : null);
+        const dsControls = isDeepSeekModelId(activeModelId)
+          ? buildDeepSeekRequestControls({
+              apiModelId: activeModelId,
+              thinkingEnabled,
+              reasoningEffort,
+            })
+          : null;
+        const isReasonerModel = Boolean(dsControls?.isThinking);
+        const peakHour = isDeepSeekPeakHour();
         emitRuntimeEvent({
           type: 'model_tier',
           sessionId,
           payload: {
             configuredModelId,
             effectiveModelId: activeModelId,
+            thinkingEnabled,
+            reasoningEffort,
+            peakHour,
             tokensUsed: activeGoal.tokensUsed,
             tokenBudget: Number(activeGoal.tokenBudget ?? 180000),
             tier: tierDecision.tier,
@@ -3875,7 +4112,6 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             turnIndex: modelTurnIndex,
           },
         });
-        const isReasonerModel = /reasoner|r1/i.test(activeModelId);
         activeGoal.turnsExecuted = modelTurnIndex;
 
         const openAiMessages: Array<Record<string, any>> = [];
@@ -3917,7 +4153,8 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
               const assistantObj: Record<string, any> = {
                 role: 'assistant',
                 content: textParts || '',
-                ...(isReasonerModel || typeof (msg as any).reasoningContent === 'string'
+                // DeepSeek tool-calling requires prior reasoning_content to be echoed back.
+                ...(typeof (msg as any).reasoningContent === 'string' || isReasonerModel
                   ? { reasoning_content: (msg as any).reasoningContent ?? '' }
                   : {}),
                 tool_calls: toolCallParts.map((tc: any) => {
@@ -4018,6 +4255,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             tool_choice: openAiTools.length > 0 ? 'auto' : undefined,
             max_tokens: 8192,
             ...(isReasonerModel ? {} : { temperature: 0.2 }),
+            ...(dsControls ? deepSeekChatBodyExtras(dsControls) : {}),
           },
           signal: request.signal ?? signal,
           timeoutMs: isReasonerModel ? 120000 : 60000,
@@ -4122,6 +4360,34 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           const cacheMissTok = Number(data.usage.prompt_cache_miss_tokens ?? 0);
           activeGoal.tokensUsed += inTok + outTok;
           const budget = Number(activeGoal.tokenBudget ?? 180000);
+          const latencyMs = Date.now() - llmTurnStartedAt;
+          const llmEvt = globalTaskTraceStore.recordLlmTurn({
+            workspaceRoot: manifest.workspaceRoot,
+            sessionId,
+            taskId,
+            turnIndex: modelTurnIndex,
+            modelId: activeModelId,
+            latencyMs,
+            inputTokens: inTok,
+            outputTokens: outTok,
+            cacheReadTokens: cacheHitTok,
+            cacheWriteTokens: cacheMissTok,
+            tokensUsed: activeGoal.tokensUsed,
+            tokenBudget: budget,
+          });
+          const snap = taskId
+            ? globalTaskTraceStore.get(taskId)
+            : globalTaskTraceStore.getBySession(sessionId);
+          const turnCost = isDeepSeekModelId(activeModelId)
+            ? estimateDeepSeekTurnCostCny({
+                apiModelId: activeModelId,
+                inputTokens: inTok,
+                outputTokens: outTok,
+                cacheReadTokens: cacheHitTok,
+                peak: isDeepSeekPeakHour(),
+              })
+            : 0;
+          sessionCostCny += turnCost;
           emitRuntimeEvent({
             type: 'goal_usage',
             sessionId,
@@ -4130,10 +4396,22 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
               tokenBudget: budget,
               inputTokens: inTok,
               outputTokens: outTok,
+              cacheReadTokens: cacheHitTok,
+              cacheWriteTokens: cacheMissTok,
+              cacheReadTokensTotal: snap?.cacheReadTokens ?? cacheHitTok,
+              cacheWriteTokensTotal: snap?.cacheWriteTokens ?? cacheMissTok,
+              estimatedCostCny: turnCost,
+              estimatedCostCnyTotal: sessionCostCny,
+              peakHour: isDeepSeekPeakHour(),
+              modelId: activeModelId,
+              thinkingEnabled,
               turnIndex: modelTurnIndex,
               remaining: Math.max(0, budget - activeGoal.tokensUsed),
+              latencyMs,
+              taskId,
             },
           });
+          if (llmEvt) emitTraceUpdated?.(llmEvt);
           yield {
             type: 'usage' as const,
             usage: {
@@ -4190,19 +4468,26 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       ? `${officialClinePrompt}\n\n${memorySection}`
       : officialClinePrompt;
 
-    const toolPolicies =
+    const baseToolPolicies =
       typeof createToolPoliciesWithPreset === 'function'
         ? createToolPoliciesWithPreset(
             isReadOnlyTurn ? 'plan' : manifest.executionMode === 'auto' ? 'yolo' : 'default'
           )
         : undefined;
+    const toolPolicies =
+      baseToolPolicies &&
+      typeof overlayToolPoliciesWithHardRules === 'function' &&
+      policyGate?.permissionRuleset?.length
+        ? overlayToolPoliciesWithHardRules(baseToolPolicies, policyGate.permissionRuleset)
+        : baseToolPolicies;
 
     const mergedTools =
       typeof applyStandardToolAliases === 'function'
         ? applyStandardToolAliases([...deepAutoCodeTools, ...builtinTools])
         : [...deepAutoCodeTools, ...builtinTools];
+    // Plan/read-only: keep investigation shells (CommandGuard blocks mutators); drop editors.
     const activeTurnTools = mergedTools.filter((t) =>
-      isReadOnlyTurn
+      isReadOnlyTurn || manifest.executionMode === 'plan'
         ? ![
             'edit_file',
             'str_replace',
@@ -4210,6 +4495,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             'apply_patch',
             'editor',
             'auto_build_and_test',
+            'connect_remote_ssh',
           ].includes(t.name)
         : true
     );
@@ -4226,10 +4512,31 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       clientVersion: '1.1.0',
       model: clineModelAdapter,
       toolPolicies,
+      mistakeTracker: mistakeTracker ?? undefined,
+      loopDetection: loopDetection ?? undefined,
       getContextBudget: () => ({
         tokensUsed: activeGoal.tokensUsed,
         tokenBudget: activeGoal.tokenBudget,
       }),
+      requestToolApproval: async ({ toolName, args, summary }) => {
+        const filePath =
+          typeof args.filePath === 'string'
+            ? args.filePath
+            : typeof args.path === 'string'
+              ? args.path
+              : undefined;
+        const command = typeof args.command === 'string' ? args.command : undefined;
+        const decision = await this.capabilityRegistry.requestUserApproval({
+          sessionId,
+          toolName,
+          summary: summary || `Approve tool '${toolName}'`,
+          risk: 'high',
+          targetPath: filePath,
+          command,
+          arguments: args,
+        });
+        return { approved: decision.approved, reason: decision.reason };
+      },
       systemPrompt:
         `${officialClinePromptWithMemory}\n\n` +
         `# DeepAutoCode Desktop IDE Environment & Guidelines\n` +
@@ -4276,10 +4583,79 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           if (event.type === 'assistant-text-delta' && event.text) {
             await streamText(event.text);
           }
+          if (event.type === 'context.pressure') {
+            emitRuntimeEvent({
+              type: 'goal_usage',
+              sessionId,
+              payload: {
+                tokensUsed: activeGoal.tokensUsed,
+                tokenBudget: Number(activeGoal.tokenBudget ?? 180000),
+                remaining: Math.max(
+                  0,
+                  Number(activeGoal.tokenBudget ?? 180000) - activeGoal.tokensUsed
+                ),
+                contextPressure: true,
+                fillRatio: event.fillRatio,
+                compactionStage: event.stage,
+                compactionTrigger: event.trigger,
+                warnBudget: Boolean(event.warnBudget),
+              },
+            });
+            const compactEvt = globalTaskTraceStore.recordSignal?.({
+              workspaceRoot: manifest.workspaceRoot,
+              sessionId,
+              taskId,
+              signal: 'compaction',
+              summary: `${event.stage || 'pressure'} · ${event.reason || ''} · trigger=${event.trigger || 'n/a'}`,
+              detail: {
+                fillRatio: event.fillRatio,
+                stage: event.stage,
+                trigger: event.trigger,
+                warnBudget: event.warnBudget,
+              },
+            });
+            if (compactEvt) emitTraceUpdated?.(compactEvt);
+          }
+          if (event.type === 'agent.mistake' || event.type === 'agent.loop') {
+            const signalEvt = globalTaskTraceStore.recordSignal?.({
+              workspaceRoot: manifest.workspaceRoot,
+              sessionId,
+              taskId,
+              signal: event.type === 'agent.loop' ? 'loop' : 'mistake',
+              summary:
+                event.reason ||
+                `${event.kind || event.type} · consecutive=${event.consecutiveMistakes ?? '?'}`,
+              detail: {
+                kind: event.kind,
+                toolName: event.toolName,
+                count: event.count,
+                consecutiveMistakes: event.consecutiveMistakes,
+              },
+            });
+            if (signalEvt) emitTraceUpdated?.(signalEvt);
+          }
         },
-        onBeforeFinish: async ({ assistantText, iterations }) => {
+        onBeforeFinish: async ({ assistantText, iterations, consecutiveMistakes }) => {
           if (isReadOnlyTurn || manifest.executionMode !== 'auto' || iterations >= maxToolCallingTurns - 2) {
             return { shouldContinue: false };
+          }
+
+          // MistakeTracker / LoopDetection: treat high consecutive mistakes like verify fail
+          if (
+            typeof consecutiveMistakes === 'number' &&
+            consecutiveMistakes >= 4 &&
+            selfHealCount < selfHealBudget
+          ) {
+            selfHealCount += 1;
+            autoContinuationCount += 1;
+            mistakeTracker?.recordSuccess();
+            return {
+              shouldContinue: true,
+              prompt: buildGoalContinuationPrompt(
+                activeGoal,
+                `检测到连续失误/循环（MistakeTracker consecutive=${consecutiveMistakes}）。请停止重复同一工具调用：换参数、换工具，或先 summarize 失败原因再 edit_file。自愈进度 ${selfHealCount}/${selfHealBudget}。`
+              ),
+            };
           }
 
           // Token budget exceeded → ask model to summarize and stop expanding exploration
@@ -4452,6 +4828,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                 },
               });
             }
+            onCircuitTriggered?.();
             return {
               shouldContinue: true,
               prompt:

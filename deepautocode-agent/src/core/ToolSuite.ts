@@ -7,6 +7,7 @@ import {
   WorkspaceFileIndex,
   type WorkspaceFileIndexOptions,
 } from './WorkspaceFileIndex.js';
+import { evaluatePermissionRules, toolNameToAction } from './RulePermission.js';
 
 const execAsync = promisify(exec);
 
@@ -71,8 +72,9 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
       edit_file: 'deny',
       write_file: 'deny',
       apply_patch: 'deny',
-      run_commands: 'deny',
-      run_command: 'deny',
+      // Allowed for investigation; CommandGuard blocks mutating shells at policy/executor.
+      run_commands: 'allow',
+      run_command: 'allow',
     };
   }
   return {
@@ -94,6 +96,37 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
     run_commands: 'ask',
     run_command: 'ask',
   };
+}
+
+/**
+ * Overlay hard workspace rules onto a tool policy map.
+ * deny beats everything; ask upgrades allow → ask (never softens deny).
+ * Resource-specific rules still enforced later at CapabilityRegistry with real paths.
+ */
+export function overlayToolPoliciesWithHardRules(
+  base: ToolPolicyMap,
+  ruleset: Array<{ action: string; resource: string; effect: 'allow' | 'deny' | 'ask' }>
+): ToolPolicyMap {
+  if (!ruleset?.length) return { ...base };
+  const MUTATORS = [
+    'editor',
+    'edit_file',
+    'write_file',
+    'apply_patch',
+    'run_command',
+    'run_commands',
+    'auto_build_and_test',
+    'connect_remote_ssh',
+  ];
+  const next: ToolPolicyMap = { ...base };
+  for (const tool of MUTATORS) {
+    const current = next[tool] || 'allow';
+    if (current === 'deny') continue;
+    const decision = evaluatePermissionRules(toolNameToAction(tool), '*', ruleset);
+    if (decision.effect === 'deny') next[tool] = 'deny';
+    else if (decision.effect === 'ask' && current === 'allow') next[tool] = 'ask';
+  }
+  return next;
 }
 
 export {
@@ -133,6 +166,8 @@ export interface CreateBuiltinToolsOptions {
   /** Shared workspace path index; speeds repeated search_codebase calls. */
   fileIndex?: WorkspaceFileIndex;
   fileIndexOptions?: WorkspaceFileIndexOptions;
+  /** When `plan`, mutating shells are blocked even if bash fallback runs locally. */
+  executionMode?: 'plan' | 'auto' | 'manual';
 }
 
 async function localSearchFallback(
@@ -160,6 +195,7 @@ async function localSearchFallback(
  */
 export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentTool<any, any>[] {
   const { cwd, shell, enableEditor = true, executors = {}, fileIndexOptions } = options;
+  const planModeShell = options.executionMode === 'plan';
   const fileIndex = options.fileIndex ?? new WorkspaceFileIndex(cwd, fileIndexOptions);
   const tools: AgentTool<any, any>[] = [];
 
@@ -402,6 +438,10 @@ export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentToo
           return 'No command provided.';
         }
         const combinedCmd = cmdList.join(' && ');
+        if (planModeShell) {
+          const { assertCommandAllowedInPlanMode } = await import('./CommandGuard.js');
+          assertCommandAllowedInPlanMode(combinedCmd);
+        }
         if (executors.bash) {
           return await executors.bash({ command: combinedCmd });
         }

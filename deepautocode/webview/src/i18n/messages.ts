@@ -1,4 +1,4 @@
-import type { AppLocale } from './types.js';
+﻿import type { AppLocale } from './types.js';
 import { SETTINGS_MESSAGES } from './settingsMessages.js';
 import { WELCOME_MESSAGES } from './welcomeMessages.js';
 
@@ -127,6 +127,11 @@ const en: Dict = {
   'dock.sessions': 'Sessions',
   'dock.changes': 'Changes',
   'dock.history': 'History',
+  'dock.trace': 'Task Detail',
+  'trace.empty': 'No task trace yet. Run an Auto turn to populate the timeline.',
+  'trace.refresh': 'Refresh',
+  'trace.cache': 'cache',
+
   'settings.title': 'DeepAutoCode Settings',
   'settings.nav.general': 'General & Project',
   'settings.nav.models': 'Models & Providers',
@@ -311,6 +316,10 @@ const zhCN: Dict = {
   'dock.sessions': '会话',
   'dock.changes': '变更',
   'dock.history': '历史',
+  'dock.trace': '任务详情',
+  'trace.empty': '暂无任务 Trace。跑一轮 Auto 后这里会显示时间线。',
+  'trace.refresh': '刷新',
+  'trace.cache': '缓存',
   'settings.title': 'DeepAutoCode 设置',
   'settings.nav.general': '常规与项目',
   'settings.nav.models': '模型与 Provider',
@@ -493,6 +502,10 @@ const zhTW: Dict = {
   'dock.sessions': '工作階段',
   'dock.changes': '變更',
   'dock.history': '歷程',
+  'dock.trace': '任務詳情',
+  'trace.empty': '尚無任務 Trace。跑一輪 Auto 後這裡會顯示時間線。',
+  'trace.refresh': '重新整理',
+  'trace.cache': '快取',
   'settings.title': 'DeepAutoCode 設定',
   'settings.nav.general': '一般與專案',
   'settings.nav.models': '模型與 Provider',

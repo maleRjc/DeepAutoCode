@@ -46,6 +46,9 @@ export const RequestMessageSchema = z.object({
     'capability.invoke',
     'extensions.check',
     'diagnostics.export',
+    'trace.get',
+    'trace.list',
+    'completion.fim',
   ]),
   requestId: z.string().min(1),
   sessionId: z.string().optional(),
@@ -92,6 +95,7 @@ export const EventMessageSchema = z.object({
     'circuit.breaker.triggered',
     'artifact.created',
     'goal.usage',
+    'trace.updated',
   ]),
   sessionId: z.string(),
   sequence: z.number().int().nonnegative(),
@@ -232,6 +236,14 @@ export interface CapabilityExecutionContext {
   workspaceRoot: string;
   executionMode: AgentExecutionMode;
   signal?: AbortSignal;
+  /** Hard forbid/ask rules compiled from workspace rule docs (beats Auto allow). */
+  permissionRuleset?: Array<{
+    action: string;
+    resource: string;
+    effect: 'allow' | 'deny' | 'ask';
+    source?: string;
+    reason?: string;
+  }>;
 }
 
 export interface CapabilityAuditEntry {

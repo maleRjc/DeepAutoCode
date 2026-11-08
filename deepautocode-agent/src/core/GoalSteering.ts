@@ -110,15 +110,14 @@ Stop starting new exploratory tool calls and concisely summarize:
 }
 
 /**
- * Automatic Phase-Based Multi-Tier Model Router (GUI & Agent-Lifecycle Driven — Zero CLI Commands Required).
+ * Automatic Phase-Based Multi-Tier Model Router (GUI & Agent-Lifecycle Driven).
  *
- * Inspired by Claude Code's automatic Haiku (fast tool/search) vs. Sonnet/Opus (deep reasoning/coding) routing:
- * 1. **Fast Tool Execution Tier (`deepseek-chat`)**:
- *    - Turn 1 initial file-discovery call (when no files have been read/prefetched yet): avoids wasting 20s of R1 CoT just to emit `read_file`.
- *    - Post-edit build/test verification turns (`hasEditedFiles && !hasBuildOrTestFailure`): after code is already written, running `make -j16` and summarizing test output is fast and deterministic.
- * 2. **Deep Reasoner Tier (`deepseek-reasoner`)**:
- *    - Automatically activated during the **Root-Cause Diagnosis & Fix Synthesis Phase** (once source files are in context, `hasReadFiles === true` and `hasEditedFiles === false`) when diagnosing complex bugs/failures, OR
- *    - Automatically activated on any **Self-Heal Turn** (`selfHealCount > 0` or `hasBuildOrTestFailure === true`) when a build or test (`#wrong != 0` / `FAILED`) fails and deep root-cause rethinking is required.
+ * DeepSeek V4 routing (Flash / V4-Pro × thinking on/off):
+ * 1. **Fast tool tier (`deepseek-flash`, thinking off)**: discovery + verify turns.
+ * 2. **Daily Auto tier (`deepseek-flash`, thinking low)**: routine coding after context is warm.
+ * 3. **Deep tier (`deepseek-v4-pro`, thinking high)**: Plan/complex debug, self-heal, multi-file synthesis.
+ *
+ * Legacy UI ids `deepseek-chat` / `deepseek-reasoner` remain accepted as aliases.
  */
 export function resolveTieredModelForTurn(params: {
   configuredModelId: string;
@@ -139,6 +138,8 @@ export function resolveTieredModelForTurn(params: {
   routingMode?: 'auto' | 'force-fast' | 'force-reasoner';
 }): {
   effectiveModelId: string;
+  thinkingEnabled: boolean;
+  reasoningEffort: 'low' | 'high' | 'max' | null;
   tier: 'fast-tool' | 'deep-reasoner' | 'default';
   reason: string;
 } {
@@ -163,32 +164,57 @@ export function resolveTieredModelForTurn(params: {
   if (!isDeepSeek) {
     return {
       effectiveModelId: configuredModelId,
+      thinkingEnabled: false,
+      reasoningEffort: null,
       tier: 'default',
       reason: 'non-deepseek-provider',
     };
   }
 
+  const flashFast = (reason: string) => ({
+    effectiveModelId: 'deepseek-flash',
+    thinkingEnabled: false,
+    reasoningEffort: null as null,
+    tier: 'fast-tool' as const,
+    reason,
+  });
+  const flashThinkLow = (reason: string) => ({
+    effectiveModelId: 'deepseek-flash',
+    thinkingEnabled: true,
+    reasoningEffort: 'low' as const,
+    tier: 'fast-tool' as const,
+    reason,
+  });
+  const proThinkHigh = (reason: string) => ({
+    effectiveModelId: 'deepseek-v4-pro',
+    thinkingEnabled: true,
+    reasoningEffort: 'high' as const,
+    tier: 'deep-reasoner' as const,
+    reason,
+  });
+
   if (routingMode === 'force-fast') {
-    return {
-      effectiveModelId: 'deepseek-chat',
-      tier: 'fast-tool',
-      reason: 'ui-force-fast',
-    };
+    return flashFast('ui-force-fast');
   }
   if (routingMode === 'force-reasoner') {
-    return {
-      effectiveModelId: 'deepseek-reasoner',
-      tier: 'deep-reasoner',
-      reason: 'ui-force-reasoner',
-    };
+    return proThinkHigh('ui-force-reasoner');
   }
 
   const isComplexDiagnosisPrompt =
     /(?:还是不对|不对|为什么|原因|根因|#wrong|FAILED|Out of bounds|报错|失败|异常|死锁|崩溃|段错误|Segmentation fault|bug|kernel|自环|未初始化)/i.test(
       userPrompt
     );
+  const wantsLegacyReasoner =
+    configuredModelId === 'deepseek-reasoner' ||
+    configuredModelId === 'deepseek-v4-pro' ||
+    /force-reasoner/i.test(configuredModelId);
+  const isAuto =
+    configuredModelId === 'deepseek-auto' ||
+    configuredModelId === 'deepseek-chat' ||
+    configuredModelId === 'deepseek-flash' ||
+    !configuredModelId;
 
-  // 1. Self-heal / semantic failure / sticky mismatch / multi-file pending → deep-reasoner
+  // 1. Self-heal / semantic / mismatch / multi-file → Pro + thinking
   if (
     selfHealCount > 0 ||
     hasBuildOrTestFailure ||
@@ -204,62 +230,57 @@ export function resolveTieredModelForTurn(params: {
     } else if (multiFilePending && !hasBuildOrTestFailure && selfHealCount === 0) {
       reason = 'auto-promoted: multi-file change synthesis';
     }
-    return {
-      effectiveModelId: 'deepseek-reasoner',
-      tier: 'deep-reasoner',
-      reason,
-    };
+    return proThinkHigh(reason);
   }
 
-  // 2. Post-Edit Verification Turn: code was already modified, now just running make/test or summarizing -> use fast model
+  // 2. Post-edit verification → Flash, no thinking
   if (hasEditedFiles && !hasBuildOrTestFailure && !hasSemanticFailure) {
-    return {
-      effectiveModelId: 'deepseek-chat',
-      tier: 'fast-tool',
-      reason: 'auto-fast: post-edit build/test verification turn',
-    };
+    return flashFast('auto-fast: post-edit build/test verification turn');
   }
 
-  // 3. Turn 1 Initial File Discovery (before any files are read/prefetched into context):
-  //    Use fast model to emit parallel read_file / explore_codebase calls in ~1s instead of waiting 20s for R1 CoT
-  if (turnIndex === 1 && !hasReadFiles && configuredModelId !== 'deepseek-reasoner') {
-    return {
-      effectiveModelId: 'deepseek-chat',
-      tier: 'fast-tool',
-      reason: 'auto-fast: initial file discovery turn',
-    };
+  // 3. Turn 1 discovery → Flash, no thinking
+  if (turnIndex === 1 && !hasReadFiles && !wantsLegacyReasoner) {
+    return flashFast('auto-fast: initial file discovery turn');
   }
 
-  // 4. Root-Cause Diagnosis & Fix Synthesis Turn: files ARE in context (prefetched or read in Turn 1),
-  //    no edits made yet, and task is a bug diagnosis / root-cause fix -> promote to deep-reasoner
+  // 4. Root-cause diagnosis with files loaded → Pro + thinking
   if (
     hasReadFiles &&
     !hasEditedFiles &&
-    (isComplexDiagnosisPrompt ||
-      configuredModelId === 'deepseek-auto' ||
-      configuredModelId === 'deepseek-reasoner')
+    (isComplexDiagnosisPrompt || isAuto || wantsLegacyReasoner)
   ) {
-    return {
-      effectiveModelId: 'deepseek-reasoner',
-      tier: 'deep-reasoner',
-      reason: 'auto-promoted: root-cause diagnosis with source files loaded in context',
-    };
+    return proThinkHigh(
+      'auto-promoted: root-cause diagnosis with source files loaded in context'
+    );
   }
 
-  // 5. If user selected `deepseek-reasoner`, even on Turn 1 without prefetched files,
-  //    keep `deepseek-reasoner` if files were already in prompt or user explicitly chose reasoner;
-  //    if user selected `deepseek-auto`, default to fast `deepseek-chat` for routine turns.
+  // 5. deepseek-auto routine turns
   if (configuredModelId === 'deepseek-auto') {
-    return {
-      effectiveModelId: isComplexDiagnosisPrompt && turnIndex >= 2 ? 'deepseek-reasoner' : 'deepseek-chat',
-      tier: isComplexDiagnosisPrompt && turnIndex >= 2 ? 'deep-reasoner' : 'fast-tool',
-      reason: 'deepseek-auto phase routing',
-    };
+    if (isComplexDiagnosisPrompt && turnIndex >= 2) {
+      return proThinkHigh('deepseek-auto phase routing');
+    }
+    return flashThinkLow('deepseek-auto phase routing');
+  }
+
+  if (wantsLegacyReasoner) {
+    return proThinkHigh('configured-model: pro/reasoner');
+  }
+
+  if (
+    configuredModelId === 'deepseek-flash' ||
+    configuredModelId === 'deepseek-chat' ||
+    /flash|chat/i.test(configuredModelId)
+  ) {
+    return flashThinkLow('configured-model: flash');
   }
 
   return {
-    effectiveModelId: configuredModelId,
-    tier: /reasoner|r1/i.test(configuredModelId) ? 'deep-reasoner' : 'default',
+    effectiveModelId: configuredModelId.includes('pro')
+      ? 'deepseek-v4-pro'
+      : 'deepseek-flash',
+    thinkingEnabled: /pro|reasoner|r1/i.test(configuredModelId),
+    reasoningEffort: /pro|reasoner|r1/i.test(configuredModelId) ? 'high' : 'low',
+    tier: /pro|reasoner|r1/i.test(configuredModelId) ? 'deep-reasoner' : 'default',
     reason: 'configured-model',
   };
 }
