@@ -78,11 +78,32 @@ export class SessionBridge {
         case 'diff_proposed':
           this.eventBridge.emit(ev.sessionId, 'diff.proposed', ev.payload);
           break;
+        case 'diff_updated':
+          this.eventBridge.emit(ev.sessionId, 'diff.updated', ev.payload);
+          break;
+        case 'model_tier':
+          this.eventBridge.emit(ev.sessionId, 'model.tier', ev.payload);
+          break;
+        case 'checkpoint_created':
+          this.eventBridge.emit(ev.sessionId, 'checkpoint.created', ev.payload);
+          break;
         case 'session_state':
           this.eventBridge.emit(ev.sessionId, 'session.state.changed', ev.payload);
           break;
         case 'error':
           this.eventBridge.emit(ev.sessionId, 'runtime.error', ev.payload);
+          break;
+        case 'sandbox_branch_created':
+          this.eventBridge.emit(ev.sessionId, 'sandbox.branch.created', ev.payload);
+          break;
+        case 'circuit_breaker_triggered':
+          this.eventBridge.emit(ev.sessionId, 'circuit.breaker.triggered', ev.payload);
+          break;
+        case 'artifact_created':
+          this.eventBridge.emit(ev.sessionId, 'artifact.created', ev.payload);
+          break;
+        case 'goal_usage':
+          this.eventBridge.emit(ev.sessionId, 'goal.usage', ev.payload);
           break;
       }
     });
@@ -107,6 +128,8 @@ export class SessionBridge {
     modelId: string;
     apiKey?: string;
     executionMode?: AgentExecutionMode;
+    /** Stage W: isolate in git worktree (used by ∥ Parallel) */
+    useWorktree?: boolean;
   }): Promise<{
     sessionId: string;
     manifest: SessionManifest;
@@ -115,6 +138,7 @@ export class SessionBridge {
     const res = await this.runtime.start({
       title: input.title,
       prompt: input.prompt,
+      useWorktree: Boolean(input.useWorktree),
       config: {
         providerId: input.providerId,
         modelId: input.modelId,
@@ -206,6 +230,30 @@ export class SessionBridge {
     };
   }
 
+  async updateDiffProposed(params: {
+    sessionId: string;
+    diffId: string;
+    proposedContent: string;
+    writeToDisk?: boolean;
+    finalize?: 'accept' | 'reject' | 'keep';
+  }): Promise<DiffChangeRecord> {
+    const updated = await this.runtime.updateDiffProposed(
+      params.sessionId,
+      params.diffId,
+      params.proposedContent,
+      {
+        writeToDisk: params.writeToDisk,
+        finalize: params.finalize,
+      }
+    );
+    if (!updated) {
+      throw new Error(
+        `DIFF_NOT_FOUND: Diff "${params.diffId}" not found or not pending in session "${params.sessionId}"`
+      );
+    }
+    return updated;
+  }
+
   async reviewDiff(params: {
     sessionId: string;
     diffId: string;
@@ -240,14 +288,38 @@ export class SessionBridge {
   async cancelSession(sessionId: string, reason = 'Cancelled by user'): Promise<{
     abortedRuntime: boolean;
     cancelledApprovals: number;
+    pendingDiffsPreserved: number;
   }> {
     this.resourceManager.cancelSessionTask(sessionId, reason);
     const cancelledApprovals = this.approvalBridge.cancelSessionApprovals(sessionId, reason);
     const abortedRuntime = await this.runtime.abort(sessionId, reason);
+    // Stop preserves pending Diffs for Accept/Reject review (Cursor-like).
+    const diffs = await this.runtime.readDiffs(sessionId);
+    const pendingDiffsPreserved = diffs.filter((d) => d.status === 'pending').length;
     return {
       abortedRuntime,
       cancelledApprovals,
+      pendingDiffsPreserved,
     };
+  }
+
+  async reviewAllPendingDiffs(
+    sessionId: string,
+    action: 'accept' | 'reject'
+  ): Promise<DiffChangeRecord[]> {
+    return this.runtime.reviewAllPendingDiffs(sessionId, action);
+  }
+
+  async createCheckpoint(sessionId: string, label?: string) {
+    return this.runtime.createCheckpoint(sessionId, label);
+  }
+
+  async listCheckpoints(sessionId: string) {
+    return this.runtime.listCheckpoints(sessionId);
+  }
+
+  async restoreCheckpoint(sessionId: string, checkpointId: string) {
+    return this.runtime.restoreCheckpoint(sessionId, checkpointId);
   }
 
   async deleteSession(sessionId: string): Promise<boolean> {

@@ -8,6 +8,14 @@ import type { FileTreeNode } from './workbench-server/server.js';
 
 const execFileAsync = promisify(execFile);
 
+/** Marker written into local mirror placeholders so empty stubs are never mistaken for real remote content. */
+export const SSH_MIRROR_STUB_MARKER = '__DEEPAUTOCODE_SSH_STUB__\n';
+
+export function isSshMirrorStubContent(content: string | Buffer): boolean {
+  const text = typeof content === 'string' ? content : content.toString('utf-8');
+  return text === SSH_MIRROR_STUB_MARKER || text.startsWith('__DEEPAUTOCODE_SSH_STUB__');
+}
+
 export interface SshHostProfile {
   id: string;
   name: string;
@@ -244,6 +252,84 @@ export class SshRemoteManager {
 
   private askPassHelperPath: string | null = null;
   private pulledFileTimestampMap = new Map<string, number>();
+  /** Hash of last successfully pulled remote content (for dirty/conflict detection). */
+  private lastPulledContentHashMap = new Map<string, string>();
+  private lastRemoteContentHashMap = new Map<string, string>();
+
+  private hashContent(content: string): string {
+    // Lightweight FNV-1a 32-bit
+    let h = 0x811c9dc5;
+    for (let i = 0; i < content.length; i++) {
+      h ^= content.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  /**
+   * True when local mirror content diverged from the last successful remote pull.
+   */
+  async isMirrorDirty(relFilePath: string): Promise<boolean> {
+    if (!this.mirrorWorkspaceRoot) return false;
+    const cleanRel = relFilePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const localTarget = path.join(this.mirrorWorkspaceRoot, cleanRel);
+    try {
+      const local = await fs.readFile(localTarget, 'utf-8');
+      if (!local || isSshMirrorStubContent(local)) return false;
+      const last = this.lastPulledContentHashMap.get(cleanRel);
+      if (!last) return false;
+      return this.hashContent(local) !== last;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Peek remote content without writing mirror; used for conflict detection.
+   */
+  async peekRemoteFile(relFilePath: string): Promise<string | null> {
+    if (!this.activeProfile || this.activeProfile.authMethod === 'local-loopback') return null;
+    const cleanRel = relFilePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const cmd = `cd ${this.quoteRemotePath(this.activeProfile.remotePath)} && head -c 1048576 "${cleanRel.replace(
+      /"/g,
+      '\\"'
+    )}"`;
+    const { stdout } = await this.execSsh(this.activeProfile, cmd, {
+      timeout: 15000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    return stdout;
+  }
+
+  async compareWithRemote(relFilePath: string): Promise<{
+    dirtyLocal: boolean;
+    remoteChanged: boolean;
+    conflict: boolean;
+    localHash?: string;
+    remoteHash?: string;
+  }> {
+    const cleanRel = relFilePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    const dirtyLocal = await this.isMirrorDirty(cleanRel);
+    let remoteHash: string | undefined;
+    try {
+      const remote = await this.peekRemoteFile(cleanRel);
+      if (remote != null) {
+        remoteHash = this.hashContent(remote);
+        this.lastRemoteContentHashMap.set(cleanRel, remoteHash);
+      }
+    } catch {
+      // ignore peek failures
+    }
+    const lastPulled = this.lastPulledContentHashMap.get(cleanRel);
+    const remoteChanged = Boolean(remoteHash && lastPulled && remoteHash !== lastPulled);
+    return {
+      dirtyLocal,
+      remoteChanged,
+      conflict: dirtyLocal && remoteChanged,
+      localHash: lastPulled,
+      remoteHash,
+    };
+  }
 
   private async ensureAskPassHelper(): Promise<string> {
     if (this.askPassHelperPath) {
@@ -822,9 +908,14 @@ export class SshRemoteManager {
         const localTarget = path.join(mirrorDir, relFile);
         await fs.mkdir(path.dirname(localTarget), { recursive: true });
         try {
-          await fs.access(localTarget);
+          const existing = await fs.readFile(localTarget);
+          // Keep real pulled content; refresh stub markers only when missing/empty/stub.
+          if (existing.byteLength === 0 || isSshMirrorStubContent(existing)) {
+            await fs.writeFile(localTarget, SSH_MIRROR_STUB_MARKER, 'utf-8');
+          }
         } catch {
-          await fs.writeFile(localTarget, '', 'utf-8');
+          // Tree placeholder only — never treat this as synchronized remote bytes.
+          await fs.writeFile(localTarget, SSH_MIRROR_STUB_MARKER, 'utf-8');
         }
       }
 
@@ -888,7 +979,11 @@ export class SshRemoteManager {
     return buf;
   }
 
-  async pullRemoteFileToMirror(relFilePath: string, force = false): Promise<string | null> {
+  async pullRemoteFileToMirror(
+    relFilePath: string,
+    force = false,
+    opts?: { allowOverwriteDirty?: boolean }
+  ): Promise<string | null> {
     if (!this.activeProfile || !this.mirrorWorkspaceRoot) return null;
     if (this.activeProfile.authMethod === 'local-loopback') return null;
 
@@ -899,12 +994,40 @@ export class SshRemoteManager {
     }
     const localTarget = path.join(this.mirrorWorkspaceRoot, cleanRel);
 
-    if (!force) {
+    // Protect dirty local edits unless caller explicitly allows overwrite.
+    if (!force && !opts?.allowOverwriteDirty) {
+      const dirty = await this.isMirrorDirty(cleanRel);
+      if (dirty) {
+        const cmp = await this.compareWithRemote(cleanRel).catch(() => null);
+        const err: any = new Error(
+          `SSH_LOCAL_DIRTY: Local mirror has unsaved/diverged edits for "${cleanRel}". Pass allowOverwriteDirty or resolve conflict.`
+        );
+        err.code = 'SSH_LOCAL_DIRTY';
+        err.conflict = Boolean(cmp?.conflict);
+        err.filePath = cleanRel;
+        throw err;
+      }
+    }
+
+    // Stubs / empty placeholders must always re-pull — they are not real remote content.
+    let forcePull = force;
+    if (!forcePull) {
+      try {
+        const cached = await fs.readFile(localTarget, 'utf-8');
+        if (!cached || isSshMirrorStubContent(cached)) {
+          forcePull = true;
+        }
+      } catch {
+        forcePull = true;
+      }
+    }
+
+    if (!forcePull) {
       const lastPulledAt = this.pulledFileTimestampMap.get(cleanRel) ?? 0;
       if (Date.now() - lastPulledAt < 30_000) {
         try {
           const cachedContent = await fs.readFile(localTarget, 'utf-8');
-          if (cachedContent.length > 0) {
+          if (cachedContent.length > 0 && !isSshMirrorStubContent(cachedContent)) {
             return cachedContent;
           }
         } catch {
@@ -924,6 +1047,8 @@ export class SshRemoteManager {
     await fs.mkdir(path.dirname(localTarget), { recursive: true });
     await fs.writeFile(localTarget, stdout, 'utf-8');
     this.pulledFileTimestampMap.set(cleanRel, Date.now());
+    this.lastPulledContentHashMap.set(cleanRel, this.hashContent(stdout));
+    this.lastRemoteContentHashMap.set(cleanRel, this.hashContent(stdout));
     return stdout;
   }
 
@@ -935,6 +1060,23 @@ export class SshRemoteManager {
     if (!this.activeProfile || this.activeProfile.authMethod === 'local-loopback') return;
 
     const cleanRel = relFilePath.replace(/\\/g, '/').replace(/^\/+/, '');
+    // Detect remote divergence before push
+    try {
+      const cmp = await this.compareWithRemote(cleanRel);
+      if (cmp.remoteChanged && !cmp.dirtyLocal) {
+        // Remote moved but local still equals last pull — soft notice via hash update after push
+      } else if (cmp.conflict) {
+        const err: any = new Error(
+          `SSH_CONFLICT: Both local mirror and remote changed for "${cleanRel}". Resolve before push.`
+        );
+        err.code = 'SSH_CONFLICT';
+        err.filePath = cleanRel;
+        throw err;
+      }
+    } catch (err) {
+      if ((err as any)?.code === 'SSH_CONFLICT') throw err;
+    }
+
     this.pulledFileTimestampMap.set(cleanRel, Date.now());
     const rawBuf = Buffer.from(content, 'utf-8');
     const relDir = path.posix.dirname(cleanRel);
@@ -948,6 +1090,9 @@ export class SshRemoteManager {
         `cd ${this.quoteRemotePath(this.activeProfile.remotePath)} && ` +
         `${mkdirPart}: > "${escapedRel}"`;
       await this.execSsh(this.activeProfile, cmd, { timeout: 15000 });
+      const h = this.hashContent(content);
+      this.lastPulledContentHashMap.set(cleanRel, h);
+      this.lastRemoteContentHashMap.set(cleanRel, h);
       return;
     }
 
@@ -961,6 +1106,46 @@ export class SshRemoteManager {
         `${prefix}printf '%s' "${b64}" | base64 -d ${redirectOp} "${escapedRel}"`;
       await this.execSsh(this.activeProfile, cmd, { timeout: 20000 });
     }
+    const h = this.hashContent(content);
+    this.lastPulledContentHashMap.set(cleanRel, h);
+    this.lastRemoteContentHashMap.set(cleanRel, h);
+  }
+
+  /**
+   * Reconnect using the active profile without wiping the mirror workspace.
+   */
+  async reconnect(): Promise<{
+    status: SshConnectionStatus;
+    workspaceRoot: string;
+    workspaceDisplayLabel: string;
+  }> {
+    if (!this.activeProfile) {
+      throw new Error('SSH_NOT_CONNECTED: No active profile to reconnect');
+    }
+    const profile = { ...this.activeProfile };
+    const mirrorKeep = this.mirrorWorkspaceRoot;
+    // Soft reconnect: re-test and refresh, keep mirror path
+    const testRes = await this.testConnection(profile);
+    if (!testRes.ok) {
+      throw new Error(`SSH_RECONNECT_FAILED: ${testRes.message}`);
+    }
+    this.remoteOsInfo = testRes.remoteOsInfo || this.remoteOsInfo;
+    this.lastLatencyMs = testRes.latencyMs;
+    this.connectedAt = new Date().toISOString();
+    this.activeProfile = profile;
+    if (profile.authMethod !== 'local-loopback') {
+      this.mirrorWorkspaceRoot = mirrorKeep || this.mirrorWorkspaceRoot;
+      await this.refreshActiveMirror();
+    }
+    const displayDir =
+      profile.remotePath === '/'
+        ? '/'
+        : path.posix.basename(profile.remotePath.replace(/\/+$/, '')) || 'workspace';
+    return {
+      status: this.getStatus(),
+      workspaceRoot: this.mirrorWorkspaceRoot,
+      workspaceDisplayLabel: `[SSH: ${profile.username}@${profile.host}] ${displayDir}`,
+    };
   }
 
   disconnect(): SshConnectionStatus {
@@ -969,6 +1154,9 @@ export class SshRemoteManager {
     this.lastLatencyMs = 0;
     this.connectedAt = '';
     this.mirrorWorkspaceRoot = '';
+    this.pulledFileTimestampMap.clear();
+    this.lastPulledContentHashMap.clear();
+    this.lastRemoteContentHashMap.clear();
     return this.getStatus();
   }
 }

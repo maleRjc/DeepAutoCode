@@ -246,3 +246,4 @@ Level 3: 全自动安全演化 (Continuous Autonomous Evolution)
 ---
 
 *本文档持久保存在 `doc/BOOTSTRAPPING-AND-SELF-EVOLUTION.md`，作为 DeepAutoCode 系统工程演化的核心指导规范。*
+

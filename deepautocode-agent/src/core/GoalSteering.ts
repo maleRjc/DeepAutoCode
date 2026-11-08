@@ -22,7 +22,13 @@ export interface GoalState {
   verifiedByCommand: boolean;
 }
 
-export function createGoalState(objective: string, tokenBudget: number | null = null): GoalState {
+/** Default per-run token budget for context compaction + budget-limit steering. */
+export const DEFAULT_GOAL_TOKEN_BUDGET = 180_000;
+
+export function createGoalState(
+  objective: string,
+  tokenBudget: number | null = DEFAULT_GOAL_TOKEN_BUDGET
+): GoalState {
   const cleanObjective = objective.replace(/^\/goal\s+/i, '').trim();
   return {
     id: `goal_${Date.now()}`,
@@ -35,6 +41,11 @@ export function createGoalState(objective: string, tokenBudget: number | null = 
     consecutiveBlockedTurns: 0,
     verifiedByCommand: false,
   };
+}
+
+export function isGoalTokenBudgetExceeded(goal: GoalState, ratio = 0.92): boolean {
+  if (goal.tokenBudget == null || goal.tokenBudget <= 0) return false;
+  return goal.tokensUsed >= goal.tokenBudget * ratio;
 }
 
 export function formatGoalElapsed(goal: GoalState): string {
@@ -118,6 +129,14 @@ export function resolveTieredModelForTurn(params: {
   hasReadFiles?: boolean;
   hasEditedFiles?: boolean;
   hasBuildOrTestFailure?: boolean;
+  /** Post-edit TypeScript/semantic diagnostics failed */
+  hasSemanticFailure?: boolean;
+  /** Consecutive edit_file oldText mismatches in this session */
+  editMismatchCount?: number;
+  /** Multiple files mutated this session */
+  multiFilePending?: boolean;
+  /** UI lock: auto | force-fast | force-reasoner */
+  routingMode?: 'auto' | 'force-fast' | 'force-reasoner';
 }): {
   effectiveModelId: string;
   tier: 'fast-tool' | 'deep-reasoner' | 'default';
@@ -132,6 +151,10 @@ export function resolveTieredModelForTurn(params: {
     hasReadFiles = false,
     hasEditedFiles = false,
     hasBuildOrTestFailure = false,
+    hasSemanticFailure = false,
+    editMismatchCount = 0,
+    multiFilePending = false,
+    routingMode = 'auto',
   } = params;
 
   const isDeepSeek =
@@ -145,22 +168,51 @@ export function resolveTieredModelForTurn(params: {
     };
   }
 
+  if (routingMode === 'force-fast') {
+    return {
+      effectiveModelId: 'deepseek-chat',
+      tier: 'fast-tool',
+      reason: 'ui-force-fast',
+    };
+  }
+  if (routingMode === 'force-reasoner') {
+    return {
+      effectiveModelId: 'deepseek-reasoner',
+      tier: 'deep-reasoner',
+      reason: 'ui-force-reasoner',
+    };
+  }
+
   const isComplexDiagnosisPrompt =
     /(?:还是不对|不对|为什么|原因|根因|#wrong|FAILED|Out of bounds|报错|失败|异常|死锁|崩溃|段错误|Segmentation fault|bug|kernel|自环|未初始化)/i.test(
       userPrompt
     );
 
-  // 1. Self-Heal Turn: previous compile or test verification failed -> ALWAYS promote to deep-reasoner
-  if (selfHealCount > 0 || hasBuildOrTestFailure) {
+  // 1. Self-heal / semantic failure / sticky mismatch / multi-file pending → deep-reasoner
+  if (
+    selfHealCount > 0 ||
+    hasBuildOrTestFailure ||
+    hasSemanticFailure ||
+    editMismatchCount >= 2 ||
+    multiFilePending
+  ) {
+    let reason = 'auto-promoted: build/test failure self-healing requires deep reasoning';
+    if (hasSemanticFailure) {
+      reason = 'auto-promoted: post-edit semantic diagnostics require deep reasoning';
+    } else if (editMismatchCount >= 2) {
+      reason = 'auto-promoted: repeated edit_file mismatch requires deep reasoning';
+    } else if (multiFilePending && !hasBuildOrTestFailure && selfHealCount === 0) {
+      reason = 'auto-promoted: multi-file change synthesis';
+    }
     return {
       effectiveModelId: 'deepseek-reasoner',
       tier: 'deep-reasoner',
-      reason: 'auto-promoted: build/test failure self-healing requires deep reasoning',
+      reason,
     };
   }
 
   // 2. Post-Edit Verification Turn: code was already modified, now just running make/test or summarizing -> use fast model
-  if (hasEditedFiles && !hasBuildOrTestFailure) {
+  if (hasEditedFiles && !hasBuildOrTestFailure && !hasSemanticFailure) {
     return {
       effectiveModelId: 'deepseek-chat',
       tier: 'fast-tool',
@@ -241,9 +293,9 @@ export function classifyPromptIntent(rawPrompt: string): PromptIntentClassificat
     };
   }
 
-  // 1. Explicit read-only guard phrases from user or UI button
+  // 1. Explicit read-only guard phrases from user or UI button (incl. Ctrl+I INLINE_QUERY)
   if (
-    /(?:^\[READ_ONLY_ANALYSIS\]|只分析|仅分析|不要改|先别改|别修改|不修改|不要修改|只查询|只看|只解释|先分析一下.*不要)/i.test(
+    /(?:^\[(?:READ_ONLY_ANALYSIS|INLINE_QUERY)\]|只分析|仅分析|不要改|先别改|别修改|不修改|不要修改|只查询|只看|只解释|先分析一下.*不要)/i.test(
       cleaned
     )
   ) {
@@ -255,8 +307,8 @@ export function classifyPromptIntent(rawPrompt: string): PromptIntentClassificat
     };
   }
 
-  // 1b. Explicit force-auto-action from UI button
-  if (/^\[FORCE_AUTO_ACTION\]/i.test(cleaned)) {
+  // 1b. Explicit force-auto-action from UI / Ctrl+I INLINE_EDIT
+  if (/^\[(?:FORCE_AUTO_ACTION|INLINE_EDIT)\]/i.test(cleaned)) {
     return {
       intent: 'auto-action',
       allowFileMutations: true,

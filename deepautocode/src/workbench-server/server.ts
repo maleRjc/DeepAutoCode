@@ -5,9 +5,21 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { WebSocket, WebSocketServer } from 'ws';
-import { AgentClientBridge, EncryptedFileSecretStorage } from '@deepautocode/agent';
+import {
+  AgentClientBridge,
+  EncryptedFileSecretStorage,
+  extractCodeOutlineSymbols,
+  loadMcpConfigsFromWorkspace,
+  loadAgentMemory,
+  appendAgentMemory,
+  McpHost,
+  parseBuildDiagnostics,
+  rankDefinitionCandidates,
+  type BuildDiagnostic,
+} from '@deepautocode/agent';
 import { buildWebviewCspHeader, generateCspNonce } from '../csp.js';
 import { ExtensionsMarketplaceManager } from '../extensions-manager.js';
+import { LspManager } from '../lsp/LspManager.js';
 import { SshRemoteManager } from '../ssh-remote.js';
 
 const execAsync = promisify(exec);
@@ -44,6 +56,10 @@ export interface IdeSettingsModel {
     autoSave: 'off' | 'afterDelay' | 'onFocusChange';
     theme: 'cursor-dark' | 'antigravity-midnight' | 'high-contrast';
   };
+  /** UI chrome / User Guide locale */
+  ui?: {
+    locale?: 'zh-CN' | 'zh-TW' | 'en';
+  };
   agent: {
     defaultExecutionMode: 'plan' | 'auto' | 'manual';
     autoApproveReadFiles: boolean;
@@ -51,14 +67,26 @@ export interface IdeSettingsModel {
     approvalTimeoutSeconds: number;
     includeActiveFileContext: boolean;
     commandAllowlist: string[];
+    /** Global User Rules (always injected) */
+    userRules: string;
     projectRules: string;
+    /** Preferred build command for post-edit verification (overridable by .deepautocode/verify.json) */
+    verifyBuildCommand: string;
+    /** Preferred test command for post-edit verification */
+    verifyTestCommand: string;
+    /** Auto mode creates evolve/* sandbox branches before first mutation */
+    enableEvolveSandbox: boolean;
   };
   mcpServers: Array<{
     id: string;
     name: string;
-    transport: 'stdio' | 'sse';
+    transport: 'stdio' | 'sse' | 'http';
     commandOrUrl: string;
     enabled: boolean;
+    env?: Record<string, string>;
+    /** HTTP headers for SSE / Streamable HTTP (Authorization, API keys, …) */
+    headers?: Record<string, string>;
+    disabledTools?: string[];
   }>;
   recentWorkspaces: string[];
   activeWorkspace?: string;
@@ -70,9 +98,12 @@ const DEFAULT_IDE_SETTINGS: IdeSettingsModel = {
     tabSize: 2,
     wordWrap: true,
     lineNumbers: true,
-    minimap: true,
+    minimap: false,
     autoSave: 'afterDelay',
     theme: 'cursor-dark',
+  },
+  ui: {
+    locale: 'zh-CN',
   },
   agent: {
     defaultExecutionMode: 'auto',
@@ -89,8 +120,12 @@ const DEFAULT_IDE_SETTINGS: IdeSettingsModel = {
       'npm run typecheck',
       'npm run build',
     ],
+    userRules: '',
     projectRules:
       '1. Follow TypeScript strict mode and ESM import conventions.\n2. Keep Cline SDK internal types isolated inside deepautocode-agent.\n3. Enforce workspace path canonicalization and never store plaintext API keys.',
+    verifyBuildCommand: 'npm run build',
+    verifyTestCommand: 'npm test',
+    enableEvolveSandbox: true,
   },
   mcpServers: [
     {
@@ -99,6 +134,7 @@ const DEFAULT_IDE_SETTINGS: IdeSettingsModel = {
       transport: 'stdio',
       commandOrUrl: 'builtin://capability-registry/workspace-fs',
       enabled: true,
+      disabledTools: [],
     },
     {
       id: 'mcp-git-inspector',
@@ -106,6 +142,7 @@ const DEFAULT_IDE_SETTINGS: IdeSettingsModel = {
       transport: 'stdio',
       commandOrUrl: 'npx -y @modelcontextprotocol/server-git',
       enabled: true,
+      disabledTools: [],
     },
   ],
   recentWorkspaces: [],
@@ -210,6 +247,55 @@ export async function createWorkbenchServer(options?: {
 
   const extManager = new ExtensionsMarketplaceManager(REPO_ROOT, dataRoot);
   const sshManager = new SshRemoteManager(dataRoot);
+  const lspManager = new LspManager();
+  if (activeWorkspaceRoot) {
+    void lspManager.setWorkspace(activeWorkspaceRoot).catch(() => undefined);
+  }
+  let workspaceProblems: BuildDiagnostic[] = [];
+
+  async function persistProblems(problems: BuildDiagnostic[]): Promise<void> {
+    workspaceProblems = problems.slice(0, 200);
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      problems: workspaceProblems,
+    };
+    await fs.mkdir(dataRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(dataRoot, 'problems.json'),
+      JSON.stringify(payload, null, 2),
+      'utf-8'
+    );
+    if (activeWorkspaceRoot) {
+      try {
+        const wsDir = path.join(activeWorkspaceRoot, '.deepautocode');
+        await fs.mkdir(wsDir, { recursive: true });
+        await fs.writeFile(
+          path.join(wsDir, 'problems.json'),
+          JSON.stringify(payload, null, 2),
+          'utf-8'
+        );
+      } catch {
+        // ignore workspace write failures
+      }
+    }
+  }
+
+  async function mergeProblemsFromOutput(stdout: string, stderr: string): Promise<BuildDiagnostic[]> {
+    const parsed = parseBuildDiagnostics(stdout || '', stderr || '', { maxItems: 80 });
+    if (parsed.length === 0) return workspaceProblems;
+    const merged = [...parsed, ...workspaceProblems];
+    const seen = new Set<string>();
+    const deduped: BuildDiagnostic[] = [];
+    for (const d of merged) {
+      const key = `${d.file}:${d.line}:${d.severity}:${d.message.slice(0, 80)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(d);
+      if (deduped.length >= 120) break;
+    }
+    await persistProblems(deduped);
+    return workspaceProblems;
+  }
   let preSshLocalWorkspaceRoot = activeWorkspaceRoot;
   const wsSubscriptions = new Map<WebSocket, { clientId: string; detach: () => Promise<void> }>();
   let wsClientSeq = 0;
@@ -221,7 +307,7 @@ export async function createWorkbenchServer(options?: {
     bridge.capabilityRegistry.registerExecutor('open-file', async (input: any, ctx) => {
       const canonicalPath = ctx.canonicalPath!;
       const relPath = path.relative(activeWorkspaceRoot, canonicalPath).replace(/\\/g, '/');
-      await sshManager.pullRemoteFileToMirror(relPath).catch(() => undefined);
+      await sshManager.pullRemoteFileToMirror(relPath, true).catch(() => undefined);
       await fs.access(canonicalPath);
       return {
         opened: true,
@@ -234,7 +320,19 @@ export async function createWorkbenchServer(options?: {
     bridge.capabilityRegistry.registerExecutor('read-file', async (input: any, ctx) => {
       const canonicalPath = ctx.canonicalPath!;
       const relPath = path.relative(activeWorkspaceRoot, canonicalPath).replace(/\\/g, '/');
-      await sshManager.pullRemoteFileToMirror(relPath).catch(() => undefined);
+      try {
+        await sshManager.pullRemoteFileToMirror(relPath, false, {
+          allowOverwriteDirty: Boolean(input?.forceRemote),
+        });
+      } catch (err) {
+        if ((err as any)?.code === 'SSH_LOCAL_DIRTY') {
+          // Keep local dirty buffer; still read from mirror disk
+        } else {
+          await sshManager.pullRemoteFileToMirror(relPath, true, { allowOverwriteDirty: true }).catch(
+            () => undefined
+          );
+        }
+      }
 
       const buffer = await fs.readFile(canonicalPath);
       const maxBytes = input.maxBytes ?? 512 * 1024;
@@ -336,8 +434,18 @@ export async function createWorkbenchServer(options?: {
     try {
       const raw = await fs.readFile(settingsFilePath, 'utf-8');
       const parsed = JSON.parse(raw);
+      const localeRaw = parsed.ui?.locale ?? DEFAULT_IDE_SETTINGS.ui?.locale ?? 'zh-CN';
+      const locale =
+        localeRaw === 'en' || localeRaw === 'zh-TW' || localeRaw === 'zh-CN'
+          ? localeRaw
+          : 'zh-CN';
       return {
         editor: { ...DEFAULT_IDE_SETTINGS.editor, ...(parsed.editor ?? {}) },
+        ui: {
+          ...(DEFAULT_IDE_SETTINGS.ui ?? {}),
+          ...(parsed.ui ?? {}),
+          locale,
+        },
         agent: { ...DEFAULT_IDE_SETTINGS.agent, ...(parsed.agent ?? {}) },
         mcpServers: Array.isArray(parsed.mcpServers)
           ? parsed.mcpServers
@@ -355,10 +463,91 @@ export async function createWorkbenchServer(options?: {
     }
   }
 
+  async function persistWorkspaceVerifyConfig(settings: IdeSettingsModel): Promise<void> {
+    if (!activeWorkspaceRoot) return;
+    try {
+      const dir = path.join(activeWorkspaceRoot, '.deepautocode');
+      await fs.mkdir(dir, { recursive: true });
+      const buildCommand = settings.agent.verifyBuildCommand?.trim() || 'npm run build';
+      const testCommand = settings.agent.verifyTestCommand?.trim() || 'npm test';
+      await fs.writeFile(
+        path.join(dir, 'verify.json'),
+        JSON.stringify(
+          {
+            buildCommand,
+            testCommand,
+            combinedCommand: `${buildCommand} && ${testCommand}`,
+            enableEvolveSandbox: settings.agent.enableEvolveSandbox !== false,
+          },
+          null,
+          2
+        ),
+        'utf-8'
+      );
+      // P1: persist IDE project rules so Agent system prompt discovers them every turn
+      const userRulesText = String(settings.agent.userRules || '').trim();
+      if (userRulesText) {
+        await fs.writeFile(
+          path.join(dir, 'user-rules.md'),
+          `# DeepAutoCode User Rules\n\n${userRulesText}\n`,
+          'utf-8'
+        );
+      } else {
+        await fs.rm(path.join(dir, 'user-rules.md'), { force: true }).catch(() => undefined);
+      }
+      const rulesText = String(settings.agent.projectRules || '').trim();
+      if (rulesText) {
+        await fs.writeFile(
+          path.join(dir, 'project-rules.md'),
+          `# DeepAutoCode Project Rules\n\n${rulesText}\n`,
+          'utf-8'
+        );
+      }
+      // Stage L/S/V: sync MCP configs (stdio|sse|http + env/headers + disabledTools)
+      const mcpServers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
+      await fs.writeFile(
+        path.join(dir, 'mcp.json'),
+        JSON.stringify(
+          {
+            mcpServers: mcpServers.map((s) => {
+              const t = String(s.transport || 'stdio').toLowerCase();
+              const transport =
+                t === 'sse' || t === 'http+sse'
+                  ? 'sse'
+                  : t === 'http' || t === 'streamable' || t === 'streamable-http'
+                    ? 'http'
+                    : 'stdio';
+              return {
+                id: s.id,
+                name: s.name,
+                transport,
+                commandOrUrl: s.commandOrUrl,
+                enabled: s.enabled !== false,
+                env: s.env && typeof s.env === 'object' ? s.env : undefined,
+                headers: s.headers && typeof s.headers === 'object' ? s.headers : undefined,
+                disabledTools: Array.isArray(s.disabledTools) ? s.disabledTools : [],
+              };
+            }),
+          },
+          null,
+          2
+        ),
+        'utf-8'
+      );
+    } catch {
+      // non-fatal: Agent can still infer verify commands
+    }
+  }
+
   async function saveIdeSettings(next: Partial<IdeSettingsModel>): Promise<IdeSettingsModel> {
     const current = await loadIdeSettings();
     const merged: IdeSettingsModel = {
       editor: { ...current.editor, ...(next.editor ?? {}) },
+      ui: {
+        ...(current.ui ?? {}),
+        ...(next.ui ?? {}),
+        locale: (next.ui?.locale ?? current.ui?.locale ?? 'zh-CN') as 'zh-CN' | 'zh-TW' | 'en',
+      },
       agent: { ...current.agent, ...(next.agent ?? {}) },
       mcpServers: next.mcpServers ?? current.mcpServers,
       recentWorkspaces: next.recentWorkspaces ?? current.recentWorkspaces,
@@ -366,6 +555,9 @@ export async function createWorkbenchServer(options?: {
     };
     await fs.mkdir(path.dirname(settingsFilePath), { recursive: true });
     await fs.writeFile(settingsFilePath, JSON.stringify(merged, null, 2), 'utf-8');
+    if (next.agent || next.mcpServers) {
+      await persistWorkspaceVerifyConfig(merged);
+    }
     return merged;
   }
 
@@ -434,6 +626,105 @@ export async function createWorkbenchServer(options?: {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/agent-memory') {
+      try {
+        const root = activeWorkspaceRoot || process.cwd();
+        const store = await loadAgentMemory(root);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, ...store }));
+      } catch (err) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, entries: [], error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/agent-memory') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const root = activeWorkspaceRoot || process.cwd();
+        if (body?.clear) {
+          const dir = path.join(root, '.deepautocode');
+          await fs.mkdir(dir, { recursive: true });
+          await fs.writeFile(
+            path.join(dir, 'agent-memory.json'),
+            JSON.stringify(
+              { version: 1, updatedAt: new Date().toISOString(), entries: [] },
+              null,
+              2
+            ),
+            'utf-8'
+          );
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, entries: [] }));
+          return;
+        }
+        const store = await appendAgentMemory(root, {
+          source: body.source || 'manual',
+          title: String(body.title || 'Manual memory'),
+          summary: String(body.summary || ''),
+          sessionId: body.sessionId ? String(body.sessionId) : undefined,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, ...store }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/mcp/test') {
+      try {
+        const root = activeWorkspaceRoot || process.cwd();
+        // Ensure settings are synced to workspace mcp.json first
+        const settings = await loadIdeSettings();
+        if (settings.mcpServers?.length) {
+          const dir = path.join(root, '.deepautocode');
+          await fs.mkdir(dir, { recursive: true });
+          await fs.writeFile(
+            path.join(dir, 'mcp.json'),
+            JSON.stringify({ mcpServers: settings.mcpServers }, null, 2),
+            'utf-8'
+          );
+        }
+        const configs = await loadMcpConfigsFromWorkspace(root);
+        const host = new McpHost();
+        await host.connectAll(configs, root);
+        const tools = host.listTools().map((t) => ({
+          serverId: t.serverId,
+          serverName: t.serverName,
+          name: t.name,
+          qualifiedName: t.qualifiedName,
+          description: t.description || '',
+        }));
+        const error = host.getLastError();
+        await host.dispose();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: !error || tools.length > 0,
+            workspaceRoot: root,
+            serverCount: configs.length,
+            tools,
+            error: error || null,
+          })
+        );
+      } catch (err) {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            tools: [],
+            error: (err as Error).message || String(err),
+          })
+        );
+      }
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/workspace/switch') {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -445,6 +736,7 @@ export async function createWorkbenchServer(options?: {
           throw new Error(`Not a directory: ${resolved}`);
         }
         activeWorkspaceRoot = resolved;
+        await lspManager.setWorkspace(activeWorkspaceRoot);
         await bridge.dispose();
         bridge = await AgentClientBridge.create({
           storageDir,
@@ -591,17 +883,11 @@ export async function createWorkbenchServer(options?: {
           throw new Error('PATH_BOUNDARY_VIOLATION: File outside workspace');
         }
         const sshStatus = sshManager.getStatus();
+        // P0-3: always force-pull on open so stubs/stale cache never masquerade as remote content
         if (sshStatus.connected) {
-          let needsPull = false;
-          try {
-            const st = await fs.stat(abs);
-            if (st.size === 0) needsPull = true;
-          } catch {
-            needsPull = true;
-          }
-          if (needsPull) {
-            await sshManager.pullRemoteBinaryFileToMirror(relParam, true).catch(() => undefined);
-          }
+          await sshManager.pullRemoteBinaryFileToMirror(relParam, true).catch(async () => {
+            await sshManager.pullRemoteFileToMirror(relParam, true).catch(() => undefined);
+          });
         }
         const buf = await fs.readFile(abs);
         const ext = path.extname(abs).toLowerCase();
@@ -660,16 +946,9 @@ export async function createWorkbenchServer(options?: {
         }
         const sshStatus = sshManager.getStatus();
         if (sshStatus.connected) {
-          let needsPull = false;
-          try {
-            const st = await fs.stat(abs);
-            if (st.size === 0) needsPull = true;
-          } catch {
-            needsPull = true;
-          }
-          if (needsPull) {
-            await sshManager.pullRemoteBinaryFileToMirror(relParam, true).catch(() => undefined);
-          }
+          await sshManager.pullRemoteBinaryFileToMirror(relParam, true).catch(async () => {
+            await sshManager.pullRemoteFileToMirror(relParam, true).catch(() => undefined);
+          });
         }
         await fs.access(abs);
         if (process.platform === 'win32') {
@@ -824,6 +1103,7 @@ export async function createWorkbenchServer(options?: {
 
       if (sshStatus.connected && sshStatus.activeProfile) {
         const remoteRes = await sshManager.execRemoteCommand(cmd);
+        const problems = await mergeProblemsFromOutput(remoteRes.stdout, remoteRes.stderr);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(
           JSON.stringify({
@@ -833,6 +1113,7 @@ export async function createWorkbenchServer(options?: {
             stderr: remoteRes.stderr,
             cwd: `${sshStatus.activeProfile.username}@${sshStatus.activeProfile.host}:${sshStatus.activeProfile.remotePath}`,
             durationMs: remoteRes.durationMs,
+            problems,
           })
         );
         return;
@@ -985,12 +1266,14 @@ export async function createWorkbenchServer(options?: {
         });
       });
 
+      const problems = await mergeProblemsFromOutput(execResult.stdout, execResult.stderr);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(
         JSON.stringify({
           ...execResult,
           cwd: activeWorkspaceRoot,
           durationMs: Date.now() - start,
+          problems,
         })
       );
       return;
@@ -1059,6 +1342,7 @@ export async function createWorkbenchServer(options?: {
         const conn = await sshManager.connect(profileInput);
         activeWorkspaceRoot = conn.workspaceRoot;
         await saveIdeSettings({ activeWorkspace: '__ssh__' });
+        await lspManager.setWorkspace(activeWorkspaceRoot);
 
         await bridge.dispose();
         bridge = await AgentClientBridge.create({
@@ -1098,10 +1382,80 @@ export async function createWorkbenchServer(options?: {
       return;
     }
 
+    if (req.method === 'POST' && url.pathname === '/api/ssh/reconnect') {
+      try {
+        const conn = await sshManager.reconnect();
+        activeWorkspaceRoot = conn.workspaceRoot;
+        await saveIdeSettings({ activeWorkspace: '__ssh__' });
+        await lspManager.setWorkspace(activeWorkspaceRoot);
+        registerSshCapabilityHooksIfActive();
+        const tree = await buildWorkspaceTree(activeWorkspaceRoot);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            status: conn.status,
+            workspaceRoot: activeWorkspaceRoot,
+            workspaceName: conn.workspaceDisplayLabel,
+            tree,
+            files: flattenFiles(tree).slice(0, 300),
+          })
+        );
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/ssh/conflict-check') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const { filePath } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const result = await sshManager.compareWithRemote(String(filePath || ''));
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, ...result, filePath }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/ssh/pull-file') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const filePath = String(body.filePath || '');
+        const allowOverwriteDirty = Boolean(body.allowOverwriteDirty);
+        const content = await sshManager.pullRemoteFileToMirror(filePath, true, {
+          allowOverwriteDirty,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, filePath, content }));
+      } catch (err) {
+        const code = (err as any)?.code || 'SSH_PULL_FAILED';
+        res.writeHead(409, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            code,
+            error: (err as Error).message,
+            conflict: Boolean((err as any)?.conflict),
+            filePath: (err as any)?.filePath,
+          })
+        );
+      }
+      return;
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/ssh/disconnect') {
       const status = sshManager.disconnect();
       activeWorkspaceRoot = preSshLocalWorkspaceRoot || '';
       await saveIdeSettings({ activeWorkspace: activeWorkspaceRoot });
+      await lspManager.setWorkspace(activeWorkspaceRoot || emptyWorkspaceDir);
 
       await bridge.dispose();
       bridge = await AgentClientBridge.create({
@@ -1136,10 +1490,209 @@ export async function createWorkbenchServer(options?: {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/workspace/problems') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ problems: workspaceProblems }));
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/workspace/problems') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        if (body?.clear) {
+          await persistProblems([]);
+        } else if (typeof body?.stdout === 'string' || typeof body?.stderr === 'string') {
+          await mergeProblemsFromOutput(String(body.stdout || ''), String(body.stderr || ''));
+        } else if (Array.isArray(body?.problems)) {
+          await persistProblems(body.problems as BuildDiagnostic[]);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, problems: workspaceProblems }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/workspace/outline') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const { filePath } = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const rel = String(filePath || '')
+          .replace(/\\/g, '/')
+          .replace(/^\.?\//, '');
+        if (!activeWorkspaceRoot || !rel) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'NO_FILE' }));
+          return;
+        }
+        const abs = path.resolve(activeWorkspaceRoot, rel);
+        if (!abs.startsWith(path.resolve(activeWorkspaceRoot))) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: 'PATH_BOUNDARY' }));
+          return;
+        }
+        const content = await fs.readFile(abs, 'utf-8');
+        const symbols = extractCodeOutlineSymbols(content, {
+          filePath: rel,
+          maxEntries: 200,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            filePath: rel,
+            symbolCount: symbols.length,
+            symbols,
+          })
+        );
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/lsp/status') {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, ...lspManager.getStatus() }));
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/lsp/definition') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const filePath = String(body.filePath || '');
+        const line = Number(body.line) || 1;
+        const character = Number(body.character || body.column) || 1;
+        const content =
+          typeof body.content === 'string' ? body.content : undefined;
+        if (activeWorkspaceRoot) {
+          await lspManager.setWorkspace(activeWorkspaceRoot);
+        }
+        const matches = await lspManager.definition(filePath, line, character, content);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            matches,
+            engine: lspManager.getStatus(),
+          })
+        );
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/lsp/diagnostics') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const filePath = String(body.filePath || '');
+        const content =
+          typeof body.content === 'string' ? body.content : undefined;
+        if (activeWorkspaceRoot) {
+          await lspManager.setWorkspace(activeWorkspaceRoot);
+        }
+        const diagnostics = await lspManager.diagnostics(filePath, content);
+        // Merge into Problems panel store
+        if (diagnostics.length > 0) {
+          await mergeProblemsFromOutput(
+            diagnostics
+              .map(
+                (d) =>
+                  `${d.file}:${d.line}:${d.column || 1}: ${d.severity}: ${d.message}`
+              )
+              .join('\n'),
+            ''
+          );
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, diagnostics, problems: workspaceProblems }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/workspace/definition') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const { symbol, currentFile } = JSON.parse(
+          Buffer.concat(chunks).toString('utf-8') || '{}'
+        );
+        const q = String(symbol || '').trim();
+        if (!q || !activeWorkspaceRoot) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: true, matches: [] }));
+          return;
+        }
+        const tree = await buildWorkspaceTree(activeWorkspaceRoot);
+        const files = flattenFiles(tree).slice(0, 180);
+        const matches: Array<{ file: string; line: number; preview: string }> = [];
+        const prefer = String(currentFile || '').replace(/\\/g, '/');
+        const ordered = [
+          ...files.filter((f) => f === prefer),
+          ...files.filter((f) => f !== prefer),
+        ];
+        for (const relFile of ordered) {
+          if (matches.length >= 80) break;
+          try {
+            const abs = path.join(activeWorkspaceRoot, relFile);
+            const stat = await fs.stat(abs);
+            if (stat.size > 384 * 1024) continue;
+            const content = await fs.readFile(abs, 'utf-8');
+            const lines = content.split(/\r?\n/);
+            for (let i = 0; i < lines.length; i++) {
+              if (!lines[i].includes(q)) continue;
+              matches.push({
+                file: relFile,
+                line: i + 1,
+                preview: lines[i].trim().slice(0, 140),
+              });
+              if (matches.length >= 80) break;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        const ranked = rankDefinitionCandidates(q, matches).slice(0, 20);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, symbol: q, matches: ranked }));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
+      return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/extensions') {
       const matrix = await extManager.loadMatrix();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(matrix));
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/extensions/install-lsp-pack') {
+      try {
+        const result = await extManager.installRecommendedLspPack();
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(result));
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
       return;
     }
 
@@ -1343,7 +1896,11 @@ export async function createWorkbenchServer(options?: {
       return;
     }
 
-    // Antigravity Ghost Text / Inline Code Autocomplete API
+    // Antigravity Ghost Text / Inline Code Autocomplete API (LRU-cached heuristics)
+    const autocompleteCache = ((globalThis as any).__dacAutocompleteCache ??= new Map()) as Map<
+      string,
+      string
+    >;
     if (req.method === 'POST' && url.pathname === '/api/ai/autocomplete') {
       const chunks: Buffer[] = [];
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
@@ -1352,6 +1909,18 @@ export async function createWorkbenchServer(options?: {
         const prefix = String(body.prefix || '');
         const suffix = String(body.suffix || '');
         const filePath = String(body.filePath || '').toLowerCase();
+        const cacheKey = `${filePath}|${prefix.slice(-240)}|${suffix.slice(0, 40)}`;
+        if (autocompleteCache.has(cacheKey)) {
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              completion: autocompleteCache.get(cacheKey) || '',
+              cached: true,
+            })
+          );
+          return;
+        }
 
         let completion = '';
         const lines = prefix.split(/\r?\n/);
@@ -1374,10 +1943,20 @@ export async function createWorkbenchServer(options?: {
           completion = "'Debug:', );";
         } else if (trimmed.endsWith(': React.')) {
           completion = 'ReactNode';
+        } else if (/^(?:async\s+)?function\s+[a-zA-Z0-9_]+\s*\([^)]*\)\s*$/.test(trimmed)) {
+          completion = '{\n  \n}';
+        } else if (/^export\s+const\s+[a-zA-Z0-9_]+\s*=\s*$/.test(trimmed)) {
+          completion = '() => {\n  return null;\n};';
         }
 
+        if (autocompleteCache.size > 200) {
+          const first = autocompleteCache.keys().next().value;
+          if (first) autocompleteCache.delete(first);
+        }
+        autocompleteCache.set(cacheKey, completion);
+
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, completion }));
+        res.end(JSON.stringify({ ok: true, completion, cached: false }));
       } catch (err) {
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, error: (err as Error).message }));

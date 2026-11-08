@@ -354,7 +354,9 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         executionMode: 'auto',
       });
 
-      expect(turnCount).toBe(2);
+      // P0-4 verify gate may inject 1–2 onBeforeFinish continuation turns after the edit.
+      expect(turnCount).toBeGreaterThanOrEqual(2);
+      expect(turnCount).toBeLessThanOrEqual(5);
       expect(assistantMsg.content).toContain('2.0.0-cline-sdk');
       expect(assistantMsg.diffIds?.length).toBe(1);
 
@@ -540,7 +542,9 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         executionMode: 'auto',
       });
 
-      expect(llmCalls).toBe(5);
+      // Extra verify-gate continuation may add one LLM call beyond the original 5-step script.
+      expect(llmCalls).toBeGreaterThanOrEqual(5);
+      expect(llmCalls).toBeLessThanOrEqual(7);
       expect(assistantMsg.content).toContain('已自动修复并验证');
       const finalCpp = await fs.readFile(path.join(workspaceDir, 'enqueue.cc'), 'utf-8');
       expect(finalCpp).toContain('return 0;');

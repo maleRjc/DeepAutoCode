@@ -24,10 +24,12 @@ if not exist "%~dp0deepautocode\node_modules\electron\dist\electron.exe" (
   cd /d "%~dp0deepautocode"
   node node_modules\electron\install.js
 )
-if not exist "%~dp0deepautocode\dist\webview" (
-  echo Building deepautocode webview and host...
-  cd /d "%~dp0deepautocode"
-  call npm.cmd run build
+echo Building deepautocode webview (so UI fixes are always fresh)...
+cd /d "%~dp0deepautocode"
+call npm.cmd run build:webview
+if not exist "%~dp0deepautocode\dist\src" (
+  echo Building deepautocode host...
+  call npm.cmd run build:host
 )
 
 echo Starting DeepAutoCode v1.1 Desktop IDE...

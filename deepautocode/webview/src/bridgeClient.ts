@@ -18,7 +18,15 @@ export interface UIEventMessage {
   | 'diff.updated'
   | 'session.state.changed'
   | 'backend.state.changed'
-  | 'runtime.error';
+  | 'runtime.error'
+  | 'sandbox.branch.created'
+  | 'circuit.breaker.triggered'
+  | 'artifact.created'
+  | 'model.tier'
+  | 'goal.usage'
+  | 'checkpoint.created'
+  | 'diff.proposed'
+  | 'diff.updated';
   sessionId: string;
   sequence: number;
   timestamp: string;

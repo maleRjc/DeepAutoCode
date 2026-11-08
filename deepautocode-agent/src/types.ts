@@ -31,8 +31,13 @@ export const RequestMessageSchema = z.object({
     'session.send',
     'session.cancel',
     'session.delete',
+    'session.checkpoint.create',
+    'session.checkpoint.list',
+    'session.checkpoint.restore',
     'approval.respond',
     'diff.review',
+    'diff.reviewAll',
+    'diff.updateProposed',
     'provider.get',
     'provider.update',
     'provider.test',
@@ -78,9 +83,15 @@ export const EventMessageSchema = z.object({
     'approval.resolved',
     'diff.proposed',
     'diff.updated',
+    'model.tier',
+    'checkpoint.created',
     'session.state.changed',
     'backend.state.changed',
     'runtime.error',
+    'sandbox.branch.created',
+    'circuit.breaker.triggered',
+    'artifact.created',
+    'goal.usage',
   ]),
   sessionId: z.string(),
   sequence: z.number().int().nonnegative(),
@@ -148,6 +159,12 @@ export interface DiffChangeRecord {
   proposedContent: string;
   unifiedDiff: string;
   status: 'pending' | 'accepted' | 'rejected' | 'revising';
+  /**
+   * Whether proposedContent was already written to disk.
+   * - manual mode: false until the user Accepts (review-before-write)
+   * - auto mode: true after immediate apply (review-after-write / rollback on Reject)
+   */
+  appliedToDisk?: boolean;
   feedback?: string;
   createdAt: string;
   updatedAt: string;
@@ -165,6 +182,12 @@ export interface SessionMessage {
 }
 
 export interface SessionManifest {
+  /** Stage W: optional git worktree isolation for parallel Composer */
+  worktree?: {
+    worktreePath?: string;
+    branch?: string;
+    message?: string;
+  };
   sessionId: string;
   title: string;
   workspaceRoot: string;

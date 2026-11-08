@@ -1,0 +1,7 @@
+{
+  "buildCommand": "npm run build",
+  "testCommand": "npm test",
+  "combinedCommand": "npm run build && npm test",
+  "sourceGlobs": ["**/*.{ts,tsx,js,jsx}"],
+  "enableEvolveSandbox": true
+}

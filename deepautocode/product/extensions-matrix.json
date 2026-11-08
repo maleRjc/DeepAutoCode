@@ -26,6 +26,7 @@
       "license": "MIT",
       "codeOssCompatible": "verified",
       "installPath": "open-vsx",
+      "lspRecommended": true,
       "notes": "Replaces proprietary ms-python.vscode-pylance which is restricted to Microsoft-branded VS Code."
     },
     {
@@ -38,6 +39,7 @@
       "license": "MIT",
       "codeOssCompatible": "verified",
       "installPath": "open-vsx",
+      "lspRecommended": true,
       "notes": "Fully functional on Code - OSS via Open VSX."
     },
     {
@@ -86,6 +88,7 @@
       "license": "Apache-2.0",
       "codeOssCompatible": "verified",
       "installPath": "open-vsx",
+      "lspRecommended": true,
       "notes": "Recommended over proprietary ms-vscode.cpptools; delivers faster AST indexing and full Code - OSS compatibility."
     },
     {
@@ -110,6 +113,7 @@
       "license": "MIT",
       "codeOssCompatible": "verified",
       "installPath": "open-vsx",
+      "lspRecommended": true,
       "notes": "Official Go team extension published directly to Open VSX."
     },
     {
@@ -122,6 +126,7 @@
       "license": "MIT / Apache-2.0",
       "codeOssCompatible": "verified",
       "installPath": "open-vsx",
+      "lspRecommended": true,
       "notes": "Official Rust language server extension on Open VSX."
     },
     {

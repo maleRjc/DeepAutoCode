@@ -1,6 +1,23 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { marksFromDiffRecord, type DiffLineKind } from '../../src/diff-line-marks';
+import {
+  parseDiffHunks,
+  rebuildProposedAfterHunkDecision,
+  type DiffHunkView,
+} from '../../src/diff-hunks';
+import {
+  buildInlineAgentPrompt,
+  selectionFromOffsets,
+} from '../../src/inline-agent-prompt';
 import { WebviewBridgeClient, type UIEventMessage } from './bridgeClient';
 import { BrandMark } from './components/BrandMark';
+import {
+  APP_LOCALES,
+  createTranslator,
+  normalizeLocale,
+  resolveInitialLocale,
+  type AppLocale,
+} from './i18n/index.js';
 
 const bridge = new WebviewBridgeClient();
 
@@ -40,7 +57,6 @@ type SettingsCategory =
   | 'security'
   | 'rules'
   | 'mcp'
-  | 'runtime'
   | 'extensions';
 
 type GuideSectionId =
@@ -50,8 +66,16 @@ type GuideSectionId =
   | 'workflows'
   | 'inline'
   | 'artifacts'
+  | 'agent'
   | 'preview-ssh'
   | 'shortcuts';
+
+function formatCompactTokens(n: number): string {
+  const v = Math.max(0, Math.round(Number(n) || 0));
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(v >= 10_000 ? 0 : 1)}k`;
+  return String(v);
+}
 
 export function App() {
   // Layout toggles & Resizable Pane Dimensions (Cursor / Antigravity style)
@@ -67,6 +91,13 @@ export function App() {
     null | 'left' | 'right' | 'bottom' | 'settings'
   >(null);
   const [isSendingPrompt, setIsSendingPrompt] = useState<boolean>(false);
+  /** Stage U: sessions currently running Agent turns (parallel-safe) */
+  const [runningSessionIds, setRunningSessionIds] = useState<string[]>([]);
+  /** Pinned composer tabs for quick parallel switching (max 4) */
+  const [composerSessionTabs, setComposerSessionTabs] = useState<string[]>([]);
+  const [agentMemoryEntries, setAgentMemoryEntries] = useState<
+    Array<{ id: string; title: string; summary: string; source: string; createdAt: string }>
+  >([]);
   const [activeActivity, setActiveActivity] = useState<
     'explorer' | 'search' | 'git' | 'extensions'
   >('explorer');
@@ -75,9 +106,26 @@ export function App() {
   >('terminal');
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showGearPopup, setShowGearPopup] = useState(false);
+  const [showLangPopup, setShowLangPopup] = useState(false);
 
   // Modals: Command Palette, Open Project Dialog, Create File/Folder Dialog
   const [showPalette, setShowPalette] = useState(false);
+  const [paletteMode, setPaletteMode] = useState<'commands' | 'symbols' | 'definitions'>(
+    'commands'
+  );
+  const [symbolPaletteItems, setSymbolPaletteItems] = useState<
+    Array<{ label: string; hint: string; run: () => void }>
+  >([]);
+  const [workspaceProblems, setWorkspaceProblems] = useState<
+    Array<{
+      file: string;
+      line: number;
+      column?: number;
+      severity: string;
+      message: string;
+      source: string;
+    }>
+  >([]);
   const [paletteQuery, setPaletteQuery] = useState('');
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [customFolderInput, setCustomFolderInput] = useState('');
@@ -86,7 +134,7 @@ export function App() {
 
   // Workspace & Multi-Tab Editor states (Antigravity first-launch: no folder opened by default)
   const [workspaceRoot, setWorkspaceRoot] = useState<string>('');
-  const [workspaceName, setWorkspaceName] = useState<string>('No Folder Opened');
+  const [workspaceName, setWorkspaceName] = useState<string>('');
   const [fileTree, setFileTree] = useState<any[]>([]);
   const [files, setFiles] = useState<string[]>([]);
   const [expandedDirs, setExpandedDirs] = useState<Record<string, boolean>>({
@@ -100,7 +148,7 @@ export function App() {
   const [activeTabPath, setActiveTabPath] = useState<string>('');
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>('general');
   const [guideSection, setGuideSection] = useState<GuideSectionId>('quickstart');
-  const [guideLang, setGuideLang] = useState<'zh' | 'en'>('zh');
+  const [appLocale, setAppLocaleState] = useState<AppLocale>(() => resolveInitialLocale());
   const [imageZoom, setImageZoom] = useState<number>(1);
   const [imageBgPattern, setImageBgPattern] = useState<'checker' | 'dark' | 'light'>('checker');
   const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(null);
@@ -130,9 +178,12 @@ export function App() {
       tabSize: 2,
       wordWrap: true,
       lineNumbers: true,
-      minimap: true,
+      minimap: false,
       autoSave: 'afterDelay',
       theme: initialStartupTheme,
+    },
+    ui: {
+      locale: resolveInitialLocale(),
     },
     agent: {
       defaultExecutionMode: 'auto',
@@ -149,8 +200,12 @@ export function App() {
         'npm run typecheck',
         'npm run build',
       ],
+      userRules: '',
       projectRules:
         '1. Follow TypeScript strict mode and ESM import conventions.\n2. Keep Cline SDK internal types isolated inside deepautocode-agent.\n3. Enforce workspace path canonicalization and never store plaintext API keys.',
+      verifyBuildCommand: 'npm run build',
+      verifyTestCommand: 'npm test',
+      enableEvolveSandbox: true,
     },
     mcpServers: [],
     recentWorkspaces: [],
@@ -158,6 +213,20 @@ export function App() {
   const [newAllowlistCmd, setNewAllowlistCmd] = useState('');
   const [newMcpName, setNewMcpName] = useState('');
   const [newMcpCmd, setNewMcpCmd] = useState('');
+  const [newMcpEnv, setNewMcpEnv] = useState('');
+  const [newMcpTransport, setNewMcpTransport] = useState<'stdio' | 'sse' | 'http'>('stdio');
+  const [newMcpHeaders, setNewMcpHeaders] = useState('');
+  const [mcpTestResult, setMcpTestResult] = useState<{
+    ok: boolean;
+    tools: Array<{ qualifiedName: string; description?: string; serverName?: string }>;
+    error?: string | null;
+    serverCount?: number;
+  } | null>(null);
+  const [isTestingMcp, setIsTestingMcp] = useState(false);
+  const [checkpointPreviewDiffs, setCheckpointPreviewDiffs] = useState<
+    Array<{ path: string; summary: string; preview: string }>
+  >([]);
+  const [problemGutterLines, setProblemGutterLines] = useState<Map<number, string>>(new Map());
   const [registeredCapabilities, setRegisteredCapabilities] = useState<any[]>([]);
 
   // Search & Git states
@@ -204,11 +273,51 @@ export function App() {
   >(null);
   const [promptInput, setPromptInput] = useState<string>('');
   const [attachActiveFile, setAttachActiveFile] = useState<boolean>(true);
-  const [aiTab, setAiTab] = useState<'composer' | 'artifacts' | 'sessions'>('composer');
+  const [aiTab, setAiTab] = useState<'composer' | 'artifacts' | 'sessions' | 'changes'>(
+    'composer'
+  );
+  const [contextChips, setContextChips] = useState<
+    Array<{ id: string; kind: string; label: string; value: string }>
+  >([]);
+  const [sessionCheckpoints, setSessionCheckpoints] = useState<any[]>([]);
+  const [lastModelTier, setLastModelTier] = useState<{
+    effectiveModelId?: string;
+    tier?: string;
+    reason?: string;
+  } | null>(null);
+  const [goalTokenUsage, setGoalTokenUsage] = useState<{
+    tokensUsed: number;
+    tokenBudget: number;
+    remaining: number;
+  } | null>(null);
+  const [pendingPromptQueue, setPendingPromptQueue] = useState<
+    Array<{ prompt: string; mode?: 'plan' | 'auto' | 'manual' }>
+  >([]);
+  const [hunkDecisions, setHunkDecisions] = useState<
+    Record<string, Array<'pending' | 'accepted' | 'rejected'>>
+  >({});
+  const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
+  const [composerSymbols, setComposerSymbols] = useState<
+    Array<{ name: string; kind: string; startLine: number; endLine: number; filePath: string }>
+  >([]);
+  const [checkpointPreviewId, setCheckpointPreviewId] = useState<string>('');
+  const ghostAbortRef = useRef<AbortController | null>(null);
+  const ghostRequestSeqRef = useRef(0);
+  const liveDiagTimerRef = useRef<any>(null);
+  const liveDiagAbortRef = useRef<AbortController | null>(null);
+  const liveDiagSeqRef = useRef(0);
+  const drainPromptQueueRef = useRef(false);
 
   // Antigravity Inline Command (Ctrl+I), Artifacts, .agents Customizations & Web Preview states
   const [showInlineCommand, setShowInlineCommand] = useState<boolean>(false);
   const [inlineCommandInput, setInlineCommandInput] = useState<string>('');
+  const [editorSelection, setEditorSelection] = useState<{
+    startLine: number;
+    endLine: number;
+    text: string;
+    hasSelection: boolean;
+  }>({ startLine: 1, endLine: 1, text: '', hasSelection: false });
+  const inlinePendingTargetRef = useRef<string>('');
   const [artifactsList, setArtifactsList] = useState<any[]>([]);
   const [activeArtifactId, setActiveArtifactId] = useState<string>('');
   const [workspaceCustomizations, setWorkspaceCustomizations] = useState<{
@@ -268,6 +377,8 @@ export function App() {
   } | null>(null);
 
   const lastSeqRef = useRef<number>(0);
+  const lastSeqBySessionRef = useRef<Record<string, number>>({});
+  const activeSessionIdRef = useRef<string>('');
   const bootstrappedRef = useRef<boolean>(false);
   const aiMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const codeGutterRef = useRef<HTMLDivElement | null>(null);
@@ -282,6 +393,10 @@ export function App() {
 
   const currentTheme = ideSettings.editor?.theme ?? initialStartupTheme;
   const isLightTheme = currentTheme === 'cursor-light' || currentTheme === 'light';
+  const locale = normalizeLocale(ideSettings.ui?.locale ?? appLocale);
+  const i18n = useMemo(() => createTranslator(locale), [locale]);
+  const { t, tr } = i18n;
+  const displayWorkspaceName = workspaceName.trim() || t('welcome.noFolder');
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', currentTheme);
@@ -293,6 +408,33 @@ export function App() {
     void window.deepAutoCodeDesktop?.setThemeOverlay?.(isLightTheme ? 'light' : 'dark');
   }, [currentTheme, isLightTheme]);
 
+  useEffect(() => {
+    setAppLocaleState(locale);
+    document.documentElement.setAttribute('lang', locale);
+    try {
+      localStorage.setItem('dac.locale', locale);
+    } catch {
+      // ignore
+    }
+  }, [locale]);
+
+  function setAppLocale(next: AppLocale) {
+    const normalized = normalizeLocale(next);
+    setAppLocaleState(normalized);
+    void persistIdeSettings({
+      ...ideSettings,
+      ui: {
+        ...(ideSettings.ui ?? {}),
+        locale: normalized,
+      },
+    });
+    setStatusNotice(getMessageForLocale(normalized, 'settings.saveNotice'));
+  }
+
+  function getMessageForLocale(loc: AppLocale, key: string): string {
+    return createTranslator(loc).t(key);
+  }
+
   function toggleColorTheme() {
     const nextTheme = isLightTheme ? 'cursor-dark' : 'cursor-light';
     void persistIdeSettings({
@@ -303,9 +445,7 @@ export function App() {
       },
     });
     setStatusNotice(
-      nextTheme === 'cursor-light'
-        ? 'Switched to Light Theme (Cursor Daylight)'
-        : 'Switched to Dark Theme (Cursor Dark)'
+      nextTheme === 'cursor-light' ? t('status.theme.light') : t('status.theme.dark')
     );
   }
 
@@ -352,11 +492,20 @@ export function App() {
   }
 
   useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  useEffect(() => {
     if (!bootstrappedRef.current) {
       bootstrappedRef.current = true;
       void bootstrapIde();
     }
     const unsub = bridge.onEvent((ev: UIEventMessage) => {
+      const sid = String(ev.sessionId || '');
+      if (sid) {
+        const prev = lastSeqBySessionRef.current[sid] || 0;
+        if (ev.sequence > prev) lastSeqBySessionRef.current[sid] = ev.sequence;
+      }
       if (ev.sequence > lastSeqRef.current) {
         lastSeqRef.current = ev.sequence;
       }
@@ -366,9 +515,11 @@ export function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'p') {
         e.preventDefault();
+        setPaletteMode('commands');
         setShowPalette((v) => !v);
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p') {
         e.preventDefault();
+        setPaletteMode('commands');
         setShowPalette((v) => !v);
       } else if ((e.ctrlKey || e.metaKey) && e.key === ',') {
         e.preventDefault();
@@ -376,9 +527,15 @@ export function App() {
       } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'j') {
         e.preventDefault();
         openSettingsCenter('models');
+      } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'o') {
+        e.preventDefault();
+        void openGoToSymbolPalette();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o') {
         e.preventDefault();
         void handleOpenProjectAction();
+      } else if (e.key === 'F12') {
+        e.preventDefault();
+        void jumpToDefinitionAtCursor();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
         e.preventDefault();
         setShowLeftSidebar((v) => !v);
@@ -404,16 +561,72 @@ export function App() {
         setShowPalette(false);
         setOpenMenu(null);
         setShowGearPopup(false);
+        setShowLangPopup(false);
         setShowProjectModal(false);
         setShowCreateModal(null);
         setShowSshModal(false);
         setShowInlineCommand(false);
+        setPaletteMode('commands');
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => {
       unsub();
       window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [activeTabPath, tabs, cursorPos.line, cursorPos.col]);
+
+  // Stage Q: keep gutter diagnostic dots in sync with Problems for the active file
+  useEffect(() => {
+    if (!activeTabPath) {
+      setProblemGutterLines(new Map());
+      return;
+    }
+    const norm = activeTabPath.replace(/\\/g, '/');
+    const marks = new Map<number, string>();
+    for (const p of workspaceProblems) {
+      const pf = String(p.file || '').replace(/\\/g, '/');
+      if (!pf) continue;
+      if (pf === norm || norm.endsWith(pf) || pf.endsWith(norm)) {
+        const sev = String(p.severity || 'info');
+        marks.set(Number(p.line) || 1, `${sev}: ${p.message}`);
+      }
+    }
+    setProblemGutterLines(marks);
+  }, [activeTabPath, workspaceProblems]);
+
+  // Stage R: cache active-file outline for @symbol mentions
+  useEffect(() => {
+    const tab = tabs.find((t) => t.path === activeTabPath && t.kind === 'code');
+    if (!tab?.path) {
+      setComposerSymbols([]);
+      return;
+    }
+    let cancelled = false;
+    void fetch('/api/workspace/outline', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePath: tab.path }),
+    })
+      .then((r) => r.json())
+      .then((res) => {
+        if (cancelled) return;
+        const symbols = Array.isArray(res?.symbols) ? res.symbols : [];
+        setComposerSymbols(
+          symbols.slice(0, 80).map((s: any) => ({
+            name: String(s.name || ''),
+            kind: String(s.kind || 'symbol'),
+            startLine: Number(s.startLine) || 1,
+            endLine: Number(s.endLine) || Number(s.startLine) || 1,
+            filePath: tab.path.replace(/\\/g, '/'),
+          }))
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setComposerSymbols([]);
+      });
+    return () => {
+      cancelled = true;
     };
   }, [activeTabPath, tabs]);
 
@@ -514,21 +727,76 @@ export function App() {
     }
   }
 
+  function syncEditorSelectionFromTextarea(textarea?: HTMLTextAreaElement | null) {
+    const el = textarea ?? codeTextareaRef.current;
+    const content = activeTab?.kind === 'code' ? activeTab.content ?? '' : '';
+    if (!el) {
+      setEditorSelection({
+        startLine: cursorPos.line,
+        endLine: cursorPos.line,
+        text: '',
+        hasSelection: false,
+      });
+      return;
+    }
+    const next = selectionFromOffsets(content, el.selectionStart, el.selectionEnd);
+    if (!next.hasSelection) {
+      next.startLine = cursorPos.line || next.startLine;
+      next.endLine = cursorPos.line || next.endLine;
+    }
+    setEditorSelection(next);
+    return next;
+  }
+
   function handleInlineCommandSubmit(overrideInstruction?: string) {
     const instruction = (overrideInstruction ?? inlineCommandInput).trim();
     if (!instruction) return;
     const currentFile = activeTab?.kind === 'code' ? activeTab.path : files[0] || '';
-    const lineHint = cursorPos.line ? ` (around line ${cursorPos.line})` : '';
+    const liveSelection =
+      syncEditorSelectionFromTextarea(codeTextareaRef.current) || editorSelection;
+    const startLine = liveSelection.hasSelection
+      ? liveSelection.startLine
+      : cursorPos.line || 1;
+    const endLine = liveSelection.hasSelection
+      ? liveSelection.endLine
+      : cursorPos.line || startLine;
+    const built = buildInlineAgentPrompt({
+      instruction,
+      filePath: currentFile,
+      startLine,
+      endLine,
+      selectedText: liveSelection.hasSelection ? liveSelection.text : '',
+    });
+    inlinePendingTargetRef.current = built.filePath;
     setShowRightAiDock(true);
     setAiTab('composer');
     setShowInlineCommand(false);
     setInlineCommandInput('');
-    const isExplain = /^(?:explain|what|why|analyze)/i.test(instruction);
-    void handleSendPrompt(
-      currentFile
-        ? `[Inline Command on ${currentFile}${lineHint}]: ${instruction}`
-        : instruction,
-      isExplain ? 'plan' : 'auto'
+    setStatusNotice(
+      built.isExplain
+        ? `Inline Query → Agent tools on ${built.filePath || 'workspace'} (${built.startLine === built.endLine ? `L${built.startLine}` : `L${built.startLine}-L${built.endLine}`})`
+        : `Inline Edit → Agent tool chain on ${built.filePath || 'workspace'} (${built.startLine === built.endLine ? `L${built.startLine}` : `L${built.startLine}-L${built.endLine}`})`
+    );
+    void handleSendPrompt(built.prompt, built.mode);
+  }
+
+  function triggerCodeLensAction(kind: 'explain' | 'refactor' | 'tests') {
+    const file = activeTab?.kind === 'code' ? activeTab.path : '';
+    const line = cursorPos.line || 1;
+    if (kind === 'explain') {
+      handleInlineCommandSubmit(
+        `Explain the logic and invariants around line ${line}${file ? ` in ${file}` : ''}`
+      );
+      return;
+    }
+    if (kind === 'refactor') {
+      handleInlineCommandSubmit(
+        `Refactor and optimize the function around line ${line}${file ? ` in ${file}` : ''}`
+      );
+      return;
+    }
+    handleInlineCommandSubmit(
+      `Write unit/verification tests for the code around line ${line}${file ? ` in ${file}` : ''}`
     );
   }
 
@@ -572,7 +840,7 @@ export function App() {
       const wsData = await fetch('/api/workspace/files').then((r) => r.json());
       currentWsRoot = wsData.workspaceRoot ?? '';
       setWorkspaceRoot(currentWsRoot);
-      setWorkspaceName(wsData.workspaceName || 'No Folder Opened');
+      setWorkspaceName(wsData.workspaceName || '');
       if (Array.isArray(wsData.tree)) setFileTree(wsData.tree);
       if (Array.isArray(wsData.files)) {
         initialFiles = wsData.files;
@@ -635,6 +903,7 @@ export function App() {
       refreshGitStatus(),
       loadServerIdeSettings(),
       refreshArtifactsAndCustomizations(),
+      refreshWorkspaceProblems(),
       fetch('/api/extensions')
         .then((r) => r.json())
         .then(setExtensionsCatalog)
@@ -656,7 +925,14 @@ export function App() {
     try {
       const res = await fetch('/api/settings').then((r) => r.json());
       if (res.settings) {
-        setIdeSettings(res.settings);
+        const mergedLocale = normalizeLocale(
+          res.settings.ui?.locale ?? resolveInitialLocale()
+        );
+        setIdeSettings({
+          ...res.settings,
+          ui: { ...(res.settings.ui ?? {}), locale: mergedLocale },
+        });
+        setAppLocaleState(mergedLocale);
         setExecutionMode(res.settings.agent?.defaultExecutionMode ?? 'auto');
       }
       if (typeof res.workspaceRoot === 'string') {
@@ -782,7 +1058,7 @@ export function App() {
   function handleCloseFolder() {
     void fetch('/api/workspace/close', { method: 'POST' }).catch(() => {});
     setWorkspaceRoot('');
-    setWorkspaceName('No Folder Opened');
+    setWorkspaceName('');
     setFileTree([]);
     setFiles([]);
     setGitState({ branch: 'main', changes: [] });
@@ -1210,6 +1486,33 @@ export function App() {
       setStatusNotice(`Saved ${current.path}`);
       appendLog(`[Capability:write-file] Saved ${current.path}`);
       void refreshGitStatus();
+      // Stage Q: save → LSP diagnostics → Problems + gutter dots
+      try {
+        const diagRes = await fetch('/api/lsp/diagnostics', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filePath: current.path, content: current.content }),
+        }).then((r) => r.json());
+        const diags = Array.isArray(diagRes?.diagnostics) ? diagRes.diagnostics : [];
+        const marks = new Map<number, string>();
+        for (const d of diags) {
+          if (String(d.severity) === 'error' || String(d.severity) === 'warning') {
+            const line = Number(d.line) || 1;
+            marks.set(line, `${d.severity}: ${d.message}`);
+          }
+        }
+        setProblemGutterLines(marks);
+        if (Array.isArray(diagRes?.problems)) {
+          setWorkspaceProblems(diagRes.problems);
+        } else {
+          void refreshWorkspaceProblems();
+        }
+        if (marks.size > 0) {
+          setStatusNotice(`Saved ${current.path} · ${marks.size} diagnostic mark(s)`);
+        }
+      } catch {
+        // non-fatal
+      }
     } catch (err) {
       setStatusNotice(`Save blocked/rejected: ${(err as Error).message}`);
     }
@@ -1247,6 +1550,200 @@ export function App() {
     setSearchResults(res.matches ?? []);
   }
 
+  async function refreshWorkspaceProblems() {
+    try {
+      const res = await fetch('/api/workspace/problems').then((r) => r.json());
+      if (Array.isArray(res?.problems)) {
+        setWorkspaceProblems(res.problems);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function wordAtCursor(content: string, line: number, col: number): string {
+    const lines = content.split(/\r?\n/);
+    const row = lines[Math.max(0, line - 1)] || '';
+    const idx = Math.max(0, Math.min(row.length, col - 1));
+    let start = idx;
+    let end = idx;
+    while (start > 0 && /[A-Za-z0-9_]/.test(row[start - 1])) start -= 1;
+    while (end < row.length && /[A-Za-z0-9_]/.test(row[end])) end += 1;
+    return row.slice(start, end);
+  }
+
+  async function openGoToSymbolPalette() {
+    const filePath = activeTab?.kind === 'code' ? activeTab.path : '';
+    if (!filePath) {
+      setStatusNotice('Open a source file to use Go to Symbol');
+      return;
+    }
+    try {
+      const res = await fetch('/api/workspace/outline', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath }),
+      }).then((r) => r.json());
+      const symbols = Array.isArray(res?.symbols) ? res.symbols : [];
+      setSymbolPaletteItems(
+        symbols.map((s: any) => ({
+          label: `${s.kind} ${s.name}`,
+          hint: `L${s.startLine}${s.endLine > s.startLine ? `-L${s.endLine}` : ''}`,
+          run: () => {
+            void openFileInTab(filePath, true, false, Number(s.startLine) || 1, Number(s.endLine) || undefined);
+          },
+        }))
+      );
+      setPaletteQuery('');
+      setPaletteMode('symbols');
+      setShowPalette(true);
+      setStatusNotice(`Go to Symbol: ${symbols.length} symbols in ${filePath}`);
+    } catch (err) {
+      setStatusNotice(`Go to Symbol failed: ${(err as Error).message}`);
+    }
+  }
+
+  async function jumpToDefinitionAtCursor() {
+    const filePath = activeTab?.kind === 'code' ? activeTab.path : '';
+    const content = activeTab?.kind === 'code' ? activeTab.content : '';
+    if (!filePath || !content) {
+      setStatusNotice('Open a source file to jump to definition');
+      return;
+    }
+    const symbol = wordAtCursor(content, cursorPos.line, cursorPos.col);
+    if (!symbol) {
+      setStatusNotice('No identifier under cursor');
+      return;
+    }
+    try {
+      // Prefer real LSP (TS Language Service / clangd) before heuristic search
+      const lspRes = await fetch('/api/lsp/definition', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filePath,
+          line: cursorPos.line,
+          character: cursorPos.col,
+          content,
+        }),
+      }).then((r) => r.json());
+      let matches = Array.isArray(lspRes?.matches) ? lspRes.matches : [];
+      if (matches.length === 0) {
+        const res = await fetch('/api/workspace/definition', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol, currentFile: filePath }),
+        }).then((r) => r.json());
+        matches = Array.isArray(res?.matches) ? res.matches : [];
+      }
+      if (matches.length === 0) {
+        setStatusNotice(`No definition found for "${symbol}"`);
+        return;
+      }
+      if (matches.length === 1) {
+        const m = matches[0];
+        await openFileInTab(m.file, true, false, Number(m.line) || 1);
+        setStatusNotice(
+          `Definition (${lspRes?.matches?.length ? 'LSP' : 'search'}): ${m.file}:${m.line}`
+        );
+        return;
+      }
+      setSymbolPaletteItems(
+        matches.map((m: any) => ({
+          label: `${m.file}:${m.line}  ${m.preview || ''}`,
+          hint: m.score != null ? `score ${m.score}` : 'LSP',
+          run: () => {
+            void openFileInTab(m.file, true, false, Number(m.line) || 1);
+          },
+        }))
+      );
+      setPaletteQuery('');
+      setPaletteMode('definitions');
+      setShowPalette(true);
+      setStatusNotice(`Definitions for "${symbol}": ${matches.length} candidates`);
+    } catch (err) {
+      setStatusNotice(`Go to Definition failed: ${(err as Error).message}`);
+    }
+  }
+
+  async function refreshLspDiagnosticsForActiveFile() {
+    const filePath = activeTab?.kind === 'code' ? activeTab.path : '';
+    const content = activeTab?.kind === 'code' ? activeTab.content : '';
+    if (!filePath) return;
+    try {
+      const res = await fetch('/api/lsp/diagnostics', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath, content }),
+      }).then((r) => r.json());
+      if (Array.isArray(res?.problems)) {
+        setWorkspaceProblems(res.problems);
+      } else if (Array.isArray(res?.diagnostics) && res.diagnostics.length > 0) {
+        setWorkspaceProblems(res.diagnostics);
+        setShowBottomPanel(true);
+        setActiveBottomTab('problems');
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleSshReconnect() {
+    try {
+      setStatusNotice('Reconnecting SSH…');
+      const res = await fetch('/api/ssh/reconnect', { method: 'POST' }).then((r) => r.json());
+      if (!res?.ok) throw new Error(res?.error || 'Reconnect failed');
+      if (res.workspaceRoot) setWorkspaceRoot(res.workspaceRoot);
+      if (res.workspaceName) setWorkspaceName(res.workspaceName);
+      if (res.status) setSshStatus(res.status);
+      await refreshWorkspaceTree();
+      setStatusNotice(`SSH reconnected: ${res.workspaceName || res.workspaceRoot}`);
+    } catch (err) {
+      setStatusNotice(`SSH reconnect failed: ${(err as Error).message}`);
+    }
+  }
+
+  async function handleSshConflictCheck(filePath?: string) {
+    const target = filePath || (activeTab?.kind === 'code' ? activeTab.path : '');
+    if (!target) return;
+    try {
+      const res = await fetch('/api/ssh/conflict-check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filePath: target }),
+      }).then((r) => r.json());
+      if (!res?.ok) throw new Error(res?.error || 'check failed');
+      if (res.conflict) {
+        const takeRemote = window.confirm(
+          `SSH conflict on ${target}: local and remote both changed.\nOK = Take Remote (overwrite local)\nCancel = Keep Local`
+        );
+        if (takeRemote) {
+          const pull = await fetch('/api/ssh/pull-file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ filePath: target, allowOverwriteDirty: true }),
+          }).then((r) => r.json());
+          if (pull?.ok && typeof pull.content === 'string') {
+            await openFileInTab(target, true, true);
+            setStatusNotice(`Took remote version: ${target}`);
+          } else {
+            setStatusNotice(pull?.error || 'Pull failed');
+          }
+        } else {
+          setStatusNotice(`Kept local version: ${target}`);
+        }
+      } else if (res.dirtyLocal) {
+        setStatusNotice(`Local mirror dirty (not pulled): ${target}`);
+      } else if (res.remoteChanged) {
+        setStatusNotice(`Remote changed since last pull: ${target}`);
+      } else {
+        setStatusNotice(`No SSH conflict: ${target}`);
+      }
+    } catch (err) {
+      setStatusNotice(`SSH conflict check failed: ${(err as Error).message}`);
+    }
+  }
+
   async function handleRunTerminalCommand(cmdText?: string) {
     const cmd = (cmdText ?? terminalInput).trim();
     if (!cmd) return;
@@ -1272,25 +1769,98 @@ export function App() {
         ts: new Date().toLocaleTimeString(),
       },
     ]);
+    if (Array.isArray(res?.problems)) {
+      setWorkspaceProblems(res.problems);
+      if (res.problems.length > 0 && (res.exitCode ?? 0) !== 0) {
+        setActiveBottomTab('problems');
+        setStatusNotice(`Problems updated: ${res.problems.length} issue(s) from build/terminal`);
+      }
+    } else {
+      void refreshWorkspaceProblems();
+    }
     void refreshWorkspaceTree();
     void refreshGitStatus();
   }
 
+  function markSessionRunning(sessionId: string, running: boolean) {
+    if (!sessionId) return;
+    setRunningSessionIds((prev) => {
+      const set = new Set(prev);
+      if (running) set.add(sessionId);
+      else set.delete(sessionId);
+      return [...set];
+    });
+  }
+
+  function pinComposerSession(sessionId: string) {
+    if (!sessionId) return;
+    setComposerSessionTabs((prev) => {
+      const next = [sessionId, ...prev.filter((id) => id !== sessionId)];
+      return next.slice(0, 4);
+    });
+  }
+
+  async function refreshAgentMemory() {
+    try {
+      const res = await fetch('/api/agent-memory').then((r) => r.json());
+      setAgentMemoryEntries(Array.isArray(res?.entries) ? res.entries : []);
+    } catch {
+      // ignore
+    }
+  }
+
   function handleRealtimeEvent(ev: UIEventMessage) {
     appendLog(`[Event #${ev.sequence}] ${ev.type}`);
+    const sid = String(ev.sessionId || '');
+    const isActive = !sid || sid === activeSessionIdRef.current;
+
+    // Stage U: background sessions update running badge without clobbering active Composer
+    if (!isActive) {
+      if (
+        ev.type === 'assistant.text.delta' ||
+        ev.type === 'tool.call.started' ||
+        ev.type === 'session.state'
+      ) {
+        if (ev.type === 'session.state' && ev.payload?.status && ev.payload.status !== 'running') {
+          markSessionRunning(sid, false);
+        } else {
+          markSessionRunning(sid, true);
+        }
+      }
+      if (ev.type === 'assistant.text.done') {
+        markSessionRunning(sid, false);
+        void bridge.request<any[]>('session.list').then(setSessions);
+        void refreshWorkspaceTree();
+        void refreshGitStatus();
+      }
+      if (ev.type === 'diff.proposed' || ev.type === 'diff.updated') {
+        setDiffs((prev) => {
+          const exists = prev.some((d) => d.diffId === ev.payload.diffId);
+          return exists
+            ? prev.map((d) => (d.diffId === ev.payload.diffId ? { ...d, ...ev.payload } : d))
+            : [ev.payload, ...prev];
+        });
+      }
+      return;
+    }
+
     switch (ev.type) {
       case 'assistant.text.delta':
+        markSessionRunning(sid, true);
         setStreamingText((prev) => prev + String(ev.payload.delta ?? ''));
         break;
       case 'assistant.text.done':
         setStreamingText('');
         setLiveToolCalls([]);
+        markSessionRunning(sid, false);
         void selectAndResumeSession(ev.sessionId);
         void bridge.request<any[]>('session.list').then(setSessions);
         void refreshWorkspaceTree();
         void refreshGitStatus();
+        void refreshAgentMemory();
         break;
       case 'tool.call.started':
+        markSessionRunning(sid, true);
         setLiveToolCalls((prev) => [...prev, ev.payload]);
         break;
       case 'tool.call.completed':
@@ -1308,6 +1878,58 @@ export function App() {
           prev.filter((a) => a.approvalId !== ev.payload.approvalId)
         );
         break;
+      case 'diff.updated':
+        setDiffs((prev) => {
+          const exists = prev.some((d) => d.diffId === ev.payload.diffId);
+          return exists
+            ? prev.map((d) => (d.diffId === ev.payload.diffId ? { ...d, ...ev.payload } : d))
+            : [ev.payload, ...prev];
+        });
+        break;
+      case 'model.tier':
+        setLastModelTier({
+          effectiveModelId: String(ev.payload.effectiveModelId || ''),
+          tier: String(ev.payload.tier || ''),
+          reason: String(ev.payload.reason || ''),
+        });
+        if (
+          typeof ev.payload.tokensUsed === 'number' ||
+          typeof ev.payload.tokenBudget === 'number'
+        ) {
+          setGoalTokenUsage((prev) => {
+            const used = Number(ev.payload.tokensUsed ?? prev?.tokensUsed ?? 0);
+            const budget = Number(ev.payload.tokenBudget ?? prev?.tokenBudget ?? 180000);
+            return {
+              tokensUsed: used,
+              tokenBudget: budget,
+              remaining: Math.max(0, budget - used),
+            };
+          });
+        }
+        break;
+      case 'goal.usage': {
+        const used = Number(ev.payload.tokensUsed ?? 0);
+        const budget = Number(ev.payload.tokenBudget ?? 180000);
+        setGoalTokenUsage({
+          tokensUsed: used,
+          tokenBudget: budget,
+          remaining: Number(
+            ev.payload.remaining ?? Math.max(0, budget - used)
+          ),
+        });
+        break;
+      }
+      case 'checkpoint.created':
+        setStatusNotice(
+          `Checkpoint saved: ${ev.payload.label || ev.payload.checkpointId} (${ev.payload.fileCount || 0} files)`
+        );
+        if (activeSessionId) {
+          void bridge
+            .request<any[]>('session.checkpoint.list', { sessionId: activeSessionId }, activeSessionId)
+            .then((list) => setSessionCheckpoints(Array.isArray(list) ? list : []))
+            .catch(() => undefined);
+        }
+        break;
       case 'diff.proposed':
         setDiffs((prev) => {
           const exists = prev.some((d) => d.diffId === ev.payload.diffId);
@@ -1315,6 +1937,7 @@ export function App() {
             ? prev.map((d) => (d.diffId === ev.payload.diffId ? ev.payload : d))
             : [ev.payload, ...prev];
         });
+        setAiTab((tab) => (tab === 'composer' ? 'changes' : tab));
         if (
           ev.payload?.filePath &&
           typeof ev.payload?.proposedContent === 'string'
@@ -1343,7 +1966,15 @@ export function App() {
             ];
           });
           setActiveTabPath(modPath);
-          setStatusNotice(`Modified file: ${modPath}`);
+          const pending = inlinePendingTargetRef.current.replace(/\\/g, '/');
+          if (pending && (modPath === pending || modPath.endsWith(`/${pending}`))) {
+            setShowRightAiDock(true);
+            setAiTab('artifacts');
+            setStatusNotice(`Inline Edit proposed diff: ${modPath}`);
+            inlinePendingTargetRef.current = '';
+          } else {
+            setStatusNotice(`Modified file: ${modPath}`);
+          }
         }
         void refreshWorkspaceTree();
         void refreshGitStatus();
@@ -1351,16 +1982,57 @@ export function App() {
       case 'runtime.error':
         setStatusNotice(`Runtime error: ${ev.payload.message}`);
         break;
+      case 'sandbox.branch.created':
+        setStatusNotice(
+          `Sandbox branch: ${ev.payload.branch || 'evolve/*'} (from ${ev.payload.previousBranch || 'HEAD'})`
+        );
+        appendLog(
+          `[Sandbox] ${ev.payload.message || `Created ${ev.payload.branch}`}`
+        );
+        void refreshGitStatus();
+        break;
+      case 'circuit.breaker.triggered':
+        setStatusNotice(
+          `Circuit breaker: rolled back ${(ev.payload.rolledBackFiles as string[] | undefined)?.length ?? 0} file(s)`
+        );
+        appendLog(
+          `[CircuitBreaker] ${ev.payload.message || 'Session mutations rolled back after repeated verify failures'}`
+        );
+        void refreshWorkspaceTree();
+        void refreshGitStatus();
+        break;
+      case 'artifact.created':
+        setStatusNotice(
+          `Artifact saved: ${ev.payload.title || ev.payload.artifactId} (${ev.payload.artifactType || 'report'})`
+        );
+        appendLog(
+          `[Artifact] ${ev.payload.artifactType || 'report'}: ${ev.payload.title || ev.payload.artifactId}`
+        );
+        void refreshArtifactsAndCustomizations();
+        if (String(ev.payload.artifactType || '') === 'plan' || String(ev.payload.source || '').includes('research')) {
+          setShowRightAiDock(true);
+          setAiTab('artifacts');
+          if (ev.payload.artifactId) {
+            setActiveArtifactId(String(ev.payload.artifactId));
+          }
+        }
+        break;
     }
   }
 
   async function selectAndResumeSession(sessionId: string) {
     setActiveSessionId(sessionId);
-    const snapshot = await bridge.resumeSession(sessionId, lastSeqRef.current);
+    activeSessionIdRef.current = sessionId;
+    pinComposerSession(sessionId);
+    const seq = lastSeqBySessionRef.current[sessionId] || 0;
+    const snapshot = await bridge.resumeSession(sessionId, seq);
     setMessages(snapshot.messages ?? []);
     setDiffs(snapshot.diffs ?? []);
     setPendingApprovals(snapshot.pendingApprovals ?? []);
     setRecoveredFlag(Boolean(snapshot.recoveredAcrossInstanceRestart));
+    setStreamingText('');
+    setLiveToolCalls([]);
+    setIsSendingPrompt(runningSessionIds.includes(sessionId));
   }
 
   async function handleCreateSession(initialPrompt?: string) {
@@ -1465,7 +2137,20 @@ export function App() {
     overrideMode?: 'plan' | 'auto' | 'manual'
   ) {
     const raw = (overridePrompt ?? promptInput).trim();
-    if (!raw || isSendingPrompt) return;
+    if (!raw) return;
+    // Stage U: only queue when the *active* session is busy; other sessions may run in parallel
+    const sendSessionId = activeSessionIdRef.current || activeSessionId;
+    const activeBusy = sendSessionId
+      ? runningSessionIds.includes(sendSessionId)
+      : isSendingPrompt;
+    if (activeBusy) {
+      setPendingPromptQueue((prev) => [...prev, { prompt: raw, mode: overrideMode }].slice(-5));
+      if (!overridePrompt) setPromptInput('');
+      setStatusNotice(
+        `Queued follow-up for this Composer (${Math.min(5, pendingPromptQueue.length + 1)} waiting).`
+      );
+      return;
+    }
 
     const autoIntent = detectUiPromptIntent(raw);
     const resolvedChoice =
@@ -1483,7 +2168,11 @@ export function App() {
     setPromptInput('');
     setStreamingText('');
     setLiveToolCalls([]);
+    setGoalTokenUsage(null);
     setIsSendingPrompt(true);
+    // Capture the session this turn belongs to (parallel-safe finally cleanup)
+    let turnSessionId = sendSessionId;
+    if (turnSessionId) markSessionRunning(turnSessionId, true);
     setStatusNotice('Agent is thinking and executing tools...');
 
     let finalPrompt = raw;
@@ -1497,12 +2186,81 @@ export function App() {
         finalPrompt = `[FORCE_AUTO_ACTION] ${finalPrompt}`;
       }
     }
-    if (/(?:^|\s)@terminal\b/i.test(finalPrompt) && terminalHistory.length > 0) {
+
+    // Sticky context chips → ensure corresponding @ mentions are present
+    for (const chip of contextChips) {
+      if (chip.kind === 'file' && !finalPrompt.includes(`@${chip.value}`)) {
+        finalPrompt = `@${chip.value} ${finalPrompt}`;
+      } else if (chip.kind === 'folder' && !/@folder\//i.test(finalPrompt)) {
+        finalPrompt = `@folder/${chip.value} ${finalPrompt}`;
+      } else if (chip.kind === 'builtin' && !finalPrompt.includes(chip.value)) {
+        finalPrompt = `${chip.value} ${finalPrompt}`;
+      } else if (chip.kind === 'code' && !/(?:^|\s)@code\b/i.test(finalPrompt)) {
+        finalPrompt = `@code ${finalPrompt}`;
+      } else if (chip.kind === 'tabs' && !/(?:^|\s)@tabs\b/i.test(finalPrompt)) {
+        finalPrompt = `@tabs ${finalPrompt}`;
+      }
+    }
+
+    if (
+      (/(?:^|\s)@terminal\b/i.test(finalPrompt) || contextChips.some((c) => c.value === '@terminal')) &&
+      terminalHistory.length > 0
+    ) {
       const recentTerm = terminalHistory
         .slice(-3)
         .map((t) => `$ ${t.cmd} (exit=${t.exitCode})\n${(t.output || '').slice(0, 1500)}`)
         .join('\n\n');
       finalPrompt = `${finalPrompt}\n\n<mentioned_terminal_output>\n${recentTerm}\n</mentioned_terminal_output>`;
+    }
+    if (
+      (/(?:^|\s)@code\b/i.test(finalPrompt) || contextChips.some((c) => c.kind === 'code')) &&
+      editorSelection.hasSelection &&
+      editorSelection.text
+    ) {
+      finalPrompt = `${finalPrompt}\n\n<mentioned_code_selection file="${activeTab?.path || ''}">\n${editorSelection.text.slice(0, 4000)}\n</mentioned_code_selection>`;
+    }
+    if (/(?:^|\s)@tabs\b/i.test(finalPrompt) || contextChips.some((c) => c.kind === 'tabs')) {
+      const tabDigest = tabs
+        .filter((t) => t.kind === 'code')
+        .slice(0, 6)
+        .map((t) => `### ${t.path}\n${(t.content || '').slice(0, 1200)}`)
+        .join('\n\n');
+      finalPrompt = `${finalPrompt}\n\n<mentioned_open_tabs>\n${tabDigest}\n</mentioned_open_tabs>`;
+    }
+    // @symbol chips / @symbol:Name → inject function/class body range from active file
+    const symbolChips = contextChips.filter((c) => c.kind === 'symbol');
+    const symbolTagMatches = [...finalPrompt.matchAll(/(?:^|\s)@symbol:([A-Za-z0-9_$.]+)/g)].map(
+      (m) => m[1]
+    );
+    if (symbolChips.length > 0 || symbolTagMatches.length > 0) {
+      const activeCode = tabs.find((t) => t.path === activeTabPath && t.kind === 'code');
+      const lines = (activeCode?.content || '').split(/\r?\n/);
+      const blocks: string[] = [];
+      const want = new Set([
+        ...symbolChips.map((c) => c.value),
+        ...symbolTagMatches,
+      ]);
+      for (const sym of composerSymbols) {
+        const key = `${sym.filePath}#${sym.name}`;
+        if (
+          !want.has(key) &&
+          !want.has(sym.name) &&
+          !want.has(`@symbol:${sym.name}`) &&
+          !symbolChips.some((c) => c.label.includes(sym.name))
+        ) {
+          continue;
+        }
+        const slice = lines
+          .slice(Math.max(0, sym.startLine - 1), Math.min(lines.length, sym.endLine))
+          .join('\n')
+          .slice(0, 3500);
+        blocks.push(
+          `### ${sym.kind} ${sym.name} (${sym.filePath}:L${sym.startLine}-L${sym.endLine})\n\`\`\`\n${slice}\n\`\`\``
+        );
+      }
+      if (blocks.length > 0) {
+        finalPrompt = `${finalPrompt}\n\n<mentioned_symbols>\n${blocks.join('\n\n')}\n</mentioned_symbols>`;
+      }
     }
     if (
       !overridePrompt &&
@@ -1526,26 +2284,31 @@ export function App() {
     setMessages((prev) => [...prev, optimisticUserMsg]);
 
     try {
-      if (!activeSessionId) {
+      if (!turnSessionId) {
         await handleCreateSession(finalPrompt);
+        turnSessionId = activeSessionIdRef.current;
+        if (turnSessionId) markSessionRunning(turnSessionId, true);
       } else {
         try {
           await bridge.request(
             'session.send',
             {
-              sessionId: activeSessionId,
+              sessionId: turnSessionId,
               prompt: finalPrompt,
               workspaceRoot: workspaceRoot || undefined,
               executionMode: effectiveMode,
               modelId: modelInput || undefined,
             },
-            activeSessionId
+            turnSessionId
           );
-          await selectAndResumeSession(activeSessionId);
+          if (activeSessionIdRef.current === turnSessionId) {
+            await selectAndResumeSession(turnSessionId);
+          }
         } catch (sendErr) {
           const sendErrMsg = (sendErr as Error).message || String(sendErr);
           if (sendErrMsg.includes('SESSION_NOT_FOUND')) {
             await handleCreateSession(finalPrompt);
+            turnSessionId = activeSessionIdRef.current;
           } else {
             throw sendErr;
           }
@@ -1554,23 +2317,50 @@ export function App() {
       await refreshWorkspaceTree();
       await refreshGitStatus();
       await refreshArtifactsAndCustomizations();
-      setStatusNotice('Agent response completed');
+      if (activeSessionIdRef.current === turnSessionId) {
+        setStatusNotice('Agent response completed');
+      } else {
+        setStatusNotice(`Background Composer finished (${String(turnSessionId).slice(0, 10)}…)`);
+      }
     } catch (err) {
       const errMsg = (err as Error).message || String(err);
       setStatusNotice(`Agent error: ${errMsg}`);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `err_${Date.now()}`,
-          sessionId: activeSessionId || 'err',
-          role: 'assistant',
-          content: `⚠️ Request failed: ${errMsg}`,
-          sequence: prev.length + 1,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
+      if (activeSessionIdRef.current === turnSessionId) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err_${Date.now()}`,
+            sessionId: turnSessionId || 'err',
+            role: 'assistant',
+            content: `⚠️ Request failed: ${errMsg}`,
+            sequence: prev.length + 1,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
+      }
     } finally {
-      setIsSendingPrompt(false);
+      if (turnSessionId) markSessionRunning(turnSessionId, false);
+      if (activeSessionIdRef.current === turnSessionId) {
+        setIsSendingPrompt(false);
+      }
+      // Drain follow-ups only for the active Composer that owns this turn
+      if (activeSessionIdRef.current === turnSessionId && !drainPromptQueueRef.current) {
+        drainPromptQueueRef.current = true;
+        setPendingPromptQueue((prev) => {
+          if (prev.length === 0) {
+            drainPromptQueueRef.current = false;
+            return prev;
+          }
+          const [next, ...rest] = prev;
+          queueMicrotask(() => {
+            drainPromptQueueRef.current = false;
+            void handleSendPrompt(next.prompt, next.mode);
+          });
+          return rest;
+        });
+      } else if (activeSessionIdRef.current === turnSessionId) {
+        drainPromptQueueRef.current = false;
+      }
     }
   }
 
@@ -1581,6 +2371,139 @@ export function App() {
       reason: approved ? 'Approved in IDE Workbench' : 'Rejected in IDE Workbench',
     });
     setStatusNotice(approved ? 'Approved tool execution' : 'Rejected tool execution');
+  }
+
+  function addContextChip(chip: { kind: string; label: string; value: string }) {
+    setContextChips((prev) => {
+      if (prev.some((c) => c.value === chip.value && c.kind === chip.kind)) return prev;
+      return [...prev, { id: `chip_${Date.now()}_${prev.length}`, ...chip }].slice(-12);
+    });
+  }
+
+  function buildCheckpointContentDiff(
+    before: string,
+    after: string,
+    maxLines = 24
+  ): { summary: string; preview: string } {
+    const a = String(before || '').replace(/\r\n/g, '\n').split('\n');
+    const b = String(after || '').replace(/\r\n/g, '\n').split('\n');
+    const lines: string[] = [];
+    let added = 0;
+    let removed = 0;
+    const max = Math.max(a.length, b.length);
+    for (let i = 0; i < max && lines.length < maxLines; i++) {
+      const left = a[i];
+      const right = b[i];
+      if (left === right) continue;
+      if (left != null && right == null) {
+        lines.push(`- ${left}`);
+        removed += 1;
+      } else if (left == null && right != null) {
+        lines.push(`+ ${right}`);
+        added += 1;
+      } else {
+        lines.push(`- ${left}`);
+        lines.push(`+ ${right}`);
+        removed += 1;
+        added += 1;
+      }
+    }
+    if (lines.length === 0) {
+      return { summary: 'no content delta vs current', preview: '(identical)' };
+    }
+    return {
+      summary: `+${added} / -${removed} line changes (sample)`,
+      preview: lines.join('\n'),
+    };
+  }
+
+  async function loadCheckpointPreviewDiffs(ck: any) {
+    const files = Array.isArray(ck?.files) ? ck.files : [];
+    const out: Array<{ path: string; summary: string; preview: string }> = [];
+    for (const f of files.slice(0, 3)) {
+      const rel = String(f.path || f.filePath || '').replace(/\\/g, '/');
+      if (!rel) continue;
+      const snap = typeof f.content === 'string' ? f.content : '';
+      let current = '';
+      const open = tabs.find((t) => t.path.replace(/\\/g, '/') === rel);
+      if (open && typeof open.content === 'string') {
+        current = open.content;
+      } else {
+        try {
+          const res = await fetch(`/api/workspace/raw?path=${encodeURIComponent(rel)}`);
+          current = res.ok ? await res.text() : '';
+        } catch {
+          current = '';
+        }
+      }
+      // Diff direction: current (disk/tab) → checkpoint snapshot (what Restore would write)
+      const { summary, preview } = buildCheckpointContentDiff(current, snap);
+      out.push({ path: rel, summary, preview });
+    }
+    setCheckpointPreviewDiffs(out);
+  }
+
+  async function refreshSessionCheckpoints(sessionId?: string) {
+    const sid = sessionId || activeSessionId;
+    if (!sid) {
+      setSessionCheckpoints([]);
+      return;
+    }
+    try {
+      const list = await bridge.request<any[]>(
+        'session.checkpoint.list',
+        { sessionId: sid },
+        sid
+      );
+      setSessionCheckpoints(Array.isArray(list) ? list : []);
+    } catch {
+      setSessionCheckpoints([]);
+    }
+  }
+
+  async function handleReviewAllPending(action: 'accept' | 'reject') {
+    const sid = activeSessionId || sessions[0]?.sessionId;
+    if (!sid) return;
+    try {
+      const updated = await bridge.request<any[]>(
+        'diff.reviewAll',
+        { sessionId: sid, action },
+        sid
+      );
+      if (Array.isArray(updated)) {
+        setDiffs((prev) => {
+          const map = new Map(updated.map((d) => [d.diffId, d]));
+          return prev.map((d) => map.get(d.diffId) || d);
+        });
+      }
+      await refreshWorkspaceTree();
+      await refreshGitStatus();
+      setStatusNotice(
+        action === 'accept'
+          ? `Accepted ${updated?.length ?? 0} pending change(s)`
+          : `Rejected ${updated?.length ?? 0} pending change(s)`
+      );
+    } catch (err) {
+      setStatusNotice(`Bulk diff review failed: ${(err as Error).message}`);
+    }
+  }
+
+  async function handleStopAgent() {
+    if (!activeSessionId) return;
+    try {
+      const res = await bridge.cancelSession(activeSessionId);
+      setIsSendingPrompt(false);
+      const pending = Number(res?.pendingDiffsPreserved ?? diffs.filter((d) => d.status === 'pending').length);
+      if (pending > 0) {
+        setAiTab('changes');
+        setShowRightAiDock(true);
+        setStatusNotice(`Stopped. ${pending} pending Diff(s) preserved for Accept/Reject.`);
+      } else {
+        setStatusNotice('Agent stopped.');
+      }
+    } catch (err) {
+      setStatusNotice(`Stop failed: ${(err as Error).message}`);
+    }
   }
 
   async function handleDiffReview(
@@ -1642,6 +2565,106 @@ export function App() {
       }
     } catch (err) {
       setStatusNotice(`Diff review error: ${(err as Error).message}`);
+    }
+  }
+
+  function getDiffHunks(diff: any): DiffHunkView[] {
+    return parseDiffHunks({
+      unifiedDiff: String(diff?.unifiedDiff || ''),
+      originalContent: String(diff?.originalContent || ''),
+      proposedContent: String(diff?.proposedContent || ''),
+    });
+  }
+
+  async function handleHunkDecision(
+    diff: any,
+    hunkIndex: number,
+    action: 'accepted' | 'rejected'
+  ) {
+    const hunks = getDiffHunks(diff);
+    if (hunks.length === 0) {
+      setStatusNotice('No hunks available for this Diff');
+      return;
+    }
+
+    let nextDecisions: Array<'pending' | 'accepted' | 'rejected'> = [];
+    setHunkDecisions((prev) => {
+      const cur =
+        prev[diff.diffId] && prev[diff.diffId].length === hunks.length
+          ? [...prev[diff.diffId]]
+          : hunks.map(() => 'pending' as const);
+      cur[hunkIndex] = action;
+      nextDecisions = cur;
+      return { ...prev, [diff.diffId]: cur };
+    });
+    // Allow React state setter to flush nextDecisions synchronously for this call
+    if (nextDecisions.length === 0) {
+      nextDecisions = hunks.map((_, i) =>
+        i === hunkIndex ? action : ('pending' as const)
+      );
+    }
+
+    const rebuilt = rebuildProposedAfterHunkDecision({
+      originalContent: String(diff.originalContent || ''),
+      hunks,
+      decisions: nextDecisions,
+    });
+
+    const targetSessionId =
+      diff.sessionId || activeSessionId || sessions[0]?.sessionId || 'default';
+
+    try {
+      if (rebuilt.remainingPending === 0) {
+        const finalize =
+          rebuilt.acceptedCount === 0 ? 'reject' : ('accept' as const);
+        const updated = await bridge.request(
+          'diff.updateProposed',
+          {
+            sessionId: targetSessionId,
+            diffId: diff.diffId,
+            proposedContent: rebuilt.proposedContent,
+            writeToDisk: true,
+            finalize,
+          },
+          targetSessionId
+        );
+        setDiffs((prev) =>
+          prev.map((d) => (d.diffId === diff.diffId ? { ...d, ...updated } : d))
+        );
+        setHunkDecisions((p) => {
+          const next = { ...p };
+          delete next[diff.diffId];
+          return next;
+        });
+        await refreshWorkspaceTree();
+        await refreshGitStatus();
+        setStatusNotice(
+          finalize === 'accept'
+            ? `Accepted ${rebuilt.acceptedCount} hunk(s) in ${diff.filePath}`
+            : `Rejected all hunks in ${diff.filePath}`
+        );
+        return;
+      }
+
+      const updated = await bridge.request(
+        'diff.updateProposed',
+        {
+          sessionId: targetSessionId,
+          diffId: diff.diffId,
+          proposedContent: rebuilt.proposedContent,
+          writeToDisk: true,
+          finalize: 'keep',
+        },
+        targetSessionId
+      );
+      setDiffs((prev) =>
+        prev.map((d) => (d.diffId === diff.diffId ? { ...d, ...updated } : d))
+      );
+      setStatusNotice(
+        `${action === 'accepted' ? 'Accepted' : 'Rejected'} hunk ${hunkIndex + 1}/${hunks.length} · ${rebuilt.remainingPending} remaining`
+      );
+    } catch (err) {
+      setStatusNotice(`Hunk review error: ${(err as Error).message}`);
     }
   }
 
@@ -2068,6 +3091,7 @@ export function App() {
       name === 'write-file' ||
       name === 'edit_file' ||
       name === 'editor' ||
+      name === 'apply_patch' ||
       name === 'reveal-diff'
     )
       return shortPath ? `Edit ${shortPath}` : 'Generate code changes';
@@ -2083,6 +3107,48 @@ export function App() {
     if (name === 'browser_action')
       return input.action ? `Browser: ${input.action}` : 'Browser inspect';
     return name;
+  }
+
+  /** Stage T: jump from tool card / Changes hunk → editor line + Changes tab */
+  function jumpToDiffHunk(diff: any, hunkIndex = 0) {
+    if (!diff) return;
+    setAiTab('changes');
+    const hunks = getDiffHunks(diff);
+    const hunk = hunks[Math.max(0, Math.min(hunkIndex, Math.max(0, hunks.length - 1)))];
+    const line =
+      Number(hunk?.oldStart) ||
+      Number(String(hunk?.header || '').match(/\+(\d+)/)?.[1]) ||
+      1;
+    void openFileInTab(String(diff.filePath || ''), true, true, line);
+    setStatusNotice(
+      `Jumped to Diff hunk ${hunk ? hunk.index + 1 : '?'} · ${diff.filePath}:${line}`
+    );
+  }
+
+  function findPendingDiffForTool(tc: any): any | null {
+    const input = tc?.input || {};
+    const output = tc?.output || tc?.result || {};
+    const byId =
+      output?.diffId ||
+      output?.diff_id ||
+      (Array.isArray(output?.files) ? output.files[0]?.diffId : null);
+    if (byId) {
+      const hit = diffs.find((d) => d.diffId === byId);
+      if (hit) return hit;
+    }
+    const filePath = String(
+      input.filePath || input.path || output?.filePath || output?.files?.[0]?.filePath || ''
+    ).replace(/\\/g, '/');
+    if (!filePath) return null;
+    const normTail = filePath.replace(/^\.\//, '');
+    const byPath = (statusPrefer: string[]) =>
+      diffs.find((d) => {
+        if (!statusPrefer.includes(String(d.status || ''))) return false;
+        const fp = String(d.filePath || '').replace(/\\/g, '/');
+        return fp.endsWith(normTail) || normTail.endsWith(fp);
+      });
+    // Prefer pending, then any matching Diff so chat history Jump still works after Accept
+    return byPath(['pending']) || byPath(['accepted', 'rejected', 'revised']) || null;
   }
 
   interface SplitDiffRow {
@@ -2159,10 +3225,64 @@ export function App() {
     return rows;
   }
 
+  /** Stage V: debounced LSP diagnostics while typing → Problems + gutter */
+  function triggerDebouncedLiveDiagnostics(filePath: string, content: string) {
+    if (!filePath || !/\.(tsx?|jsx?|mjs|cjs|py|c|cc|cpp|cxx|h|hpp)$/i.test(filePath)) return;
+    if (liveDiagTimerRef.current) clearTimeout(liveDiagTimerRef.current);
+    liveDiagTimerRef.current = setTimeout(async () => {
+      const seq = ++liveDiagSeqRef.current;
+      liveDiagAbortRef.current?.abort();
+      const controller = new AbortController();
+      liveDiagAbortRef.current = controller;
+      try {
+        const res = await fetch('/api/lsp/diagnostics', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ filePath, content }),
+        }).then((r) => r.json());
+        if (seq !== liveDiagSeqRef.current) return;
+        const diags = Array.isArray(res?.diagnostics) ? res.diagnostics : [];
+        const marks = new Map<number, string>();
+        for (const d of diags) {
+          marks.set(Number(d.line) || 1, `${d.severity || 'info'}: ${d.message}`);
+        }
+        setProblemGutterLines(marks);
+        if (Array.isArray(res?.problems)) {
+          setWorkspaceProblems(res.problems);
+        } else if (diags.length > 0) {
+          setWorkspaceProblems((prev) => {
+            const norm = filePath.replace(/\\/g, '/');
+            const kept = prev.filter((p) => {
+              const pf = String(p.file || '').replace(/\\/g, '/');
+              return !(pf === norm || norm.endsWith(pf) || pf.endsWith(norm));
+            });
+            return [
+              ...kept,
+              ...diags.map((d: any) => ({
+                file: String(d.file || filePath),
+                line: Number(d.line) || 1,
+                column: Number(d.column) || 1,
+                severity: String(d.severity || 'error'),
+                message: String(d.message || ''),
+              })),
+            ];
+          });
+        }
+      } catch {
+        // aborted or transient — ignore
+      }
+    }, 700);
+  }
+
   function triggerDebouncedGhostAutocomplete(content: string, cursorPosOffset: number) {
     if (!autocompleteEnabled) return;
     if (autocompleteTimerRef.current) clearTimeout(autocompleteTimerRef.current);
     autocompleteTimerRef.current = setTimeout(async () => {
+      const reqSeq = ++ghostRequestSeqRef.current;
+      ghostAbortRef.current?.abort();
+      const controller = new AbortController();
+      ghostAbortRef.current = controller;
       try {
         const prefix = content.slice(0, cursorPosOffset);
         const suffix = content.slice(cursorPosOffset);
@@ -2179,16 +3299,18 @@ export function App() {
             prefix,
             suffix,
           }),
+          signal: controller.signal,
         }).then((r) => r.json());
+        if (reqSeq !== ghostRequestSeqRef.current) return;
         if (res?.ok && typeof res.completion === 'string' && res.completion.length > 0) {
           setGhostText(res.completion);
         } else {
           setGhostText('');
         }
       } catch {
-        setGhostText('');
+        if (reqSeq === ghostRequestSeqRef.current) setGhostText('');
       }
-    }, 280);
+    }, 220);
   }
 
   const SOURCE_FILE_EXT_PATTERN =
@@ -3247,7 +4369,7 @@ export function App() {
         return { badge: 'JSX', color: '#22d3ee', language: 'JavaScript React' };
       case 'html':
       case 'htm':
-        return { badge: '<>', color: '#f97316', language: 'HTML' };
+        return { badge: 'HTM', color: '#f97316', language: 'HTML' };
       case 'css':
       case 'scss':
       case 'less':
@@ -3256,7 +4378,7 @@ export function App() {
         return { badge: '{}', color: '#f59e0b', language: 'JSON' };
       case 'md':
       case 'mdx':
-        return { badge: 'M↓', color: '#a855f7', language: 'Markdown' };
+        return { badge: 'MD', color: '#a855f7', language: 'Markdown' };
       case 'py':
         return { badge: 'PY', color: '#3b82f6', language: 'Python' };
       case 'sh':
@@ -3294,8 +4416,11 @@ export function App() {
   function renderSyntaxHighlightedLine(
     line: string,
     lineIdx: number,
-    isActiveLine: boolean
+    isActiveLine: boolean,
+    diffKind?: DiffLineKind
   ): React.ReactNode {
+    const diffClass =
+      diffKind === 'add' ? 'diff-add' : diffKind === 'mod' ? 'diff-mod' : '';
     const trimmed = line.trim();
     if (
       trimmed.startsWith('//') ||
@@ -3306,7 +4431,7 @@ export function App() {
       return (
         <div
           key={lineIdx}
-          className={`ag-code-line ${isActiveLine ? 'active' : ''}`}
+          className={`ag-code-line ${isActiveLine ? 'active' : ''} ${diffClass}`.trim()}
         >
           <span className="tok-comment">{line || ' '}</span>
         </div>
@@ -3363,7 +4488,7 @@ export function App() {
     return (
       <div
         key={lineIdx}
-        className={`ag-code-line ${isActiveLine ? 'active' : ''}`}
+        className={`ag-code-line ${isActiveLine ? 'active' : ''} ${diffClass}`.trim()}
       >
         {parts.length > 0 ? parts : ' '}
         {isActiveLine && ghostText && (
@@ -3489,6 +4614,18 @@ export function App() {
 
   const activeTab = tabs.find((t) => t.path === activeTabPath);
   const codeLines = (activeTab?.content ?? '').split('\n');
+  const pendingDiffForActive =
+    activeTab?.kind === 'code'
+      ? diffs.find(
+          (d) =>
+            d.status === 'pending' &&
+            String(d.filePath || '').replace(/\\/g, '/') ===
+              String(activeTab.path || '').replace(/\\/g, '/')
+        )
+      : undefined;
+  const pendingDiffMarks = pendingDiffForActive
+    ? marksFromDiffRecord(pendingDiffForActive)
+    : new Map<number, DiffLineKind>();
 
   const bodyGridStyle: React.CSSProperties = {
     gridTemplateColumns: [
@@ -3511,11 +4648,11 @@ export function App() {
   const MENU_DEFINITIONS = [
     {
       id: 'file',
-      label: 'File',
+      label: t('menu.file'),
       items: [
-        { header: 'Create' },
+        { header: t('menu.hdr.create') },
         {
-          label: 'New File...',
+          label: t('menu.file.newFile'),
           shortcut: 'Ctrl+N',
           action: () => {
             setCreateTargetName('src/new-file.ts');
@@ -3523,7 +4660,7 @@ export function App() {
           },
         },
         {
-          label: 'New Folder...',
+          label: t('menu.file.newFolder'),
           shortcut: 'Ctrl+Shift+N',
           action: () => {
             setCreateTargetName('src/new-folder');
@@ -3531,79 +4668,79 @@ export function App() {
           },
         },
         { divider: true },
-        { header: 'Project & Workspace' },
+        { header: t('menu.hdr.project') },
         {
-          label: 'Open Folder / Project...',
+          label: t('menu.file.openFolder'),
           shortcut: 'Ctrl+O',
           action: () => void handleOpenProjectAction(),
         },
         {
-          label: 'Switch Recent Project...',
+          label: t('menu.file.switchRecent'),
           shortcut: 'Ctrl+R',
           action: () => setShowProjectModal(true),
         },
         {
-          label: 'Connect to Remote Host (SSH)...',
+          label: t('menu.file.connectSsh'),
           shortcut: 'Ctrl+Alt+O',
           action: () => void openSshConnectionModal(),
         },
         ...(sshStatus?.connected
           ? [
               {
-                label: 'Close Remote SSH Connection',
+                label: t('menu.file.closeSsh'),
                 shortcut: '',
                 action: () => void handleDisconnectSshHost(),
               },
             ]
           : []),
         { divider: true },
-        { header: 'Save' },
+        { header: t('menu.hdr.save') },
         {
-          label: 'Save',
+          label: t('menu.file.save'),
           shortcut: 'Ctrl+S',
           action: () => void saveCurrentTab(),
         },
         {
-          label: 'Save All',
+          label: t('menu.file.saveAll'),
           shortcut: 'Ctrl+K S',
           action: () => void saveAllTabs(),
         },
         { divider: true },
-        { header: 'Preferences' },
+        { header: t('menu.hdr.preferences') },
         {
-          label: 'Settings',
+          label: t('menu.file.settings'),
           shortcut: 'Ctrl+,',
           action: () => openSettingsCenter('general'),
         },
         {
-          label: 'AI Models & Providers',
+          label: t('menu.file.models'),
           shortcut: 'Ctrl+Shift+J',
           action: () => openSettingsCenter('models'),
         },
         {
-          label: 'Security & Approval Policies',
+          label: t('menu.file.security'),
           shortcut: '',
           action: () => openSettingsCenter('security'),
         },
         {
-          label: 'Extensions',
+          label: t('menu.file.extensions'),
           shortcut: 'Ctrl+Shift+X',
           action: () => openSettingsCenter('extensions'),
         },
         { divider: true },
-        { header: 'Close' },
+        { header: t('menu.hdr.close') },
         {
-          label: 'Close Editor',
+          label: t('menu.file.closeEditor'),
           shortcut: 'Ctrl+W',
           action: () => activeTabPath && closeTab(activeTabPath),
         },
         {
-          label: 'Close Folder',
+          label: t('menu.file.closeFolder'),
           shortcut: 'Ctrl+K F',
           action: () => handleCloseFolder(),
         },
         {
-          label: 'Close Window',
+          label: t('menu.file.closeWindow'),
           shortcut: 'Alt+F4',
           action: () => void handleCloseWindow(),
         },
@@ -3611,10 +4748,10 @@ export function App() {
     },
     {
       id: 'edit',
-      label: 'Edit',
+      label: t('menu.edit'),
       items: [
         {
-          label: 'Find in Files...',
+          label: t('menu.edit.findInFiles'),
           shortcut: 'Ctrl+Shift+F',
           action: () => {
             setShowLeftSidebar(true);
@@ -3623,7 +4760,7 @@ export function App() {
         },
         { divider: true },
         {
-          label: 'Edit AI Project Rules...',
+          label: t('menu.edit.rules'),
           shortcut: '',
           action: () => openSettingsCenter('rules'),
         },
@@ -3631,10 +4768,10 @@ export function App() {
     },
     {
       id: 'selection',
-      label: 'Selection',
+      label: t('menu.selection'),
       items: [
         {
-          label: 'Add Active File to AI Context',
+          label: t('menu.selection.addContext'),
           shortcut: 'Ctrl+L',
           action: () => {
             setAttachActiveFile(true);
@@ -3643,7 +4780,7 @@ export function App() {
         },
         { divider: true },
         {
-          label: 'Ask Agent to Review Active File',
+          label: t('menu.selection.askReview'),
           shortcut: '',
           action: () => {
             setShowRightAiDock(true);
@@ -3656,17 +4793,17 @@ export function App() {
     },
     {
       id: 'view',
-      label: 'View',
+      label: t('menu.view'),
       items: [
         {
-          label: 'Command Palette...',
+          label: t('menu.view.palette'),
           shortcut: 'Ctrl+Shift+P',
           action: () => setShowPalette(true),
         },
         { divider: true },
-        { header: 'Panels' },
+        { header: t('menu.hdr.panels') },
         {
-          label: 'Explorer',
+          label: t('menu.view.explorer'),
           shortcut: 'Ctrl+Shift+E',
           action: () => {
             setShowLeftSidebar(true);
@@ -3674,7 +4811,7 @@ export function App() {
           },
         },
         {
-          label: 'Search',
+          label: t('menu.view.search'),
           shortcut: 'Ctrl+Shift+F',
           action: () => {
             setShowLeftSidebar(true);
@@ -3682,7 +4819,7 @@ export function App() {
           },
         },
         {
-          label: 'Source Control (Git)',
+          label: t('menu.view.git'),
           shortcut: 'Ctrl+Shift+G',
           action: () => {
             setShowLeftSidebar(true);
@@ -3690,7 +4827,7 @@ export function App() {
           },
         },
         {
-          label: 'Extensions',
+          label: t('menu.view.extensions'),
           shortcut: 'Ctrl+Shift+X',
           action: () => {
             setShowLeftSidebar(true);
@@ -3698,24 +4835,24 @@ export function App() {
           },
         },
         { divider: true },
-        { header: 'Appearance & Layout' },
+        { header: t('menu.hdr.appearance') },
         {
-          label: 'Toggle Dark / Light Theme',
+          label: t('menu.view.toggleTheme'),
           shortcut: 'Alt+T',
           action: () => toggleColorTheme(),
         },
         {
-          label: 'Toggle Primary Sidebar',
+          label: t('menu.view.toggleSidebar'),
           shortcut: 'Ctrl+B',
           action: () => setShowLeftSidebar((v) => !v),
         },
         {
-          label: 'Toggle Bottom Panel',
+          label: t('menu.view.toggleBottom'),
           shortcut: 'Ctrl+J',
           action: () => setShowBottomPanel((v) => !v),
         },
         {
-          label: 'Toggle AI Composer Dock',
+          label: t('menu.view.toggleAi'),
           shortcut: 'Ctrl+L',
           action: () => setShowRightAiDock((v) => !v),
         },
@@ -3723,21 +4860,21 @@ export function App() {
     },
     {
       id: 'go',
-      label: 'Go',
+      label: t('menu.go'),
       items: [
         {
-          label: 'Go to File...',
+          label: t('menu.go.file'),
           shortcut: 'Ctrl+P',
           action: () => setShowPalette(true),
         },
         { divider: true },
         {
-          label: 'Product Config (product.json)',
+          label: t('menu.go.product'),
           shortcut: '',
           action: () => void openFileInTab('product/product.json', true),
         },
         {
-          label: 'Architecture & ADR Report',
+          label: t('menu.go.adr'),
           shortcut: '',
           action: () => void openFileInTab('docs/ADR-AND-POC-REPORT.md', true),
         },
@@ -3745,28 +4882,28 @@ export function App() {
     },
     {
       id: 'run',
-      label: 'Run',
+      label: t('menu.run'),
       items: [
-        { header: 'Build & Test' },
+        { header: t('menu.hdr.buildTest') },
         {
-          label: 'Run TypeScript Typecheck',
+          label: t('menu.run.typecheck'),
           shortcut: 'Ctrl+Shift+B',
           action: () => void handleRunTerminalCommand('npm run typecheck'),
         },
         {
-          label: 'Run Test Suite',
+          label: t('menu.run.tests'),
           shortcut: 'F5',
           action: () => void handleRunTerminalCommand('npm test'),
         },
         { divider: true },
-        { header: 'Runtime Verification' },
+        { header: t('menu.hdr.runtime') },
         {
-          label: 'Restart Extension Host (PoC-L2)',
+          label: t('menu.run.restartHost'),
           shortcut: 'Ctrl+Shift+R',
           action: () => void handleSimulateExtensionHostRestart(),
         },
         {
-          label: 'Provider Smoke Test',
+          label: t('menu.run.smoke'),
           shortcut: '',
           action: () => openSettingsCenter('models'),
         },
@@ -3774,10 +4911,10 @@ export function App() {
     },
     {
       id: 'terminal',
-      label: 'Terminal',
+      label: t('menu.terminal'),
       items: [
         {
-          label: 'New / Focus Terminal',
+          label: t('menu.terminal.new'),
           shortcut: 'Ctrl+`',
           action: () => {
             setShowBottomPanel(true);
@@ -3786,12 +4923,12 @@ export function App() {
         },
         { divider: true },
         {
-          label: 'Run git status',
+          label: t('menu.terminal.gitStatus'),
           shortcut: '',
           action: () => void handleRunTerminalCommand('git status'),
         },
         {
-          label: 'Clear Terminal',
+          label: t('menu.terminal.clear'),
           shortcut: '',
           action: () => setTerminalHistory([]),
         },
@@ -3799,73 +4936,78 @@ export function App() {
     },
     {
       id: 'help',
-      label: 'Help',
+      label: t('menu.help'),
       items: [
-        { header: 'User Guide & Manual' },
+        { header: t('menu.hdr.guide') },
         {
-          label: '📖 DeepAutoCode User Guide (Complete Manual)',
+          label: t('menu.help.guide'),
           shortcut: 'F1',
           action: () => openUserGuide('quickstart'),
         },
         {
-          label: '🚀 1. Quick Start & Project Setup',
+          label: t('menu.help.s1'),
           shortcut: '',
           action: () => openUserGuide('quickstart'),
         },
         {
-          label: '🖥️ 2. Workbench Layout & Navigation',
+          label: t('menu.help.s2'),
           shortcut: '',
           action: () => openUserGuide('workbench'),
         },
         {
-          label: '🤖 3. AI Execution Modes (Plan / Auto / Manual)',
+          label: t('menu.help.s3'),
           shortcut: '',
           action: () => openUserGuide('modes'),
         },
         {
-          label: '⚡ 4. / Slash Workflows & @ Context Mentions',
+          label: t('menu.help.s4'),
           shortcut: '',
           action: () => openUserGuide('workflows'),
         },
         {
-          label: '✨ 5. Inline AI (Ctrl+I) & Code Lenses',
+          label: t('menu.help.s5'),
           shortcut: '',
           action: () => openUserGuide('inline'),
         },
         {
-          label: '📑 6. Artifacts, Subagents & .agents/ Rules',
+          label: t('menu.help.s6'),
           shortcut: '',
           action: () => openUserGuide('artifacts'),
         },
         {
-          label: '🌐 7. Live Web Preview & Remote SSH',
+          label: t('menu.help.s7'),
+          shortcut: '',
+          action: () => openUserGuide('agent'),
+        },
+        {
+          label: t('menu.help.s8'),
           shortcut: '',
           action: () => openUserGuide('preview-ssh'),
         },
         {
-          label: '⌨️ 8. Keyboard Shortcuts & Troubleshooting',
+          label: t('menu.help.s9'),
           shortcut: '',
           action: () => openUserGuide('shortcuts'),
         },
         { divider: true },
-        { header: 'Documentation & Diagnostics' },
+        { header: t('menu.hdr.docs') },
         {
-          label: 'Open User Guide Markdown (docs/USER-GUIDE.md)',
+          label: t('menu.help.openMd'),
           shortcut: '',
           action: () => void openFileInTab('docs/USER-GUIDE.md', true),
         },
         {
-          label: 'Architecture & PoC Documentation',
+          label: t('menu.help.poc'),
           shortcut: '',
           action: () => void openFileInTab('docs/ADR-AND-POC-REPORT.md', true),
         },
         {
-          label: 'Settings Center',
+          label: t('menu.help.settings'),
           shortcut: 'Ctrl+,',
           action: () => openSettingsCenter('general'),
         },
         {
-          label: 'Export Security Diagnostics',
+          label: t('menu.help.diagnostics'),
           shortcut: '',
           action: () => void handleExportDiagnostics(),
         },
@@ -3879,6 +5021,7 @@ export function App() {
       onClick={() => {
         setOpenMenu(null);
         setShowGearPopup(false);
+        setShowLangPopup(false);
       }}
     >
       {/* 1. Custom Native IDE Titlebar & 8-Item Project Menu Bar */}
@@ -3936,7 +5079,9 @@ export function App() {
         <div className="command-center-bar" onClick={() => setShowPalette(true)}>
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <span>🔍</span>
-            <span>{workspaceName} — Search files or run command</span>
+            <span>
+              {displayWorkspaceName} {t('command.search')}
+            </span>
           </span>
           <span className="badge" style={{ fontSize: 10 }}>
             Ctrl+P
@@ -3948,54 +5093,54 @@ export function App() {
           <button
             className="theme-toggle-btn"
             onClick={() => toggleColorTheme()}
-            title="Switch between Dark and Light Theme"
+            title={t('title.theme')}
           >
             <span>{isLightTheme ? '🌙' : '☀️'}</span>
-            <span>{isLightTheme ? 'Dark' : 'Light'}</span>
+            <span>{isLightTheme ? t('title.theme.dark') : t('title.theme.light')}</span>
           </button>
           <div className="titlebar-sep" />
           <button
             className={`icon-btn ${showLeftSidebar ? 'active' : ''}`}
             onClick={() => setShowLeftSidebar((v) => !v)}
-            title="Toggle Primary Sidebar (Ctrl+B)"
+            title={t('title.sidebar')}
           >
             ◧
           </button>
           <button
             className={`icon-btn ${showBottomPanel ? 'active' : ''}`}
             onClick={() => setShowBottomPanel((v) => !v)}
-            title="Toggle Terminal Panel (Ctrl+J)"
+            title={t('title.bottom')}
           >
             ◨
           </button>
           <button
             className={`icon-btn ${activeTabPath === 'preview://localhost' ? 'active' : ''}`}
             onClick={() => openWebPreviewTab()}
-            title="Open Live Web Preview (http://localhost:3000/)"
+            title={t('title.previewFull')}
           >
-            🌐 Preview
+            🌐 {t('title.preview')}
           </button>
           <button
             className={`icon-btn ${showRightAiDock ? 'active' : ''}`}
             onClick={() => setShowRightAiDock((v) => !v)}
-            title="Toggle AI Agent Dock (Ctrl+L)"
+            title={t('title.aiFull')}
           >
-            ✨ AI
+            ✨ {t('title.ai')}
           </button>
           <div className="titlebar-sep" />
           <button
             className={`icon-btn ${activeTabPath === 'guide://deepautocode' ? 'active' : ''}`}
             onClick={() => openUserGuide('quickstart')}
-            title="Open DeepAutoCode User Guide & Manual (F1)"
+            title={t('title.guideFull')}
           >
-            📖 Guide
+            📖 {t('title.guide')}
           </button>
           <button
             className={`icon-btn ${activeTabPath === 'settings://deepautocode' ? 'active' : ''}`}
             onClick={() => openSettingsCenter('general')}
-            title="Open DeepAutoCode Settings Center (Ctrl+,)"
+            title={t('title.settingsFull')}
           >
-            ⚙️ Settings
+            ⚙️ {t('title.settings')}
           </button>
         </div>
       </header>
@@ -4008,7 +5153,7 @@ export function App() {
             {[
               {
                 id: 'explorer',
-                title: 'Project Explorer (Ctrl+Shift+E)',
+                title: t('activity.explorer'),
                 svg: (
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
@@ -4017,7 +5162,7 @@ export function App() {
               },
               {
                 id: 'search',
-                title: 'Search Workspace (Ctrl+Shift+F)',
+                title: t('activity.search'),
                 svg: (
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="11" cy="11" r="7" />
@@ -4027,7 +5172,7 @@ export function App() {
               },
               {
                 id: 'git',
-                title: 'Source Control / Git (Ctrl+Shift+G)',
+                title: t('activity.git'),
                 svg: (
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                     <circle cx="18" cy="18" r="3" />
@@ -4038,7 +5183,7 @@ export function App() {
               },
               {
                 id: 'extensions',
-                title: 'Open VSX Extensions & VSIX (Ctrl+Shift+X)',
+                title: t('activity.extensions'),
                 svg: (
                   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                     <rect x="3" y="3" width="7" height="7" rx="1.2" />
@@ -4072,11 +5217,49 @@ export function App() {
             ))}
           </div>
 
-          {/* Bottom-Left Settings Gear with Popup Menu (Antigravity style) */}
+          {/* Bottom-Left: Language / Diagnostics / Settings Gear */}
           <div className="activity-bottom" onClick={(e) => e.stopPropagation()}>
             <div
+              className={`activity-icon ${showLangPopup ? 'active' : ''}`}
+              title={t('activity.language')}
+              onClick={() => {
+                setShowGearPopup(false);
+                setShowLangPopup((v) => !v);
+              }}
+            >
+              <span className="activity-lang-badge" aria-hidden>
+                {t(`activity.language.short.${locale}` as 'activity.language.short.zh-CN')}
+              </span>
+              {showLangPopup && (
+                <div
+                  className="menu-dropdown"
+                  style={{ bottom: 8, top: 'auto', left: 48, minWidth: 200 }}
+                >
+                  <div className="menu-group-header">{t('lang.label')}</div>
+                  {APP_LOCALES.map((loc) => (
+                    <div
+                      key={loc.id}
+                      className={`menu-dropdown-item ${locale === loc.id ? 'active' : ''}`}
+                      onClick={() => {
+                        setShowLangPopup(false);
+                        setAppLocale(loc.id);
+                      }}
+                    >
+                      <span>
+                        {t(`activity.language.short.${loc.id}` as 'activity.language.short.zh-CN')}{' '}
+                        {loc.nativeLabel}
+                      </span>
+                      {locale === loc.id && (
+                        <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>✓</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div
               className="activity-icon"
-              title="Export Redacted Security Diagnostics"
+              title={t('gear.diagnostics')}
               onClick={() => void handleExportDiagnostics()}
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -4087,8 +5270,11 @@ export function App() {
               className={`activity-icon ${
                 activeTabPath === 'settings://deepautocode' ? 'active' : ''
               }`}
-              title="Settings & Customizations (Ctrl+,)"
-              onClick={() => setShowGearPopup((v) => !v)}
+              title={`${t('gear.settings')} (Ctrl+,)`}
+              onClick={() => {
+                setShowLangPopup(false);
+                setShowGearPopup((v) => !v);
+              }}
             >
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="3" />
@@ -4106,8 +5292,14 @@ export function App() {
                       toggleColorTheme();
                     }}
                   >
-                    <span>{isLightTheme ? '🌙 Switch to Dark Theme' : '☀️ Switch to Light Theme'}</span>
-                    <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>Theme</span>
+                    <span>
+                      {isLightTheme
+                        ? `🌙 ${t('gear.theme.dark')}`
+                        : `☀️ ${t('gear.theme.light')}`}
+                    </span>
+                    <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                      {t('settings.theme')}
+                    </span>
                   </div>
                   <div className="menu-divider" />
                   <div
@@ -4117,7 +5309,7 @@ export function App() {
                       openSettingsCenter('general');
                     }}
                   >
-                    <span>⚙️ IDE & Project Settings</span>
+                    <span>⚙️ {t('gear.settings')}</span>
                     <span style={{ fontSize: 11, color: '#8b949e' }}>Ctrl+,</span>
                   </div>
                   <div
@@ -4127,7 +5319,7 @@ export function App() {
                       openSettingsCenter('models');
                     }}
                   >
-                    <span>🤖 AI Models & Providers</span>
+                    <span>🤖 {t('gear.models')}</span>
                     <span style={{ fontSize: 11, color: '#8b949e' }}>Ctrl+Shift+J</span>
                   </div>
                   <div
@@ -4137,7 +5329,7 @@ export function App() {
                       openSettingsCenter('security');
                     }}
                   >
-                    <span>🛡️ Security & Approval Policies</span>
+                    <span>🛡️ {t('gear.security')}</span>
                   </div>
                   <div
                     className="menu-dropdown-item"
@@ -4146,7 +5338,7 @@ export function App() {
                       openSettingsCenter('rules');
                     }}
                   >
-                    <span>📜 Rules for AI (.deepautocode)</span>
+                    <span>📜 {t('gear.rules')}</span>
                   </div>
                   <div
                     className="menu-dropdown-item"
@@ -4155,16 +5347,7 @@ export function App() {
                       openSettingsCenter('mcp');
                     }}
                   >
-                    <span>🔌 MCP Servers & Capabilities</span>
-                  </div>
-                  <div
-                    className="menu-dropdown-item"
-                    onClick={() => {
-                      setShowGearPopup(false);
-                      openSettingsCenter('runtime');
-                    }}
-                  >
-                    <span>⚡ Cline SDK Runtime (local/auto/hub)</span>
+                    <span>🔌 {t('gear.mcp')}</span>
                   </div>
                   <div className="menu-divider" />
                   <div
@@ -4174,7 +5357,7 @@ export function App() {
                       openSettingsCenter('extensions');
                     }}
                   >
-                    <span>🧩 Extensions & VSIX Marketplace</span>
+                    <span>🧩 {t('gear.extensions')}</span>
                     <span style={{ fontSize: 11, color: '#8b949e' }}>Ctrl+Shift+X</span>
                   </div>
                   <div
@@ -4184,7 +5367,7 @@ export function App() {
                       setShowPalette(true);
                     }}
                   >
-                    <span>⌨️ Command Palette...</span>
+                    <span>⌨️ {t('gear.palette')}</span>
                     <span style={{ fontSize: 11, color: '#8b949e' }}>Ctrl+Shift+P</span>
                   </div>
                 </div>
@@ -4198,13 +5381,13 @@ export function App() {
           {activeActivity === 'explorer' && (
             <>
               <div className="sidebar-header ag-sidebar-titlebar">
-                <span>EXPLORER</span>
+                <span>{t('sidebar.explorer')}</span>
                 <button
                   className="ag-header-action"
-                  title="Open / Switch Workspace Folder..."
+                  title={t('settings.openFolder')}
                   onClick={() => void handleOpenProjectAction()}
                 >
-                  Switch Folder
+                  {t('settings.openFolder')}
                 </button>
               </div>
 
@@ -4334,25 +5517,25 @@ export function App() {
                       fontSize: 12,
                     }}
                   >
-                    <div>You have not yet opened a folder.</div>
+                    <div>{t('welcome.explorer.empty')}</div>
                     <button
                       className="btn primary"
                       style={{ width: '100%', justifyContent: 'center', padding: '7px 12px' }}
                       onClick={() => void handleOpenProjectAction()}
                     >
-                      📂 Open Folder
+                      📂 {t('welcome.openFolder')}
                     </button>
                     <button
                       className="btn"
                       style={{ width: '100%', justifyContent: 'center', padding: '7px 12px' }}
                       onClick={() => void openSshConnectionModal()}
                     >
-                      🌐 Connect to SSH Host...
+                      🌐 {t('welcome.explorer.ssh')}
                     </button>
                     {(ideSettings.recentWorkspaces ?? []).length > 0 && (
                       <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
                         <div style={{ fontSize: 11, fontWeight: 600, opacity: 0.8 }}>
-                          RECENT FOLDERS
+                          {t('welcome.explorer.recent')}
                         </div>
                         {(ideSettings.recentWorkspaces ?? []).slice(0, 5).map((ws: string) => (
                           <div
@@ -4385,7 +5568,7 @@ export function App() {
           {activeActivity === 'search' && (
             <>
               <div className="sidebar-header">
-                <span>Search in Project</span>
+                <span>{t('sidebar.search')}</span>
               </div>
               <div style={{ padding: 10 }}>
                 <input
@@ -4397,7 +5580,10 @@ export function App() {
                     borderRadius: 4,
                     color: 'var(--text-primary)',
                   }}
-                  placeholder="Search text across workspace files..."
+                  placeholder={tr(
+                    '在工作区文件中搜索文本…',
+                    'Search text across workspace files...'
+                  )}
                   value={searchQuery}
                   onChange={(e) => void handleWorkspaceSearch(e.target.value)}
                 />
@@ -4431,12 +5617,12 @@ export function App() {
           {activeActivity === 'git' && (
             <>
               <div className="sidebar-header">
-                <span>Source Control (Git)</span>
+                <span>{t('sidebar.git')}</span>
                 <span className="badge">{gitState.branch}</span>
               </div>
               <div className="sidebar-scroll" style={{ padding: 8 }}>
                 <div style={{ fontSize: 11, color: '#8b949e', marginBottom: 8 }}>
-                  Working Tree Changes ({gitState.changes.length})
+                  {tr('工作区变更', 'Working Tree Changes')} ({gitState.changes.length})
                 </div>
                 {gitState.changes.map((c) => (
                   <div
@@ -4456,16 +5642,51 @@ export function App() {
           {activeActivity === 'extensions' && (
             <>
               <div className="sidebar-header">
-                <span>Open VSX Marketplace</span>
+                <span>{t('sidebar.extensions')}</span>
                 <button
                   className="btn"
                   style={{ padding: '2px 6px', fontSize: 10.5 }}
                   onClick={() => openSettingsCenter('extensions')}
                 >
-                  Full View
+                  {tr('完整视图', 'Full View')}
                 </button>
               </div>
               <div className="sidebar-scroll" style={{ padding: 8 }}>
+                <div
+                  style={{
+                    padding: 8,
+                    marginBottom: 8,
+                    border: '1px solid var(--border)',
+                    borderRadius: 6,
+                    background: 'var(--bg-elevated)',
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                    Recommended Language Pack
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-secondary)', lineHeight: 1.45, marginBottom: 8 }}>
+                    Install clangd / rust-analyzer / BasedPyright / ESLint / Go VSIX into catalog storage.
+                    Live editor language features today use Agent outline, Problems-from-build, and F12 search — not a running Extension Host LSP.
+                  </div>
+                  <button
+                    className="btn primary"
+                    style={{ width: '100%', fontSize: 12 }}
+                    onClick={async () => {
+                      setStatusNotice('Installing recommended language pack…');
+                      const result = await fetch('/api/extensions/install-lsp-pack', {
+                        method: 'POST',
+                      }).then((r) => r.json());
+                      const updated = await fetch('/api/extensions').then((r) => r.json());
+                      setExtensionsCatalog(updated);
+                      setStatusNotice(
+                        result?.notice ||
+                          `LSP pack: installed ${result?.installed?.length ?? 0}, skipped ${result?.skipped?.length ?? 0}`
+                      );
+                    }}
+                  >
+                    Install Recommended LSP Pack
+                  </button>
+                </div>
                 {(extensionsCatalog?.extensions ?? []).map((ext: any) => (
                   <div
                     key={ext.id}
@@ -4793,36 +6014,34 @@ export function App() {
                   >
                     <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                       <BrandMark size={16} radius={4} />
-                      <span style={{ fontWeight: 700 }}>DeepAutoCode Guide</span>
+                      <span style={{ fontWeight: 700 }}>{t('guide.title')}</span>
                     </div>
                   </div>
 
-                  <div style={{ padding: '4px 8px 10px 8px', display: 'flex', gap: 6 }}>
-                    <button
-                      className={`btn ${guideLang === 'zh' ? 'primary' : ''}`}
-                      style={{ flex: 1, padding: '3px 6px', fontSize: 11 }}
-                      onClick={() => setGuideLang('zh')}
-                    >
-                      🇨🇳 中文说明
-                    </button>
-                    <button
-                      className={`btn ${guideLang === 'en' ? 'primary' : ''}`}
-                      style={{ flex: 1, padding: '3px 6px', fontSize: 11 }}
-                      onClick={() => setGuideLang('en')}
-                    >
-                      🇺🇸 English
-                    </button>
+                  <div style={{ padding: '4px 8px 10px 8px', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    {APP_LOCALES.map((loc) => (
+                      <button
+                        key={loc.id}
+                        className={`btn ${locale === loc.id ? 'primary' : ''}`}
+                        style={{ flex: 1, minWidth: 72, padding: '3px 6px', fontSize: 11 }}
+                        onClick={() => setAppLocale(loc.id)}
+                        title={loc.englishLabel}
+                      >
+                        {loc.nativeLabel}
+                      </button>
+                    ))}
                   </div>
 
                   {[
-                    { id: 'quickstart', icon: '🚀', label: guideLang === 'zh' ? '1. 快速上手配置' : '1. Quick Start' },
-                    { id: 'workbench', icon: '🖥️', label: guideLang === 'zh' ? '2. 工作台与布局' : '2. Workbench Layout' },
-                    { id: 'modes', icon: '🤖', label: guideLang === 'zh' ? '3. 三种 AI 模式' : '3. AI Execution Modes' },
-                    { id: 'workflows', icon: '⚡', label: guideLang === 'zh' ? '4. 斜杠 / 与引用 @' : '4. / Slash & @ Mentions' },
-                    { id: 'inline', icon: '✨', label: guideLang === 'zh' ? '5. 行内 AI (Ctrl+I)' : '5. Inline AI & CodeLens' },
-                    { id: 'artifacts', icon: '📑', label: guideLang === 'zh' ? '6. 制品与 .agents' : '6. Artifacts & .agents' },
-                    { id: 'preview-ssh', icon: '🌐', label: guideLang === 'zh' ? '7. 网页预览与 SSH' : '7. Web Preview & SSH' },
-                    { id: 'shortcuts', icon: '⌨️', label: guideLang === 'zh' ? '8. 快捷键速查表' : '8. Shortcuts & Cheat Sheet' },
+                    { id: 'quickstart', icon: '🚀', label: tr('1. 快速上手配置', '1. Quick Start')},
+                    { id: 'workbench', icon: '🖥️', label: tr('2. 工作台与布局', '2. Workbench Layout')},
+                    { id: 'modes', icon: '🤖', label: tr('3. 三种 AI 模式', '3. AI Execution Modes')},
+                    { id: 'workflows', icon: '⚡', label: tr('4. 斜杠 / 与引用 @', '4. / Slash & @ Mentions')},
+                    { id: 'inline', icon: '✨', label: tr('5. 行内 AI (Ctrl+I)', '5. Inline AI & CodeLens')},
+                    { id: 'artifacts', icon: '📑', label: tr('6. 制品 / 子代理 / Token', '6. Artifacts & Tokens')},
+                    { id: 'agent', icon: '🛠️', label: tr('7. Agent 编程引擎', '7. Agent Coding Engine')},
+                    { id: 'preview-ssh', icon: '🌐', label: tr('8. 网页预览与 SSH', '8. Web Preview & SSH')},
+                    { id: 'shortcuts', icon: '⌨️', label: tr('9. 快捷键速查表', '9. Shortcuts & Cheat Sheet')},
                   ].map((nav) => (
                     <div
                       key={nav.id}
@@ -4840,14 +6059,14 @@ export function App() {
                       style={{ width: '100%', fontSize: 11, padding: '4px 8px' }}
                       onClick={() => void openFileInTab('docs/USER-GUIDE.md', true)}
                     >
-                      📄 查看 USER-GUIDE.md
+                      📄 {t('guide.openMd')}
                     </button>
                     <button
                       className="btn"
                       style={{ width: '100%', fontSize: 11, padding: '4px 8px' }}
                       onClick={() => openSettingsCenter('general')}
                     >
-                      ⚙️ 打开设置中心 (Ctrl+,)
+                      ⚙️ {t('guide.openSettings')}
                     </button>
                   </div>
                 </aside>
@@ -4865,48 +6084,45 @@ export function App() {
                   {guideSection === 'quickstart' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '🚀 1. 快速上手与项目打开 (Quick Start)' : '🚀 1. Quick Start & Project Setup'}
+                        {tr('🚀 1. 快速上手与项目打开 (Quick Start)', '🚀 1. Quick Start & Project Setup')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? 'DeepAutoCode 深度对齐 Google Antigravity 交互规范。首次启动时保持极简欢迎界面，无需预载冗余代码；支持一键打开本地项目或远程 SSH 服务器。'
-                          : 'DeepAutoCode is fully aligned with Google Antigravity specifications. Clean startup screen by default; open local folders or remote SSH servers in one click.'}
+                        {tr('DeepAutoCode 是 Agent-first 自动编码工作台（非完整 VS Code/Cursor 替代）。首次启动保持极简欢迎界面；打开本地项目或 SSH 后即可进入四面板工作台，用 /goal、Plan→执行、验证门禁完成端到端落地。', 'DeepAutoCode is an Agent-first coding workbench (not a full VS Code/Cursor replacement). Clean welcome screen; open a folder or SSH host, then use /goal, Plan→Execute, and verify gates for end-to-end landing.')}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '步骤 1：打开工作区项目' : 'Step 1: Open a Project Workspace'}
+                          {tr('步骤 1：打开工作区项目', 'Step 1: Open a Project Workspace')}
                         </div>
                         <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: '0 0 12px 0' }}>
-                          {guideLang === 'zh'
-                            ? '点击顶部菜单 File -> Open Folder (Ctrl+O) 打开本地工程，或者点击 Connect via SSH (Ctrl+Alt+O) 直连远程 Linux 开发机。'
-                            : 'Click File -> Open Folder (Ctrl+O) to open a local repository, or click Connect via SSH (Ctrl+Alt+O) for remote Linux development.'}
+                          {tr('点击顶部菜单 File -> Open Folder (Ctrl+O) 打开本地工程，或者点击 Connect via SSH (Ctrl+Alt+O) 直连远程 Linux 开发机。', 'Click File -> Open Folder (Ctrl+O) to open a local repository, or click Connect via SSH (Ctrl+Alt+O) for remote Linux development.')}
                         </p>
                         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                           <button className="btn primary" onClick={() => void handleOpenProjectAction()}>
-                            📂 {guideLang === 'zh' ? '打开本地项目文件夹 (Ctrl+O)' : 'Open Local Folder (Ctrl+O)'}
+                            📂 {tr('打开本地项目文件夹 (Ctrl+O)', 'Open Local Folder (Ctrl+O)')}
                           </button>
                           <button className="btn" onClick={() => void openSshConnectionModal()}>
-                            🌐 {guideLang === 'zh' ? '连接远程 SSH 主机 (Ctrl+Alt+O)' : 'Connect via SSH (Ctrl+Alt+O)'}
+                            🌐 {tr('连接远程 SSH 主机 (Ctrl+Alt+O)', 'Connect via SSH (Ctrl+Alt+O)')}
                           </button>
                         </div>
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '步骤 2：配置 AI 模型与 API 密钥' : 'Step 2: Configure AI Model & API Key'}
+                          {tr('步骤 2：配置 AI 模型与 API 密钥', 'Step 2: Configure AI Model & API Key')}
                         </div>
                         <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: '0 0 12px 0' }}>
-                          {guideLang === 'zh'
-                            ? 'DeepAutoCode 开箱即用支持 DeepSeek (deepseek-chat / deepseek-reasoner)，并原生兼容 OpenAI 接口（如 Ollama、vLLM、企业中转网关）以及 Anthropic Claude。所有密钥严格存放于系统凭据管理器 (SecretStorage)，杜绝明文泄露。'
-                            : 'DeepAutoCode supports DeepSeek out of the box, with full OpenAI-Compatible (Ollama, vLLM, Gateway) and Anthropic Claude compatibility. API keys are safely stored in OS SecretStorage.'}
+                          {tr('支持 DeepSeek（推荐 Composer 选 ⚡ Auto Router，复杂编辑/自愈会升档 reasoner）、OpenAI 兼容（Ollama / vLLM / 网关）与 Anthropic Claude。密钥存于系统 SecretStorage。可选在设置中配置 .deepautocode/verify.json 验证门禁与 evolve 沙箱。', 'DeepSeek (prefer ⚡ Auto Router — escalates to reasoner on hard edits/self-heal), OpenAI-Compatible (Ollama/vLLM/Gateway), and Anthropic Claude. Keys live in OS SecretStorage. Optionally configure .deepautocode/verify.json and evolve sandbox in Settings.')}
                         </p>
                         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                           <button className="btn primary" onClick={() => openSettingsCenter('models')}>
-                            🤖 {guideLang === 'zh' ? '配置 AI 模型与 Provider (Ctrl+Shift+J)' : 'Configure AI Models (Ctrl+Shift+J)'}
+                            🤖 {tr('配置 AI 模型与 Provider (Ctrl+Shift+J)', 'Configure AI Models (Ctrl+Shift+J)')}
                           </button>
                           <button className="btn" onClick={() => void handleTestAiKey()}>
-                            ⚡ {guideLang === 'zh' ? '测试当前 AI 连通性' : 'Test AI Connectivity'}
+                            ⚡ {tr('测试当前 AI 连通性', 'Test AI Connectivity')}
+                          </button>
+                          <button className="btn" onClick={() => openSettingsCenter('security')}>
+                            🛡️ {tr('配置验证门禁 verify.json', 'Configure verify.json Gate')}
                           </button>
                         </div>
                       </div>
@@ -4917,76 +6133,66 @@ export function App() {
                   {guideSection === 'workbench' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '🖥️ 2. 工作台布局与四大工作区 (Workbench Layout)' : '🖥️ 2. Workbench Layout & Navigation'}
+                        {tr('🖥️ 2. 工作台布局与四大工作区 (Workbench Layout)', '🖥️ 2. Workbench Layout & Navigation')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? 'DeepAutoCode 采用标准的 Antigravity / Cursor 四面板弹性网格布局，支持自由拖拽调节尺寸与快捷键随时唤出/隐藏。'
-                          : 'Standard Antigravity / Cursor 4-pane resizable grid layout with full keyboard shortcuts and collapsible panels.'}
+                        {tr('DeepAutoCode 采用标准的 Antigravity / Cursor 四面板弹性网格布局，支持自由拖拽调节尺寸与快捷键随时唤出/隐藏。', 'Standard Antigravity / Cursor 4-pane resizable grid layout with full keyboard shortcuts and collapsible panels.')}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 10, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '四大核心面板功能与快捷键' : 'Core Panes & Keyboard Shortcuts'}
+                          {tr('四大核心面板功能与快捷键', 'Core Panes & Keyboard Shortcuts')}
                         </div>
                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
                           <div style={{ padding: 12, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-elevated)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                              <strong style={{ fontSize: 13 }}>◧ {guideLang === 'zh' ? '左侧主侧边栏 (Primary Sidebar)' : 'Primary Sidebar'}</strong>
+                              <strong style={{ fontSize: 13 }}>◧ {tr('左侧主侧边栏 (Primary Sidebar)', 'Primary Sidebar')}</strong>
                               <kbd className="welcome-kbd">Ctrl+B</kbd>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                              {guideLang === 'zh'
-                                ? '包含文件管理器 (Explorer)、全局代码搜索 (Search)、Git 源代码管理、Open VSX 扩展市场。'
-                                : 'Includes Project Explorer, Global Search, Git Source Control, and Open VSX Extensions.'}
+                              {tr('包含文件管理器 (Explorer)、全局代码搜索 (Search)、Git 源代码管理、Open VSX 扩展市场。', 'Includes Project Explorer, Global Search, Git Source Control, and Open VSX Extensions.')}
                             </div>
                             <button className="btn" style={{ marginTop: 8, padding: '3px 8px', fontSize: 11 }} onClick={() => setShowLeftSidebar((v) => !v)}>
-                              {guideLang === 'zh' ? '切换左侧栏显示' : 'Toggle Left Sidebar'}
+                              {tr('切换左侧栏显示', 'Toggle Left Sidebar')}
                             </button>
                           </div>
 
                           <div style={{ padding: 12, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-elevated)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                              <strong style={{ fontSize: 13 }}>◨ {guideLang === 'zh' ? '底部面板 (Bottom Panel)' : 'Bottom Panel'}</strong>
+                              <strong style={{ fontSize: 13 }}>◨ {tr('底部面板 (Bottom Panel)', 'Bottom Panel')}</strong>
                               <kbd className="welcome-kbd">Ctrl+J</kbd>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                              {guideLang === 'zh'
-                                ? '内置集成终端 (Terminal)、代码语法与编译问题 (Problems)、高危命令审计日志 (Audit)、Extension Host 运行时输出。'
-                                : 'Integrated Terminal, Problems, Security Audit Logs, and Extension Host Runtime Output.'}
+                              {tr('内置集成终端 (Terminal)、代码语法与编译问题 (Problems)、高危命令审计日志 (Audit)、Extension Host 运行时输出。', 'Integrated Terminal, Problems, Security Audit Logs, and Extension Host Runtime Output.')}
                             </div>
                             <button className="btn" style={{ marginTop: 8, padding: '3px 8px', fontSize: 11 }} onClick={() => setShowBottomPanel((v) => !v)}>
-                              {guideLang === 'zh' ? '切换底部面板显示' : 'Toggle Bottom Panel'}
+                              {tr('切换底部面板显示', 'Toggle Bottom Panel')}
                             </button>
                           </div>
 
                           <div style={{ padding: 12, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-elevated)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                              <strong style={{ fontSize: 13 }}>✨ {guideLang === 'zh' ? '右侧 AI Agent 面板' : 'AI Agent Dock'}</strong>
+                              <strong style={{ fontSize: 13 }}>✨ {tr('右侧 AI Agent 面板', 'AI Agent Dock')}</strong>
                               <kbd className="welcome-kbd">Ctrl+L</kbd>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                              {guideLang === 'zh'
-                                ? '多轮对话 Composer、结构化制品 (Artifacts)、历史会话切换、审批卡片、执行模式切换。'
-                                : 'AI Composer, Structured Artifacts, Session History, Human-in-the-Loop Approvals, and Execution Modes.'}
+                              {tr('Composer（模型 tier + Goal token 用量）、Artifacts 一键执行、Sessions/检查点 Restore、Changes 多文件 Diff（Accept/Reject/Revise）、审批卡片与执行模式。', 'Composer (model tier + Goal tokens), Artifacts one-click execute, Sessions/checkpoints, Changes Diff Accept/Reject/Revise, approvals, and modes.')}
                             </div>
                             <button className="btn primary" style={{ marginTop: 8, padding: '3px 8px', fontSize: 11 }} onClick={() => setShowRightAiDock((v) => !v)}>
-                              {guideLang === 'zh' ? '切换右侧 AI 栏显示' : 'Toggle AI Dock'}
+                              {tr('切换右侧 AI 栏显示', 'Toggle AI Dock')}
                             </button>
                           </div>
 
                           <div style={{ padding: 12, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-elevated)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                              <strong style={{ fontSize: 13 }}>🌐 {guideLang === 'zh' ? '内置 Web 实时预览' : 'Live Web Preview'}</strong>
+                              <strong style={{ fontSize: 13 }}>🌐 {tr('内置 Web 实时预览', 'Live Web Preview')}</strong>
                               <span className="badge success">Preview</span>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>
-                              {guideLang === 'zh'
-                                ? '在主编辑区一键打开本地项目（如 http://localhost:3000/）内嵌预览，支持网页交互与 AI 审查。'
-                                : 'Preview local web apps (e.g. http://localhost:3000/) directly in an editor tab with AI inspection.'}
+                              {tr('在主编辑区一键打开本地项目（如 http://localhost:3000/）内嵌预览，支持网页交互与 AI 审查。', 'Preview local web apps (e.g. http://localhost:3000/) directly in an editor tab with AI inspection.')}
                             </div>
                             <button className="btn" style={{ marginTop: 8, padding: '3px 8px', fontSize: 11 }} onClick={() => openWebPreviewTab()}>
-                              {guideLang === 'zh' ? '打开 Web 预览标签页' : 'Open Web Preview'}
+                              {tr('打开 Web 预览标签页', 'Open Web Preview')}
                             </button>
                           </div>
                         </div>
@@ -4998,12 +6204,10 @@ export function App() {
                   {guideSection === 'modes' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '🤖 3. 三大 AI 执行模式与安全边界 (AI Execution Modes)' : '🤖 3. Three AI Execution Modes & Security'}
+                        {tr('🤖 3. 三大 AI 执行模式与安全边界 (AI Execution Modes)', '🤖 3. Three AI Execution Modes & Security')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? 'DeepAutoCode 严格遵循 ADR-008 安全架构，提供基于角色的三级执行权限，确保代码生成的安全与可控。'
-                          : 'DeepAutoCode strictly enforces ADR-008 security architecture, providing 3 distinct execution permission tiers.'}
+                        {tr('三级执行权限 + Diff 先提案。Auto 首次写入可创建 evolve/auto-* 沙箱分支；自愈耗尽触发熔断回滚。Plan 模式只读规划，点 Artifacts 一键执行后强制落地。', 'Three permission tiers + Diff-first proposals. Auto may create evolve/auto-* sandbox branches; exhausted self-heal triggers circuit-breaker rollback. Plan stays read-only until Artifacts one-click execute.')}
                       </div>
 
                       <div className="settings-card">
@@ -5011,12 +6215,10 @@ export function App() {
                           <div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                               <span className="badge success" style={{ fontSize: 11 }}>∞ Agent (Auto)</span>
-                              <strong style={{ fontSize: 13.5 }}>{guideLang === 'zh' ? '自动执行模式 (默认推荐)' : 'Auto Mode (Default)'}</strong>
+                              <strong style={{ fontSize: 13.5 }}>{tr('自动执行模式 (默认推荐)', 'Auto Mode (Default)')}</strong>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                              {guideLang === 'zh'
-                                ? 'AI 可自主执行只读探查、文件修改，并免审运行安全白名单命令（如 git status、git diff、npm test、npm run build 等）。对于高危终端命令或工作区外写入，依然会弹出人工审批卡片。'
-                                : 'AI autonomously explores, writes files, and executes allowlisted safe commands (git status, npm test, etc.). High-risk commands still require explicit approval.'}
+                              {tr('自主探查、apply_patch/edit_file 写入、白名单命令（git status、npm test、npm run build…）。高危命令仍需审批。首次写入可建 evolve 沙箱；Changes 面板可 Accept/Reject；Stop 后 pending Diff 保留审阅。', 'Autonomous explore, apply_patch/edit_file writes, allowlisted commands. High-risk still needs approval. First write may create evolve sandbox; Changes panel Accept/Reject; Stop keeps pending Diffs.')}
                             </div>
                           </div>
                           <button
@@ -5026,7 +6228,7 @@ export function App() {
                               setStatusNotice('Switched Execution Mode -> Auto (Agent)');
                             }}
                           >
-                            {executionMode === 'auto' ? '✓ ' + (guideLang === 'zh' ? '当前模式' : 'Active') : guideLang === 'zh' ? '设为自动模式' : 'Select Auto'}
+                            {executionMode === 'auto' ? '✓ ' + (tr('当前模式', 'Active')) : tr('设为自动模式', 'Select Auto')}
                           </button>
                         </div>
 
@@ -5034,12 +6236,10 @@ export function App() {
                           <div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                               <span className="badge info" style={{ fontSize: 11 }}>📖 Plan (Read-Only)</span>
-                              <strong style={{ fontSize: 13.5 }}>{guideLang === 'zh' ? '规划模式 (严格只读)' : 'Plan Mode (Strictly Read-Only)'}</strong>
+                              <strong style={{ fontSize: 13.5 }}>{tr('规划模式 (严格只读)', 'Plan Mode (Strictly Read-Only)')}</strong>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                              {guideLang === 'zh'
-                                ? '只允许读取文件、扫描目录、生成结构化 Artifact 实施计划与派发只读子智能体 (invoke_subagent)。阻断任何源代码修改与终端命令，适合大型项目架构设计与安全审计。'
-                                : 'Strictly read-only. Allows file reading, write_artifact planning, and invoke_subagent research. Blocks all code mutations until you approve.'}
+                              {tr('只读探查 + write_artifact 规划 + invoke_subagent(research/planner)。阻断源码修改与终端命令。审阅后在 Artifacts 点 ▶ Proceed & Execute Plan / Execute Tasks / Act on Report，以 FORCE_AUTO_ACTION 强制落地。', 'Read-only explore + write_artifact + invoke_subagent(research/planner). No mutations until ▶ Proceed & Execute Plan / Execute Tasks / Act on Report injects FORCE_AUTO_ACTION.')}
                             </div>
                           </div>
                           <button
@@ -5049,7 +6249,7 @@ export function App() {
                               setStatusNotice('Switched Execution Mode -> Plan (Read-Only)');
                             }}
                           >
-                            {executionMode === 'plan' ? '✓ ' + (guideLang === 'zh' ? '当前模式' : 'Active') : guideLang === 'zh' ? '设为规划模式' : 'Select Plan'}
+                            {executionMode === 'plan' ? '✓ ' + (tr('当前模式', 'Active')) : tr('设为规划模式', 'Select Plan')}
                           </button>
                         </div>
 
@@ -5057,12 +6257,10 @@ export function App() {
                           <div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                               <span className="badge warning" style={{ fontSize: 11 }}>🛡️ Manual</span>
-                              <strong style={{ fontSize: 13.5 }}>{guideLang === 'zh' ? '手动审批模式 (最高防护)' : 'Manual Mode (Strict Approval)'}</strong>
+                              <strong style={{ fontSize: 13.5 }}>{tr('手动审批模式 (最高防护)', 'Manual Mode (Strict Approval)')}</strong>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                              {guideLang === 'zh'
-                                ? 'AI 执行的每一项文件写入、代码修改或终端命令都必须经过用户在界面上点击 Approve 确认后方可执行。'
-                                : 'Every single file mutation or shell command requires your explicit approval via the interactive approval card.'}
+                              {tr('AI 执行的每一项文件写入、代码修改或终端命令都必须经过用户在界面上点击 Approve 确认后方可执行。', 'Every single file mutation or shell command requires your explicit approval via the interactive approval card.')}
                             </div>
                           </div>
                           <button
@@ -5072,9 +6270,18 @@ export function App() {
                               setStatusNotice('Switched Execution Mode -> Manual');
                             }}
                           >
-                            {executionMode === 'manual' ? '✓ ' + (guideLang === 'zh' ? '当前模式' : 'Active') : guideLang === 'zh' ? '设为手动模式' : 'Select Manual'}
+                            {executionMode === 'manual' ? '✓ ' + (tr('当前模式', 'Active')) : tr('设为手动模式', 'Select Manual')}
                           </button>
                         </div>
+                      </div>
+
+                      <div className="settings-card">
+                        <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
+                          {tr('安全事件与状态栏提示', 'Safety Events (Status Bar)')}
+                        </div>
+                        <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: 0 }}>
+                          {tr('sandbox.branch.created（evolve 沙箱分支）、circuit.breaker.triggered（熔断回滚文件数）、diff.proposed（先提案再写入）、goal.usage（Token 用量）。Composer 底部显示模型 tier 与 tok used/budget。', 'sandbox.branch.created, circuit.breaker.triggered, diff.proposed, and goal.usage. Composer shows model tier plus tok used/budget.')}
+                        </p>
                       </div>
                     </div>
                   )}
@@ -5083,27 +6290,25 @@ export function App() {
                   {guideSection === 'workflows' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '⚡ 4. 斜杠 / 工作流与 @ 上下文引用 (/ Slash & @ Mentions)' : '⚡ 4. / Slash Workflows & @ Context Mentions'}
+                        {tr('⚡ 4. 斜杠 / 工作流与 @ 上下文引用 (/ Slash & @ Mentions)', '⚡ 4. / Slash Workflows & @ Context Mentions')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? 'DeepAutoCode 内置了 Antigravity 2.0 的交互式 Slash 命令与 @ 上下文引用系统，在 AI Composer 输入框中键入即可自动弹出候选菜单。'
-                          : 'DeepAutoCode features Antigravity 2.0 interactive slash workflows and context mentions. Type / or @ in the AI Composer to trigger.'}
+                        {tr('DeepAutoCode 内置了 Antigravity 2.0 的交互式 Slash 命令与 @ 上下文引用系统，在 AI Composer 输入框中键入即可自动弹出候选菜单。', 'DeepAutoCode features Antigravity 2.0 interactive slash workflows and context mentions. Type / or @ in the AI Composer to trigger.')}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 10, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '常用斜杠工作流命令 (/ Slash Workflows)' : 'Built-in Slash Workflows'}
+                          {tr('常用斜杠工作流命令 (/ Slash Workflows)', 'Built-in Slash Workflows')}
                         </div>
                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 10 }}>
                           {[
-                            { cmd: '/plan', title: guideLang === 'zh' ? '架构与实施规划' : 'Architectural Plan', desc: guideLang === 'zh' ? '生成结构化实施计划 Artifact，不改动源码' : 'Generate structured implementation plan without editing files' },
-                            { cmd: '/goal', title: guideLang === 'zh' ? '长程自主执行' : 'Autonomous Goal', desc: guideLang === 'zh' ? '自主推进代码落地、自动编译并修复错误直至验证完成' : 'End-to-end execution: code, build, test, and self-heal errors' },
-                            { cmd: '/fix', title: guideLang === 'zh' ? '排查并修复错误' : 'Bug & Error Fix', desc: guideLang === 'zh' ? '分析错误根因，应用最小可控修复方案并重新验证' : 'Diagnose compiler/test errors, apply minimal fix, re-verify' },
-                            { cmd: '/review', title: guideLang === 'zh' ? '代码与安全审查' : 'Code & Security Review', desc: guideLang === 'zh' ? '审查安全、性能与代码质量，给出文件与行号建议' : 'Review security, performance, and defects with file:line tags' },
-                            { cmd: '/test', title: guideLang === 'zh' ? '生成与运行测试' : 'Generate & Run Tests', desc: guideLang === 'zh' ? '为当前模块编写单元/集成测试并执行测试套件' : 'Write unit/integration tests and run the test suite' },
-                            { cmd: '/learn', title: guideLang === 'zh' ? '沉淀项目规则' : 'Persist AI Rules', desc: guideLang === 'zh' ? '将成功经验或架构约束沉淀到 .agents/rules/*.md' : 'Persist project conventions into .agents/rules/*.md' },
-                            { cmd: '/compact', title: guideLang === 'zh' ? '压缩会话上下文' : 'Compact Context', desc: guideLang === 'zh' ? '提炼长会话关键状态，释放上下文窗口空间' : 'Summarize history into a checkpoint to free context window' },
+                            { cmd: '/plan', title: tr('架构与实施规划', 'Architectural Plan'), desc: tr('生成结构化实施计划 Artifact，不改动源码', 'Generate structured implementation plan without editing files')},
+                            { cmd: '/goal', title: tr('长程自主执行', 'Autonomous Goal'), desc: tr('自主推进代码落地、自动编译并修复错误直至验证完成', 'End-to-end execution: code, build, test, and self-heal errors')},
+                            { cmd: '/fix', title: tr('排查并修复错误', 'Bug & Error Fix'), desc: tr('分析错误根因，应用最小可控修复方案并重新验证', 'Diagnose compiler/test errors, apply minimal fix, re-verify')},
+                            { cmd: '/review', title: tr('代码与安全审查', 'Code & Security Review'), desc: tr('审查安全、性能与代码质量，给出文件与行号建议', 'Review security, performance, and defects with file:line tags')},
+                            { cmd: '/test', title: tr('生成与运行测试', 'Generate & Run Tests'), desc: tr('为当前模块编写单元/集成测试并执行测试套件', 'Write unit/integration tests and run the test suite')},
+                            { cmd: '/learn', title: tr('沉淀项目规则', 'Persist AI Rules'), desc: tr('将成功经验或架构约束沉淀到 .agents/rules/*.md', 'Persist project conventions into .agents/rules/*.md')},
+                            { cmd: '/compact', title: tr('压缩会话上下文', 'Compact Context'), desc: tr('提炼长会话关键状态，释放上下文窗口空间', 'Summarize history into a checkpoint to free context window')},
                           ].map((item) => (
                             <div
                               key={item.cmd}
@@ -5114,7 +6319,7 @@ export function App() {
                                 setPromptInput(`${item.cmd} `);
                                 setStatusNotice(`Inserted ${item.cmd} into AI Composer`);
                               }}
-                              title={guideLang === 'zh' ? `点击将 ${item.cmd} 填入 AI 对话框` : `Click to insert ${item.cmd} into AI Composer`}
+                              title={tr(`点击将 ${item.cmd} 填入 AI 对话框`, `Click to insert ${item.cmd} into AI Composer`)}
                             >
                               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                                 <span className="context-pill" style={{ color: 'var(--accent-bright)' }}><code>{item.cmd}</code></span>
@@ -5128,15 +6333,23 @@ export function App() {
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 10, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '常用 @ 上下文引用 (@ Context Mentions)' : '@ Context Mentions'}
+                          {tr('常用 @ 上下文引用 (@ Context Mentions)', '@ Context Mentions')}
                         </div>
                         <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                           {[
-                            { tag: '@git', desc: guideLang === 'zh' ? '自动抓取 git status 与最近变更 diff 注入上下文' : 'Injects live git status & git diff' },
-                            { tag: '@terminal', desc: guideLang === 'zh' ? '将最近的终端命令执行结果与退出码注入上下文' : 'Injects recent terminal logs and exit codes' },
-                            { tag: '@rules', desc: guideLang === 'zh' ? '将 .agents/rules/*.md 与项目规范规则注入提示词' : 'Injects .agents/rules/*.md conventions' },
-                            { tag: '@problems', desc: guideLang === 'zh' ? '将当前工作区的语法、编译报错与警告注入' : 'Injects compiler & linter diagnostics' },
-                            { tag: '@<filepath>', desc: guideLang === 'zh' ? '实时搜索工作区文件，并将目标代码内容精确注入' : 'Filters & injects exact file content' },
+                            { tag: '@git', desc: tr('自动抓取 git status 与最近变更 diff 注入上下文', 'Injects live git status & git diff')},
+                            { tag: '@terminal', desc: tr('将最近的终端命令执行结果与退出码注入上下文', 'Injects recent terminal logs and exit codes')},
+                            { tag: '@rules', desc: tr('将 .agents/rules/*.md 与项目规范规则注入提示词', 'Injects .agents/rules/*.md conventions')},
+                            { tag: '@problems', desc: tr('注入 Problems；自愈轮也会自动加载 .deepautocode/problems.json', 'Injects Problems; self-heal also auto-loads problems.json')},
+                            { tag: '@codebase', desc: tr('语义/混合检索相关源码', 'Semantic/hybrid codebase retrieval')},
+                            { tag: '@docs', desc: tr('注入 README / docs / USER-GUIDE', 'Injects README / docs / USER-GUIDE')},
+                            { tag: '@web', desc: tr('抓取 URL：@web https://…', 'Fetch URL: @web https://…')},
+                            { tag: '@skill', desc: tr('按需展开 .agents/skills SKILL.md（默认仅目录）', 'On-demand expand Skill bodies (catalog by default)')},
+                            { tag: '@symbol', desc: tr('从当前文件大纲挑选符号并注入函数/类正文', 'Pick a symbol from the active-file outline and inject its body')},
+                            { tag: '@code', desc: tr('钉住当前编辑器选区', 'Pins current editor selection')},
+                            { tag: '@tabs', desc: tr('注入已打开代码标签页摘要', 'Digest of open code tabs')},
+                            { tag: '@folder/...', desc: tr('钉住文件夹上下文芯片', 'Pins a folder context chip')},
+                            { tag: '@<filepath>', desc: tr('实时搜索工作区文件，并将目标代码内容精确注入', 'Filters & injects exact file content')},
                           ].map((item) => (
                             <div
                               key={item.tag}
@@ -5158,28 +6371,24 @@ export function App() {
                   {guideSection === 'inline' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '✨ 5. 行内 AI (Ctrl+I) 与快捷 Code Lenses' : '✨ 5. Inline AI (Ctrl+I) & Code Lenses'}
+                        {tr('✨ 5. 行内 AI (Ctrl+I) 与快捷 Code Lenses', '✨ 5. Inline AI (Ctrl+I) & Code Lenses')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? '除了右侧独立 AI 面板，DeepAutoCode 还提供了直接在代码编辑器内原位触发的 AI 指令系统。'
-                          : 'DeepAutoCode provides in-editor AI commands directly anchored to your active file and cursor position.'}
+                        {tr('行内指令与 Code Lens 走与 Composer 相同的 session.send Agent 工具链（read → search → editor → verify）。Explain 为 INLINE_QUERY 只读；重构/测试为 INLINE_EDIT。', 'Inline Command and Code Lenses share Composer’s session.send Agent chain (read → search → editor → verify). Explain uses INLINE_QUERY; refactor/tests use INLINE_EDIT.')}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 10, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '两大行内交互方式' : 'Two Inline Modalities'}
+                          {tr('两大行内交互方式', 'Two Inline Modalities')}
                         </div>
                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
                           <div style={{ padding: 14, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-elevated)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                              <strong style={{ fontSize: 13.5 }}>⌨️ {guideLang === 'zh' ? '行内指令悬浮窗 (Ctrl+I)' : 'Inline Command Widget (Ctrl+I)'}</strong>
+                              <strong style={{ fontSize: 13.5 }}>⌨️ {tr('行内指令悬浮窗 (Ctrl+I)', 'Inline Command Widget (Ctrl+I)')}</strong>
                               <kbd className="welcome-kbd">Ctrl+I</kbd>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                              {guideLang === 'zh'
-                                ? '在任意代码文件中按下 Ctrl+I，即可在光标行弹出浮动指令框，直接输入针对当前行/函数的修改或生成需求，无需移开视线。'
-                                : 'Press Ctrl+I in any code tab to pop up a floating instruction bar anchored to your cursor line.'}
+                              {tr('在任意代码文件中按下 Ctrl+I，即可在光标行弹出浮动指令框，直接输入针对当前行/函数的修改或生成需求，无需移开视线。', 'Press Ctrl+I in any code tab to pop up a floating instruction bar anchored to your cursor line.')}
                             </div>
                             <button
                               className="btn primary"
@@ -5189,19 +6398,17 @@ export function App() {
                                 setStatusNotice('Opened Inline Command Widget (Ctrl+I)');
                               }}
                             >
-                              ✨ {guideLang === 'zh' ? '立即体验 Ctrl+I' : 'Try Ctrl+I Now'}
+                              ✨ {tr('立即体验 Ctrl+I', 'Try Ctrl+I Now')}
                             </button>
                           </div>
 
                           <div style={{ padding: 14, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-elevated)' }}>
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                              <strong style={{ fontSize: 13.5 }}>⚡ {guideLang === 'zh' ? '编辑器顶部快捷 Code Lens' : 'Code Lens Bar'}</strong>
+                              <strong style={{ fontSize: 13.5 }}>⚡ {tr('编辑器顶部快捷 Code Lens', 'Code Lens Bar')}</strong>
                               <span className="badge">CodeLens</span>
                             </div>
                             <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                              {guideLang === 'zh'
-                                ? '代码编辑器顶部常驻快捷按钮：✨ Explain（解释当前代码）、🛠️ Refactor（重构与优化）、🧪 Write Tests（编写单元测试）。'
-                                : 'Quick actions at the top of the code editor: ✨ Explain, 🛠️ Refactor, and 🧪 Write Tests.'}
+                              {tr('代码编辑器顶部常驻快捷按钮：✨ Explain（解释当前代码）、🛠️ Refactor（重构与优化）、🧪 Write Tests（编写单元测试）。', 'Quick actions at the top of the code editor: ✨ Explain, 🛠️ Refactor, and 🧪 Write Tests.')}
                             </div>
                             <div style={{ display: 'flex', gap: 6, marginTop: 10 }}>
                               <button className="btn" style={{ padding: '3px 8px', fontSize: 11 }} onClick={() => triggerCodeLensAction('explain')}>
@@ -5224,22 +6431,18 @@ export function App() {
                   {guideSection === 'artifacts' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '📑 6. 结构化 Artifacts、子智能体与 .agents 定制' : '📑 6. Artifacts, Subagents & .agents Ecosystem'}
+                        {tr('📑 6. Artifacts、子智能体、Todos 与 Token', '📑 6. Artifacts, Subagents, Todos & Tokens')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? 'DeepAutoCode 具备完整的工程级交付管理体系：独立持久化的 Artifacts 制品、并行子智能体委派与标准 .agents 定制生态。'
-                          : 'DeepAutoCode provides structured Artifacts, parallel subagent orchestration, and native .agents customizations.'}
+                        {tr('结构化制品持久化、一键 FORCE_AUTO_ACTION 落地、research/planner/verifier 子代理、manage_todo，以及 Composer/状态栏实时 Goal token 用量。', 'Persisted Artifacts, one-click FORCE_AUTO_ACTION landing, research/planner/verifier subagents, manage_todo, and live Goal token used/budget in Composer + status bar.')}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '📑 Artifacts 制品面板与一键执行计划' : 'Artifacts Pane & Plan Execution'}
+                          {tr('📑 Artifacts 制品面板与一键执行计划', 'Artifacts Pane & Plan Execution')}
                         </div>
                         <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: '0 0 12px 0' }}>
-                          {guideLang === 'zh'
-                            ? 'AI 生成的实施计划 (Plan)、任务清单 (Task List)、技术报告 (Report) 会独立保存为 Artifact。在右侧 📑 Artifacts 标签页中审阅后，点击 ▶ Proceed & Execute Plan 即可自动将计划转化为代码落地。'
-                            : 'Plans, Task Lists, and Reports are persisted as Artifacts. Review them in the 📑 Artifacts dock and click ▶ Proceed & Execute Plan to implement.'}
+                          {tr('AI 生成的实施计划 (Plan)、任务清单 (Task List)、技术报告 (Report) 会独立保存为 Artifact。在右侧 📑 Artifacts 标签页中审阅后，点击 ▶ Proceed & Execute Plan / Execute Tasks / Act on Report，将以 FORCE_AUTO_ACTION 强制落地（manage_todo + apply_patch + verify）。Composer 与底部状态栏会显示实时 Goal token 用量/预算。', 'Plans, Task Lists, and Reports are persisted as Artifacts. Use ▶ Proceed & Execute Plan / Execute Tasks / Act on Report to force Auto Mode landing (manage_todo + apply_patch + verify). Composer and the status bar show live Goal token used/budget.')}
                         </p>
                         <button
                           className="btn primary"
@@ -5249,110 +6452,182 @@ export function App() {
                             void refreshArtifactsAndCustomizations();
                           }}
                         >
-                          📑 {guideLang === 'zh' ? '打开右侧 Artifacts 面板' : 'Open Artifacts Panel'}
+                          📑 {tr('打开右侧 Artifacts 面板', 'Open Artifacts Panel')}
                         </button>
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '📜 .agents/ 规范化定制（Rules / Skills / Workflows）' : '.agents/ Workspace Customizations'}
+                          {tr('🤖 子智能体、Todos 与 Token', 'Subagents, Todos & Tokens')}
                         </div>
                         <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: '0 0 12px 0' }}>
-                          {guideLang === 'zh'
-                            ? '系统自动扫描当前工作区的 .agents/rules/*.md（规则）、.agents/skills/*/SKILL.md（技能）、.agents/workflows/*.md（工作流）以及 AGENTS.md，并将其注入 Agent 提示词。'
-                            : 'DeepAutoCode automatically scans and loads .agents/rules, .agents/skills, .agents/workflows, and AGENTS.md in your repository.'}
+                          {tr('invoke_subagent：research（多轮 search→outline→read）、planner（步骤计划）、verifier（诊断+verify → PASS/FAIL）。manage_todo 清单可在自愈续跑时注入；Goal 默认 180k token，Composer 与状态栏实时显示 used/budget（goal.usage）。', 'invoke_subagent: research (search→outline→read), planner, verifier (PASS/FAIL). manage_todo injects on self-heal continue. Default Goal budget 180k; Composer + status bar show live used/budget via goal.usage.')}
+                        </p>
+                      </div>
+
+                      <div className="settings-card">
+                        <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
+                          {tr('📜 .agents/ 规范化定制（Rules / Skills / Workflows）', '.agents/ Workspace Customizations')}
+                        </div>
+                        <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: '0 0 12px 0' }}>
+                          {tr('自动加载 .agents/rules/*.md、.agents/skills/*/SKILL.md、.agents/workflows/*.md、AGENTS.md / CLAUDE.md，以及 .deepautocode/project-rules.md，并注入每轮 system prompt。', 'Loads .agents/rules, skills, workflows, AGENTS.md / CLAUDE.md, and .deepautocode/project-rules.md into each turn’s system prompt.')}
                         </p>
                         <button className="btn" onClick={() => openSettingsCenter('rules')}>
-                          📜 {guideLang === 'zh' ? '管理工作区 .agents 规则与技能' : 'Manage .agents Customizations'}
+                          📜 {tr('管理工作区 .agents 规则与技能', 'Manage .agents Customizations')}
                         </button>
                       </div>
                     </div>
                   )}
 
-                  {/* Section 7: Web Preview & SSH */}
+                  {/* Section 7: Agent Coding Engine */}
+                  {guideSection === 'agent' && (
+                    <div>
+                      <div className="settings-section-title">
+                        {tr('🛠️ 7. Agent 编程引擎 (Search / Patch / Verify)', '🛠️ 7. Agent Coding Engine')}
+                      </div>
+                      <div className="settings-section-desc">
+                        {tr('编程能力来自 Agent 工具链与验证闭环，而非 Code-OSS Fork。以下能力已落地，可直接在 Auto /goal 中体验。', 'Coding power comes from the Agent tool chain and verify loop—not a Code-OSS fork. These capabilities are live in Auto /goal runs.')}
+                      </div>
+
+                      <div className="settings-card">
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
+                          {[
+                            {
+                              t: tr('增强搜索', 'Search'),
+                              d: tr('search_codebase：rg 优先；regex/glob/case_sensitive；mode=symbol|content|auto；工作区文件索引加速', 'search_codebase: ripgrep-first; regex/glob/case_sensitive; symbol|content|auto; workspace file index'),
+                            },
+                            {
+                              t: tr('大纲与补丁', 'Outline & Patch'),
+                              d: tr('outline_file；apply_patch 多文件；edit_file 多 hunk；mismatch 自动重读 + 一次重试；invoke_subagent(editor) 预算改写可回滚', 'outline_file; apply_patch; edit_file multi-hunk; mismatch auto re-read + one-shot retry; budgeted editor subagent with rollback'),
+                            },
+                            {
+                              t: tr('实时诊断', 'Live Diagnostics'),
+                              d: tr('边打字边 debounce LSP→Problems→gutter；保存仍强制刷新；TS/JS LS；可选 clangd；Python py_compile', 'Debounced as-you-type LSP → Problems → gutter; save still refreshes; TS/JS LS; optional clangd; Python'),
+                            },
+                            {
+                              t: tr('验证与熔断', 'Verify & Circuit Breaker'),
+                              d: tr('verify.json 构建/测试门禁；verify 催促 ≤4；自愈 ≤5；耗尽回滚并推送 circuit.breaker.triggered', 'verify.json build/test gate; nudge ≤4; self-heal ≤5; then rollback + circuit.breaker.triggered'),
+                            },
+                            {
+                              t: tr('模型升档与压缩', 'Tier Escalate & Compaction'),
+                              d: tr('自愈/语义失败/连续 mismatch/多文件 pending → reasoner；按工具输出与 token 预算分级压缩旧 tool 结果', 'Self-heal / semantic fail / mismatch / multi-file → reasoner; graded compaction of older tool results'),
+                            },
+                            {
+                              t: tr('检查点与 Problems', 'Checkpoints & Problems'),
+                              d: tr('改文件后自动 checkpoint；Problems + Diff/诊断 gutter；Changes「Next File」导览 pending Diff；Rules 支持 globs', 'Checkpoints; Problems + Diff/diagnostic gutter; Changes Next File; .cursor/rules globs'),
+                            },
+                            {
+                              t: 'MCP / Memory / Jump',
+                              d: tr('stdio/SSE/HTTP + resources/prompts；@codebase 语义检索；CDP 浏览器；.cursorignore', 'stdio/SSE/HTTP + resources/prompts; @codebase semantic search; CDP browser; .cursorignore'),
+                            },
+                          ].map((card) => (
+                            <div
+                              key={card.t}
+                              style={{ padding: 12, border: '1px solid var(--border)', borderRadius: 6, background: 'var(--bg-elevated)' }}
+                            >
+                              <strong style={{ fontSize: 13 }}>{card.t}</strong>
+                              <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', lineHeight: 1.55, marginTop: 6 }}>{card.d}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 14 }}>
+                          <button className="btn primary" onClick={() => openSettingsCenter('security')}>
+                            🛡️ {tr('打开安全 / 验证门禁设置', 'Open Security / Verify Gate Settings')}
+                          </button>
+                          <button
+                            className="btn"
+                            onClick={() => {
+                              setShowRightAiDock(true);
+                              setAiTab('composer');
+                              setExecutionMode('auto');
+                              setPromptInput('/goal ');
+                            }}
+                          >
+                            ∞ {tr('在 Composer 填入 /goal', 'Insert /goal in Composer')}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Section 8: Web Preview & SSH */}
                   {guideSection === 'preview-ssh' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '🌐 7. 内置实时 Web 预览与远程 SSH 开发' : '🌐 7. Live Web Preview & Remote SSH'}
+                        {tr('🌐 8. 内置实时 Web 预览与远程 SSH 开发', '🌐 8. Live Web Preview & Remote SSH')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? '无需频繁切换外部浏览器或第三方终端，在同一个 IDE 窗口内完成前端页面预览与远程 Linux 服务器开发。'
-                          : 'Preview web apps and develop on remote Linux clusters directly inside DeepAutoCode.'}
+                        {tr('无需频繁切换外部浏览器或第三方终端，在同一个 IDE 窗口内完成前端页面预览与远程 Linux 服务器开发。', 'Preview web apps and develop on remote Linux clusters directly inside DeepAutoCode.')}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '🌐 内置 Web 预览 (默认 http://localhost:3000/)' : 'Live Web Preview Tab'}
+                          {tr('🌐 内置 Web 预览 (默认 http://localhost:3000/)', 'Live Web Preview Tab')}
                         </div>
                         <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: '0 0 12px 0' }}>
-                          {guideLang === 'zh'
-                            ? '点击顶栏右侧的 🌐 Preview 按钮，或在 View 菜单中选择 Open Live Web Preview，即可在编辑器标签页中实时渲染本地前端项目，支持地址栏跳转、强制刷新，以及点击 ✨ Ask AI to Inspect 让 AI 自动检查页面端点。'
-                            : 'Click 🌐 Preview in the titlebar to inspect local dev servers (http://localhost:3000/). Supports reload, browser opening, and AI inspection.'}
+                          {tr('点击顶栏右侧的 🌐 Preview 按钮，或在 View 菜单中选择 Open Live Web Preview，即可在编辑器标签页中实时渲染本地前端项目，支持地址栏跳转、强制刷新，以及点击 ✨ Ask AI to Inspect 让 AI 自动检查页面端点。', 'Click 🌐 Preview in the titlebar to inspect local dev servers (http://localhost:3000/). Supports reload, browser opening, and AI inspection.')}
                         </p>
                         <button className="btn primary" onClick={() => openWebPreviewTab('http://localhost:3000/')}>
-                          🌐 {guideLang === 'zh' ? '打开 http://localhost:3000/ 预览' : 'Open http://localhost:3000/ Preview'}
+                          🌐 {tr('打开 http://localhost:3000/ 预览', 'Open http://localhost:3000/ Preview')}
                         </button>
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 8, fontSize: 14 }}>
-                          {guideLang === 'zh' ? '🌐 Remote - SSH 远程连接管理器' : 'Remote - SSH Connection Manager'}
+                          {tr('🌐 Remote - SSH 远程连接管理器', 'Remote - SSH Connection Manager')}
                         </div>
                         <p style={{ fontSize: 12.5, lineHeight: 1.6, color: 'var(--text-secondary)', margin: '0 0 12px 0' }}>
-                          {guideLang === 'zh'
-                            ? '点击状态栏左侧的 >< SSH Remote 按钮或按 Ctrl+Alt+O，输入类似 ssh -p 22 root@10.0.62.83 的快捷命令或保存连接配置，即可浏览远程目录并将整套 AI Agent 部署于远程机运行。'
-                            : 'Click the >< SSH Remote badge or press Ctrl+Alt+O. Supports fast parsing, password/identity files, and full remote file trees.'}
+                          {tr('点击状态栏 >< SSH 或按 Ctrl+Alt+O。支持 ssh -p 22 user@host:/path 解析、密码/密钥、远程目录树、脏文件保护、Reconnect、Conflict Check / Take Remote。打开时强制 pull；镜像 stub 不可当作真实远端内容。Agent 可在远程工作区执行。', 'Status badge >< SSH or Ctrl+Alt+O. Parses ssh -p 22 user@host:/path; password/key; dirty-file guard; Reconnect; Conflict Check / Take Remote. Open forces pull; mirror stubs are not real remote content. Agent runs on the remote workspace.')}
                         </p>
                         <button className="btn" onClick={() => void openSshConnectionModal()}>
-                          🌐 {guideLang === 'zh' ? '打开 SSH 连接管理器 (Ctrl+Alt+O)' : 'Open SSH Connection Manager (Ctrl+Alt+O)'}
+                          🌐 {tr('打开 SSH 连接管理器 (Ctrl+Alt+O)', 'Open SSH Connection Manager (Ctrl+Alt+O)')}
                         </button>
                       </div>
                     </div>
                   )}
 
-                  {/* Section 8: Shortcuts */}
+                  {/* Section 9: Shortcuts */}
                   {guideSection === 'shortcuts' && (
                     <div>
                       <div className="settings-section-title">
-                        {guideLang === 'zh' ? '⌨️ 8. 常用快捷键速查表 (Keyboard Shortcuts Reference)' : '⌨️ 8. Keyboard Shortcuts & Reference'}
+                        {tr('⌨️ 9. 常用快捷键速查表 (Keyboard Shortcuts Reference)', '⌨️ 9. Keyboard Shortcuts & Reference')}
                       </div>
                       <div className="settings-section-desc">
-                        {guideLang === 'zh'
-                          ? '熟练使用快捷键可大幅提升在 DeepAutoCode 中的结对编程效率。'
-                          : 'Master keyboard shortcuts to maximize your pair-programming speed.'}
+                        {tr('熟练使用快捷键可大幅提升在 DeepAutoCode 中的结对编程效率。', 'Master keyboard shortcuts to maximize your pair-programming speed.')}
                       </div>
 
                       <div className="settings-card">
                         <table className="md-table" style={{ width: '100%', borderCollapse: 'collapse' }}>
                           <thead>
                             <tr>
-                              <th style={{ textAlign: 'left', padding: '8px 12px' }}>{guideLang === 'zh' ? '快捷键' : 'Shortcut'}</th>
-                              <th style={{ textAlign: 'left', padding: '8px 12px' }}>{guideLang === 'zh' ? '功能说明' : 'Action'}</th>
-                              <th style={{ textAlign: 'left', padding: '8px 12px' }}>{guideLang === 'zh' ? '快速触发' : 'Trigger'}</th>
+                              <th style={{ textAlign: 'left', padding: '8px 12px' }}>{tr('快捷键', 'Shortcut')}</th>
+                              <th style={{ textAlign: 'left', padding: '8px 12px' }}>{tr('功能说明', 'Action')}</th>
+                              <th style={{ textAlign: 'left', padding: '8px 12px' }}>{tr('快速触发', 'Trigger')}</th>
                             </tr>
                           </thead>
                           <tbody>
                             {[
-                              { k: 'F1', d: guideLang === 'zh' ? '打开完整使用说明中心' : 'Open User Guide Center', a: () => openUserGuide('quickstart') },
-                              { k: 'Ctrl+Shift+P / Ctrl+P', d: guideLang === 'zh' ? '打开命令面板 / 快速搜索文件' : 'Command Palette / Quick File Open', a: () => setShowPalette(true) },
-                              { k: 'Ctrl+I', d: guideLang === 'zh' ? '弹出编辑器行内 AI 指令浮窗' : 'Toggle Inline AI Command Widget', a: () => setShowInlineCommand(true) },
-                              { k: 'Ctrl+L', d: guideLang === 'zh' ? '展开/收起右侧 AI 对话栏' : 'Toggle AI Agent & Artifacts Dock', a: () => setShowRightAiDock((v) => !v) },
-                              { k: 'Ctrl+B', d: guideLang === 'zh' ? '展开/收起左侧主侧边栏' : 'Toggle Primary Left Sidebar', a: () => setShowLeftSidebar((v) => !v) },
-                              { k: 'Ctrl+J', d: guideLang === 'zh' ? '展开/收起底部终端与问题面板' : 'Toggle Bottom Terminal Panel', a: () => setShowBottomPanel((v) => !v) },
-                              { k: 'Ctrl+O', d: guideLang === 'zh' ? '打开本地项目文件夹' : 'Open Project Folder', a: () => void handleOpenProjectAction() },
-                              { k: 'Ctrl+Alt+O', d: guideLang === 'zh' ? '打开远程 SSH 连接管理器' : 'Connect via SSH', a: () => void openSshConnectionModal() },
-                              { k: 'Ctrl+S', d: guideLang === 'zh' ? '保存当前活动文件' : 'Save Current File', a: () => void saveCurrentTab() },
-                              { k: 'Ctrl+,', d: guideLang === 'zh' ? '打开 DeepAutoCode 设置中心' : 'Open Settings Center', a: () => openSettingsCenter('general') },
-                              { k: 'Ctrl+Shift+J', d: guideLang === 'zh' ? '打开 AI 模型与 Provider 设置' : 'Configure AI Models', a: () => openSettingsCenter('models') },
-                              { k: 'Alt+T', d: guideLang === 'zh' ? '切换深色 / 浅色主题' : 'Toggle Dark / Light Theme', a: () => toggleColorTheme() },
+                              { k: 'F1', d: tr('打开完整使用说明中心', 'Open User Guide Center'), a: () => openUserGuide('quickstart') },
+                              { k: 'Ctrl+Shift+P / Ctrl+P', d: tr('打开命令面板 / 快速搜索文件', 'Command Palette / Quick File Open'), a: () => setShowPalette(true) },
+                              { k: 'Ctrl+I', d: tr('弹出编辑器行内 AI 指令浮窗', 'Toggle Inline AI Command Widget'), a: () => setShowInlineCommand(true) },
+                              { k: 'Ctrl+Shift+O', d: tr('当前文件符号大纲跳转', 'Go to Symbol in Editor'), a: () => void openGoToSymbolPalette() },
+                              { k: 'F12', d: tr('跳转到光标处定义 (LSP/搜索)', 'Go to Definition under Cursor'), a: () => void jumpToDefinitionAtCursor() },
+                              { k: 'Ctrl+L', d: tr('展开/收起右侧 AI 对话栏', 'Toggle AI Agent & Artifacts Dock'), a: () => setShowRightAiDock((v) => !v) },
+                              { k: 'Ctrl+B', d: tr('展开/收起左侧主侧边栏', 'Toggle Primary Left Sidebar'), a: () => setShowLeftSidebar((v) => !v) },
+                              { k: 'Ctrl+J', d: tr('展开/收起底部终端与问题面板', 'Toggle Bottom Terminal Panel'), a: () => setShowBottomPanel((v) => !v) },
+                              { k: 'Ctrl+O', d: tr('打开本地项目文件夹', 'Open Project Folder'), a: () => void handleOpenProjectAction() },
+                              { k: 'Ctrl+Alt+O', d: tr('打开远程 SSH 连接管理器', 'Connect via SSH'), a: () => void openSshConnectionModal() },
+                              { k: 'Ctrl+S', d: tr('保存当前活动文件', 'Save Current File'), a: () => void saveCurrentTab() },
+                              { k: 'Ctrl+,', d: tr('打开 DeepAutoCode 设置中心', 'Open Settings Center'), a: () => openSettingsCenter('general') },
+                              { k: 'Ctrl+Shift+J', d: tr('打开 AI 模型与 Provider 设置', 'Configure AI Models'), a: () => openSettingsCenter('models') },
+                              { k: 'Alt+T', d: tr('切换深色 / 浅色主题', 'Toggle Dark / Light Theme'), a: () => toggleColorTheme() },
                             ].map((row) => (
                               <tr key={row.k} style={{ borderTop: '1px solid var(--border)' }}>
                                 <td style={{ padding: '8px 12px' }}><kbd className="welcome-kbd">{row.k}</kbd></td>
                                 <td style={{ padding: '8px 12px', fontSize: 12.5 }}>{row.d}</td>
                                 <td style={{ padding: '8px 12px' }}>
                                   <button className="btn" style={{ padding: '2px 8px', fontSize: 10.5 }} onClick={row.a}>
-                                    {guideLang === 'zh' ? '立即执行' : 'Run'}
+                                    {tr('立即执行', 'Run')}
                                   </button>
                                 </td>
                               </tr>
@@ -5376,16 +6651,15 @@ export function App() {
                     style={{ display: 'flex', alignItems: 'center', gap: 6 }}
                   >
                     <BrandMark size={16} radius={4} />
-                    <span>DeepAutoCode Settings</span>
+                    <span>{t('settings.title')}</span>
                   </div>
                   {[
-                    { id: 'general', icon: '⚙️', label: 'General & Project' },
-                    { id: 'models', icon: '🤖', label: 'Models & Providers' },
-                    { id: 'security', icon: '🛡️', label: 'Agent & Security' },
-                    { id: 'rules', icon: '📜', label: 'Rules for AI' },
-                    { id: 'mcp', icon: '🔌', label: 'MCP & Capabilities' },
-                    { id: 'runtime', icon: '⚡', label: 'Cline SDK Runtime' },
-                    { id: 'extensions', icon: '🧩', label: 'Extensions & VSIX' },
+                    { id: 'general', icon: '⚙️', label: t('settings.nav.general') },
+                    { id: 'models', icon: '🤖', label: t('settings.nav.models') },
+                    { id: 'security', icon: '🛡️', label: t('settings.nav.security') },
+                    { id: 'rules', icon: '📜', label: t('settings.nav.rules') },
+                    { id: 'mcp', icon: '🔌', label: t('settings.nav.mcp') },
+                    { id: 'extensions', icon: '🧩', label: t('settings.nav.extensions') },
                   ].map((nav) => (
                     <div
                       key={nav.id}
@@ -5411,28 +6685,47 @@ export function App() {
                 <div className="settings-content">
                   {settingsCategory === 'general' && (
                     <div>
-                      <div className="settings-section-title">General, Project & Editor Settings</div>
-                      <div className="settings-section-desc">
-                        Manage active project workspace folder, recent projects, and Code - OSS editor preferences.
+                      <div className="settings-section-title">{t('settings.general.title')}</div>
+                      <div className="settings-section-desc">{t('settings.general.desc')}</div>
+
+                      <div className="settings-card">
+                        <div className="settings-row">
+                          <div>
+                            <div className="settings-label">{t('settings.language')}</div>
+                            <div className="settings-sublabel">{t('settings.language.hint')}</div>
+                          </div>
+                          <select
+                            className="settings-select"
+                            style={{ minWidth: 160 }}
+                            value={locale}
+                            onChange={(e) => setAppLocale(normalizeLocale(e.target.value))}
+                          >
+                            {APP_LOCALES.map((loc) => (
+                              <option key={loc.id} value={loc.id}>
+                                {loc.nativeLabel}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Current Project Workspace</div>
+                            <div className="settings-label">{t('settings.workspace')}</div>
                             <div className="settings-sublabel">{workspaceRoot}</div>
                           </div>
                           <button
                             className="btn primary"
                             onClick={() => void handleOpenProjectAction()}
                           >
-                            📂 Open / Switch Folder...
+                            📂 {t('settings.openFolder')}
                           </button>
                         </div>
 
                         <div style={{ marginTop: 12 }}>
                           <div className="settings-sublabel" style={{ marginBottom: 8 }}>
-                            Quick Switch Recent Workspaces:
+                            {t('settings.recent')}
                           </div>
                           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                             {(ideSettings.recentWorkspaces ?? []).map((ws: string) => (
@@ -5451,10 +6744,8 @@ export function App() {
                       <div className="settings-card">
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Editor Font Size</div>
-                            <div className="settings-sublabel">
-                              Controls font size in pixels in the code editor.
-                            </div>
+                            <div className="settings-label">{t('settings.fontSize')}</div>
+                            <div className="settings-sublabel">{t('settings.fontSize.hint')}</div>
                           </div>
                           <input
                             type="number"
@@ -5475,10 +6766,8 @@ export function App() {
 
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Tab Size</div>
-                            <div className="settings-sublabel">
-                              The number of spaces a tab is equal to.
-                            </div>
+                            <div className="settings-label">{t('settings.tabSize')}</div>
+                            <div className="settings-sublabel">{t('settings.tabSize.hint')}</div>
                           </div>
                           <select
                             className="settings-select"
@@ -5494,17 +6783,15 @@ export function App() {
                               })
                             }
                           >
-                            <option value={2}>2 Spaces</option>
-                            <option value={4}>4 Spaces</option>
+                            <option value={2}>{t('settings.tab.2')}</option>
+                            <option value={4}>{t('settings.tab.4')}</option>
                           </select>
                         </div>
 
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Auto Save</div>
-                            <div className="settings-sublabel">
-                              Controls automatic saving of dirty editor files.
-                            </div>
+                            <div className="settings-label">{t('settings.autoSave')}</div>
+                            <div className="settings-sublabel">{t('settings.autoSave.hint')}</div>
                           </div>
                           <select
                             className="settings-select"
@@ -5516,18 +6803,18 @@ export function App() {
                               })
                             }
                           >
-                            <option value="afterDelay">afterDelay (1000ms)</option>
-                            <option value="onFocusChange">onFocusChange</option>
-                            <option value="off">off</option>
+                            <option value="afterDelay">{t('settings.autoSave.afterDelay')}</option>
+                            <option value="onFocusChange">
+                              {t('settings.autoSave.onFocusChange')}
+                            </option>
+                            <option value="off">{t('settings.autoSave.off')}</option>
                           </select>
                         </div>
 
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">IDE Color Theme</div>
-                            <div className="settings-sublabel">
-                              Select workbench color theme or click the ☀️/🌙 button in the top titlebar.
-                            </div>
+                            <div className="settings-label">{t('settings.theme.label')}</div>
+                            <div className="settings-sublabel">{t('settings.theme.hint')}</div>
                           </div>
                           <select
                             className="settings-select"
@@ -5539,10 +6826,12 @@ export function App() {
                               })
                             }
                           >
-                            <option value="cursor-dark">🌙 Cursor Dark (Default)</option>
-                            <option value="cursor-light">☀️ Cursor Light (Clean Daylight)</option>
-                            <option value="antigravity-midnight">🌌 Antigravity Midnight</option>
-                            <option value="high-contrast">⚡ High Contrast Dark</option>
+                            <option value="cursor-dark">{t('settings.theme.dark')}</option>
+                            <option value="cursor-light">{t('settings.theme.light')}</option>
+                            <option value="antigravity-midnight">
+                              {t('settings.theme.midnight')}
+                            </option>
+                            <option value="high-contrast">{t('settings.theme.contrast')}</option>
                           </select>
                         </div>
                       </div>
@@ -5551,19 +6840,15 @@ export function App() {
 
                   {settingsCategory === 'models' && (
                     <div>
-                      <div className="settings-section-title">
-                        Models & Provider Configuration (Section 7 / ADR-005)
-                      </div>
-                      <div className="settings-section-desc">
-                        DeepSeek is configured as the out-of-the-box default Provider without vendor lock-in. API Keys are stored in OS Credential Storage (SecretStorage).
-                      </div>
+                      <div className="settings-section-title">{t('settings.models.title')}</div>
+                      <div className="settings-section-desc">{t('settings.models.desc')}</div>
 
                       <div className="settings-card">
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Active Model Provider</div>
+                            <div className="settings-label">{t('settings.models.provider')}</div>
                             <div className="settings-sublabel">
-                              Switch between DeepSeek, OpenAI-Compatible (Ollama / vLLM / Enterprise Gateway), and Anthropic.
+                              {t('settings.models.provider.hint')}
                             </div>
                           </div>
                           <select
@@ -5591,9 +6876,9 @@ export function App() {
 
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">API Base Endpoint</div>
+                            <div className="settings-label">{t('settings.models.endpoint')}</div>
                             <div className="settings-sublabel">
-                              Base URL for chat completions and tool calling.
+                              {t('settings.models.endpoint.hint')}
                             </div>
                           </div>
                           <input
@@ -5605,9 +6890,9 @@ export function App() {
 
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Default Model ID</div>
+                            <div className="settings-label">{t('settings.models.modelId')}</div>
                             <div className="settings-sublabel">
-                              e.g. deepseek-chat, deepseek-reasoner, qwen2.5-coder:14b
+                              {t('settings.models.modelId.hint')}
                             </div>
                           </div>
                           <input
@@ -5619,11 +6904,9 @@ export function App() {
 
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">
-                              API Key (OS Credential Storage)
-                            </div>
+                            <div className="settings-label">{t('settings.models.apiKey')}</div>
                             <div className="settings-sublabel">
-                              Never written to plaintext config or logs. Click "⚡ Test AI Key" to verify live model connectivity.
+                              {t('settings.models.apiKey.hint')}
                             </div>
                           </div>
                           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -5632,7 +6915,7 @@ export function App() {
                               className="settings-input"
                               placeholder={
                                 providerData?.active?.hasApiKeyConfigured
-                                  ? '•••••••• (Configured in SecretStorage)'
+                                  ? t('settings.models.apiKey.configured')
                                   : 'sk-...'
                               }
                               value={apiKeyInput}
@@ -5644,7 +6927,9 @@ export function App() {
                               disabled={isTestingKey}
                               onClick={() => void handleTestAiKey()}
                             >
-                              {isTestingKey ? '⏳ Testing...' : '⚡ Test AI Key'}
+                              {isTestingKey
+                                ? t('settings.models.testing')
+                                : t('settings.models.test')}
                             </button>
                           </div>
                         </div>
@@ -5664,7 +6949,7 @@ export function App() {
                               setStatusNotice(`Saved Provider "${selectedProviderId}"`);
                             }}
                           >
-                            Save Provider Configuration
+                            {t('settings.models.save')}
                           </button>
                           <button
                             className="btn"
@@ -5672,8 +6957,8 @@ export function App() {
                             onClick={() => void handleTestAiKey()}
                           >
                             {isTestingKey
-                              ? '⏳ Verifying AI Model...'
-                              : '⚡ Test AI Key & Model Connectivity'}
+                              ? t('settings.models.verifying')
+                              : t('settings.models.testFull')}
                           </button>
                         </div>
 
@@ -5692,8 +6977,8 @@ export function App() {
                             >
                               <strong style={{ fontSize: 13 }}>
                                 {smokeResult.ok
-                                  ? `✅ AI Connectivity Verified (${smokeResult.providerId} / ${smokeResult.modelId})`
-                                  : `❌ AI Connectivity Failed (${smokeResult.providerId} / ${smokeResult.modelId})`}
+                                  ? `${t('settings.models.ok')} (${smokeResult.providerId} / ${smokeResult.modelId})`
+                                  : `${t('settings.models.fail')} (${smokeResult.providerId} / ${smokeResult.modelId})`}
                               </strong>
                               <span
                                 className={`badge ${
@@ -5707,22 +6992,25 @@ export function App() {
                             </div>
                             {smokeResult.ok ? (
                               <div style={{ color: 'var(--text-primary)', fontSize: 12 }}>
-                                Model Response Preview:
+                                {t('settings.models.preview')}
                                 <code
                                   className="md-inline-code"
                                   style={{ marginLeft: 6 }}
                                 >
-                                  {smokeResult.replyPreview || 'Connected'}
+                                  {smokeResult.replyPreview || t('settings.models.connected')}
                                 </code>
                               </div>
                             ) : (
                               <div style={{ color: 'var(--text-primary)', fontSize: 12 }}>
                                 <div>
-                                  Reason: {smokeResult.diagnostic?.userMessage || 'Unable to connect to model service'}
+                                  {t('settings.models.reason')}{' '}
+                                  {smokeResult.diagnostic?.userMessage ||
+                                    t('settings.models.unable')}
                                 </div>
                                 {smokeResult.diagnostic?.remediation && (
                                   <div style={{ marginTop: 4, opacity: 0.9 }}>
-                                    Remediation: {smokeResult.diagnostic.remediation}
+                                    {t('settings.models.remediation')}{' '}
+                                    {smokeResult.diagnostic.remediation}
                                   </div>
                                 )}
                               </div>
@@ -5735,19 +7023,15 @@ export function App() {
 
                   {settingsCategory === 'security' && (
                     <div>
-                      <div className="settings-section-title">
-                        Agent Execution & Security Policies (Section 9 / ADR-008)
-                      </div>
-                      <div className="settings-section-desc">
-                        Configure Plan read-only boundaries, Auto mode command allowlists, human-in-the-loop approval timeouts, and symlink escape protection.
-                      </div>
+                      <div className="settings-section-title">{t('settings.security.title')}</div>
+                      <div className="settings-section-desc">{t('settings.security.desc')}</div>
 
                       <div className="settings-card">
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Default Agent Execution Mode</div>
+                            <div className="settings-label">{t('settings.security.mode')}</div>
                             <div className="settings-sublabel">
-                              Plan Mode enforces strict read-only; Auto Mode allows low-risk allowlisted operations; Manual requires approval for all mutations.
+                              {t('settings.security.mode.hint')}
                             </div>
                           </div>
                           <select
@@ -5762,17 +7046,17 @@ export function App() {
                               });
                             }}
                           >
-                            <option value="auto">∞ Agent (Auto Allowlist)</option>
-                            <option value="plan">📖 Plan (Strictly Read-Only)</option>
-                            <option value="manual">🛡️ Manual Approval</option>
+                            <option value="auto">{t('settings.security.mode.auto')}</option>
+                            <option value="plan">{t('settings.security.mode.plan')}</option>
+                            <option value="manual">{t('settings.security.mode.manual')}</option>
                           </select>
                         </div>
 
                         <div className="settings-row">
                           <div>
-                            <div className="settings-label">Approval Expiration Timeout (Seconds)</div>
+                            <div className="settings-label">{t('settings.security.timeout')}</div>
                             <div className="settings-sublabel">
-                              Unanswered high-risk tool approval cards automatically expire and reject after this duration.
+                              {t('settings.security.timeout.hint')}
                             </div>
                           </div>
                           <input
@@ -5795,10 +7079,65 @@ export function App() {
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 6 }}>
-                          Auto Mode Command Allowlist (Section 9.2)
+                          {t('settings.security.verify')}
                         </div>
                         <div className="settings-sublabel" style={{ marginBottom: 10 }}>
-                          Commands matching these prefixes run without blocking in Auto Mode; all other commands trigger explicit user approval.
+                          {t('settings.security.verify.hint')}
+                        </div>
+                        <div style={{ display: 'grid', gap: 8 }}>
+                          <input
+                            className="settings-input"
+                            placeholder={t('settings.security.buildPh')}
+                            value={ideSettings.agent?.verifyBuildCommand ?? 'npm run build'}
+                            onChange={(e) =>
+                              void persistIdeSettings({
+                                ...ideSettings,
+                                agent: {
+                                  ...ideSettings.agent,
+                                  verifyBuildCommand: e.target.value,
+                                },
+                              })
+                            }
+                          />
+                          <input
+                            className="settings-input"
+                            placeholder={t('settings.security.testPh')}
+                            value={ideSettings.agent?.verifyTestCommand ?? 'npm test'}
+                            onChange={(e) =>
+                              void persistIdeSettings({
+                                ...ideSettings,
+                                agent: {
+                                  ...ideSettings.agent,
+                                  verifyTestCommand: e.target.value,
+                                },
+                              })
+                            }
+                          />
+                          <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 }}>
+                            <input
+                              type="checkbox"
+                              checked={ideSettings.agent?.enableEvolveSandbox !== false}
+                              onChange={(e) =>
+                                void persistIdeSettings({
+                                  ...ideSettings,
+                                  agent: {
+                                    ...ideSettings.agent,
+                                    enableEvolveSandbox: e.target.checked,
+                                  },
+                                })
+                              }
+                            />
+                            {t('settings.security.evolve')}
+                          </label>
+                        </div>
+                      </div>
+
+                      <div className="settings-card">
+                        <div className="settings-label" style={{ marginBottom: 6 }}>
+                          {t('settings.security.allowlist')}
+                        </div>
+                        <div className="settings-sublabel" style={{ marginBottom: 10 }}>
+                          {t('settings.security.allowlist.hint')}
                         </div>
                         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
                           {(ideSettings.agent?.commandAllowlist ?? []).map((cmd: string) => (
@@ -5824,7 +7163,7 @@ export function App() {
                         <div style={{ display: 'flex', gap: 8 }}>
                           <input
                             className="settings-input"
-                            placeholder="Add safe command prefix (e.g. npm run lint)"
+                            placeholder={t('settings.security.allowlist.ph')}
                             value={newAllowlistCmd}
                             onChange={(e) => setNewAllowlistCmd(e.target.value)}
                           />
@@ -5843,7 +7182,7 @@ export function App() {
                               });
                             }}
                           >
-                            + Add Allowlist Rule
+                            {t('settings.security.allowlist.add')}
                           </button>
                         </div>
                       </div>
@@ -5852,25 +7191,23 @@ export function App() {
 
                   {settingsCategory === 'rules' && (
                     <div>
-                      <div className="settings-section-title">
-                        Antigravity Customizations: .agents/ Rules, Skills & Workflows
-                      </div>
-                      <div className="settings-section-desc">
-                        DeepAutoCode automatically discovers <code>.agents/rules/*.md</code>,{' '}
-                        <code>.agents/skills/*/SKILL.md</code>, <code>.agents/workflows/*.md</code>, and{' '}
-                        <code>AGENTS.md</code> in the active workspace and injects them into Agent sessions.
-                      </div>
+                      <div className="settings-section-title">{t('settings.rules.title')}</div>
+                      <div className="settings-section-desc">{t('settings.rules.desc')}</div>
 
                       <div className="settings-card">
                         <div className="settings-row" style={{ marginBottom: 12 }}>
                           <div>
                             <div className="settings-label">
-                              Workspace .agents/ Customizations ({workspaceCustomizations.rules.length} Rules,{' '}
-                              {workspaceCustomizations.skills.length} Skills,{' '}
-                              {workspaceCustomizations.workflows.length} Workflows)
+                              {t('settings.rules.workspace')} (
+                              {t('settings.rules.count', {
+                                rules: workspaceCustomizations.rules.length,
+                                skills: workspaceCustomizations.skills.length,
+                                workflows: workspaceCustomizations.workflows.length,
+                              })}
+                              )
                             </div>
                             <div className="settings-sublabel">
-                              Scaffold standard Antigravity customization files directly into your active repository.
+                              {t('settings.rules.workspace.hint')}
                             </div>
                           </div>
                           <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
@@ -5878,19 +7215,19 @@ export function App() {
                               className="btn primary"
                               onClick={() => void handleScaffoldCustomization('rule')}
                             >
-                              + New .agents Rule
+                              {t('settings.rules.newRule')}
                             </button>
                             <button
                               className="btn"
                               onClick={() => void handleScaffoldCustomization('skill')}
                             >
-                              + New .agents Skill
+                              {t('settings.rules.newSkill')}
                             </button>
                             <button
                               className="btn"
                               onClick={() => void handleScaffoldCustomization('workflow')}
                             >
-                              + New .agents Workflow
+                              {t('settings.rules.newWorkflow')}
                             </button>
                           </div>
                         </div>
@@ -5945,12 +7282,43 @@ export function App() {
                         )}
 
                         <div className="settings-label" style={{ marginBottom: 8 }}>
-                          Global / Fallback Project Rules
+                          {t('settings.rules.user')}
+                        </div>
+                        <div className="settings-sublabel" style={{ marginBottom: 6 }}>
+                          {t('settings.rules.user.hint')}
                         </div>
                         <textarea
                           style={{
                             width: '100%',
-                            minHeight: 160,
+                            minHeight: 100,
+                            background: 'var(--bg-input)',
+                            border: '1px solid var(--border)',
+                            borderRadius: 6,
+                            color: 'var(--text-primary)',
+                            padding: 12,
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: 12.5,
+                            lineHeight: 1.6,
+                          }}
+                          value={ideSettings.agent?.userRules ?? ''}
+                          onChange={(e) =>
+                            setIdeSettings({
+                              ...ideSettings,
+                              agent: { ...ideSettings.agent, userRules: e.target.value },
+                            })
+                          }
+                          placeholder={t('settings.rules.user.ph')}
+                        />
+                        <div className="settings-label" style={{ margin: '14px 0 8px' }}>
+                          {t('settings.rules.project')}
+                        </div>
+                        <div className="settings-sublabel" style={{ marginBottom: 6 }}>
+                          {t('settings.rules.project.hint')}
+                        </div>
+                        <textarea
+                          style={{
+                            width: '100%',
+                            minHeight: 140,
                             background: 'var(--bg-input)',
                             border: '1px solid var(--border)',
                             borderRadius: 6,
@@ -5973,7 +7341,7 @@ export function App() {
                             className="btn primary"
                             onClick={() => void persistIdeSettings(ideSettings)}
                           >
-                            Save Project AI Rules
+                            {t('settings.rules.save')}
                           </button>
                         </div>
                       </div>
@@ -5982,16 +7350,12 @@ export function App() {
 
                   {settingsCategory === 'mcp' && (
                     <div>
-                      <div className="settings-section-title">
-                        MCP Servers & Registered Host Capabilities (Appendix B)
-                      </div>
-                      <div className="settings-section-desc">
-                        Inspect the 5 core Code - OSS Host Capabilities registered in CapabilityRegistry and manage Model Context Protocol (MCP) servers.
-                      </div>
+                      <div className="settings-section-title">{t('settings.mcp.title')}</div>
+                      <div className="settings-section-desc">{t('settings.mcp.desc')}</div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 10 }}>
-                          Verified Capability → Code - OSS API Mapping Table (ADR-010)
+                          {t('settings.mcp.caps')}
                         </div>
                         {(registeredCapabilities ?? []).map((cap: any) => (
                           <div key={cap.name} className="settings-row">
@@ -6004,8 +7368,8 @@ export function App() {
                                   }`}
                                 >
                                   {cap.requiresApprovalByDefault
-                                    ? 'Requires Approval'
-                                    : 'Safe / Auto'}
+                                    ? t('settings.mcp.requiresApproval')
+                                    : t('settings.mcp.safeAuto')}
                                 </span>
                               </div>
                               <div className="settings-sublabel">{cap.description}</div>
@@ -6017,167 +7381,329 @@ export function App() {
                                   marginTop: 2,
                                 }}
                               >
-                                Host API: {cap.codeOssApi}
+                                {t('settings.mcp.hostApi')} {cap.codeOssApi}
                               </div>
                             </div>
-                            <span className="badge">Timeout: {cap.defaultTimeoutMs}ms</span>
+                            <span className="badge">
+                              {t('settings.mcp.timeout')} {cap.defaultTimeoutMs}ms
+                            </span>
                           </div>
                         ))}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 10 }}>
-                          Configured MCP Servers
+                          {t('settings.mcp.servers')}
                         </div>
+                        <p style={{ fontSize: 12, color: 'var(--text-secondary)', margin: '0 0 10px 0' }}>
+                          {t('settings.mcp.servers.hint')}
+                        </p>
                         {(ideSettings.mcpServers ?? []).map((srv: any) => (
-                          <div key={srv.id} className="settings-row">
-                            <div>
-                              <div className="settings-label">{srv.name}</div>
-                              <div
-                                className="settings-sublabel"
-                                style={{ fontFamily: 'var(--font-mono)' }}
-                              >
-                                [{srv.transport}] {srv.commandOrUrl}
+                          <div
+                            key={srv.id}
+                            style={{
+                              borderBottom: '1px solid var(--border)',
+                              padding: '8px 0',
+                            }}
+                          >
+                            <div className="settings-row">
+                              <div>
+                                <div className="settings-label">{srv.name}</div>
+                                <div
+                                  className="settings-sublabel"
+                                  style={{ fontFamily: 'var(--font-mono)' }}
+                                >
+                                  [{srv.transport}] {srv.commandOrUrl}
+                                </div>
+                                {srv.env && Object.keys(srv.env).length > 0 && (
+                                  <div className="settings-sublabel">
+                                    {t('settings.mcp.env')} {Object.keys(srv.env).join(', ')}
+                                  </div>
+                                )}
+                                {srv.headers && Object.keys(srv.headers).length > 0 && (
+                                  <div className="settings-sublabel">
+                                    {t('settings.mcp.headers')}{' '}
+                                    {Object.keys(srv.headers).join(', ')}
+                                  </div>
+                                )}
+                                {(srv.disabledTools || []).length > 0 && (
+                                  <div className="settings-sublabel">
+                                    {t('settings.mcp.disabledTools')}{' '}
+                                    {(srv.disabledTools || []).join(', ')}
+                                  </div>
+                                )}
+                              </div>
+                              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                                <button
+                                  className="btn"
+                                  style={{ padding: '2px 8px', fontSize: 11 }}
+                                  onClick={() => {
+                                    const next = (ideSettings.mcpServers ?? []).map((s: any) =>
+                                      s.id === srv.id ? { ...s, enabled: s.enabled === false } : s
+                                    );
+                                    void persistIdeSettings({ ...ideSettings, mcpServers: next });
+                                  }}
+                                >
+                                  {srv.enabled === false
+                                    ? t('settings.mcp.enable')
+                                    : t('settings.mcp.disable')}
+                                </button>
+                                <span
+                                  className={`badge ${
+                                    String(srv.commandOrUrl || '').startsWith('builtin://')
+                                      ? 'warning'
+                                      : srv.enabled === false
+                                        ? 'danger'
+                                        : 'success'
+                                  }`}
+                                >
+                                  {String(srv.commandOrUrl || '').startsWith('builtin://')
+                                    ? t('settings.mcp.placeholder')
+                                    : srv.enabled === false
+                                      ? t('settings.mcp.disabled')
+                                      : t('settings.mcp.enabled')}
+                                </span>
+                                <button
+                                  className="btn"
+                                  style={{ padding: '2px 8px', fontSize: 11 }}
+                                  onClick={() => {
+                                    const next = (ideSettings.mcpServers ?? []).filter(
+                                      (s: any) => s.id !== srv.id
+                                    );
+                                    void persistIdeSettings({ ...ideSettings, mcpServers: next });
+                                  }}
+                                >
+                                  {t('settings.mcp.remove')}
+                                </button>
                               </div>
                             </div>
-                            <span className="badge success">Enabled</span>
                           </div>
                         ))}
-                        <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                        <div style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
                           <input
                             className="settings-input"
-                            placeholder="MCP Server Name"
+                            placeholder={t('settings.mcp.namePh')}
                             value={newMcpName}
                             onChange={(e) => setNewMcpName(e.target.value)}
                           />
+                          <select
+                            className="settings-input"
+                            value={newMcpTransport}
+                            onChange={(e) =>
+                              setNewMcpTransport(e.target.value as 'stdio' | 'sse' | 'http')
+                            }
+                            style={{ maxWidth: 140 }}
+                            title="MCP transport"
+                          >
+                            <option value="stdio">stdio</option>
+                            <option value="sse">sse (HTTP+SSE)</option>
+                            <option value="http">http (Streamable)</option>
+                          </select>
                           <input
                             className="settings-input"
-                            placeholder="Command or URL (npx -y ...)"
+                            placeholder={
+                              newMcpTransport === 'stdio'
+                                ? t('settings.mcp.cmdPh')
+                                : t('settings.mcp.urlPh')
+                            }
                             value={newMcpCmd}
                             onChange={(e) => setNewMcpCmd(e.target.value)}
+                          />
+                          <input
+                            className="settings-input"
+                            placeholder={t('settings.mcp.envPh')}
+                            value={newMcpEnv}
+                            onChange={(e) => setNewMcpEnv(e.target.value)}
+                            style={{ minWidth: 200 }}
+                          />
+                          <input
+                            className="settings-input"
+                            placeholder={t('settings.mcp.headersPh')}
+                            value={newMcpHeaders}
+                            onChange={(e) => setNewMcpHeaders(e.target.value)}
+                            style={{ minWidth: 260 }}
+                            title="Paste Bearer token or custom headers. Full OAuth browser flow can use accessToken in mcp.json auth."
                           />
                           <button
                             className="btn primary"
                             onClick={() => {
                               if (!newMcpName.trim() || !newMcpCmd.trim()) return;
+                              const env: Record<string, string> = {};
+                              for (const part of newMcpEnv.split(/[,;\n]+/)) {
+                                const m = part.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+                                if (m) env[m[1]] = m[2];
+                              }
+                              const headers: Record<string, string> = {};
+                              for (const part of newMcpHeaders.split(/[,;\n]+/)) {
+                                const m = part.trim().match(/^([A-Za-z0-9_-]+)=(.*)$/);
+                                if (m) headers[m[1]] = m[2];
+                              }
                               const next = [
                                 ...(ideSettings.mcpServers ?? []),
                                 {
                                   id: `mcp_${Date.now()}`,
                                   name: newMcpName.trim(),
-                                  transport: 'stdio',
+                                  transport: newMcpTransport,
                                   commandOrUrl: newMcpCmd.trim(),
                                   enabled: true,
+                                  env: Object.keys(env).length ? env : undefined,
+                                  headers: Object.keys(headers).length ? headers : undefined,
+                                  disabledTools: [],
                                 },
                               ];
                               setNewMcpName('');
                               setNewMcpCmd('');
+                              setNewMcpEnv('');
+                              setNewMcpHeaders('');
+                              setNewMcpTransport('stdio');
                               void persistIdeSettings({ ...ideSettings, mcpServers: next });
+                              setStatusNotice(
+                                `MCP ${newMcpTransport} server saved → .deepautocode/mcp.json`
+                              );
                             }}
                           >
-                            + Add MCP
+                            {t('settings.mcp.add')}
                           </button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {settingsCategory === 'runtime' && (
-                    <div>
-                      <div className="settings-section-title">
-                        Cline SDK Runtime & Hub-Spoke Topology (Section 5 / ADR-006 / ADR-009)
-                      </div>
-                      <div className="settings-section-desc">
-                        Configure backendMode (local / auto / hub / remote) and verify PoC-L1 (disk write) & PoC-L2 (cross-instance session recovery).
-                      </div>
-
-                      <div className="settings-card">
-                        <div className="settings-row">
-                          <div>
-                            <div className="settings-label">Runtime Backend Mode</div>
-                            <div className="settings-sublabel">
-                              local is the Phase 0/1 baseline; auto probes local Hub and falls back to local.
-                            </div>
-                          </div>
-                          <div style={{ display: 'flex', gap: 6 }}>
-                            {(['local', 'auto', 'hub', 'remote'] as const).map((m) => (
-                              <button
-                                key={m}
-                                className={`btn ${
-                                  backendStatus?.diagnostics?.configuredMode === m
-                                    ? 'primary'
-                                    : ''
-                                }`}
-                                onClick={async () => {
-                                  try {
-                                    await bridge.request(
-                                      'backend.switch',
-                                      { mode: m },
-                                      activeSessionId
-                                    );
-                                    const back = await bridge.request('backend.status');
-                                    setBackendStatus(back);
-                                    setStatusNotice(
-                                      `Backend mode -> ${back.diagnostics.effectiveMode}`
-                                    );
-                                  } catch (err) {
-                                    setStatusNotice((err as Error).message);
-                                  }
-                                }}
-                              >
-                                {m.toUpperCase()}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-
-                        <div className="settings-row">
-                          <div>
-                            <div className="settings-label">
-                              PoC-L2 Cross-Instance Session Recovery Test
-                            </div>
-                            <div className="settings-sublabel">
-                              Destroys the active ClineCore instance and boots a new instance to verify persisted sessions are automatically discovered and restored.
-                            </div>
-                          </div>
                           <button
-                            className="btn primary"
-                            onClick={() => void handleSimulateExtensionHostRestart()}
+                            className="btn"
+                            disabled={isTestingMcp}
+                            onClick={() => {
+                              setIsTestingMcp(true);
+                              void fetch('/api/mcp/test', { method: 'POST' })
+                                .then((r) => r.json())
+                                .then((res) => {
+                                  setMcpTestResult({
+                                    ok: Boolean(res.ok),
+                                    tools: Array.isArray(res.tools) ? res.tools : [],
+                                    error: res.error || null,
+                                    serverCount: res.serverCount,
+                                  });
+                                  setStatusNotice(
+                                    res.ok
+                                      ? `MCP OK · ${(res.tools || []).length} tool(s) from ${res.serverCount || 0} server(s)`
+                                      : `MCP test failed: ${res.error || 'unknown'}`
+                                  );
+                                })
+                                .catch((err) => {
+                                  setMcpTestResult({
+                                    ok: false,
+                                    tools: [],
+                                    error: (err as Error).message,
+                                  });
+                                })
+                                .finally(() => setIsTestingMcp(false));
+                            }}
                           >
-                            ↻ Simulate Extension Host Restart
+                            {isTestingMcp
+                              ? t('settings.mcp.testing')
+                              : t('settings.mcp.test')}
                           </button>
                         </div>
-
-                        <pre
-                          style={{
-                            marginTop: 12,
-                            padding: 12,
-                            background: 'var(--bg-input)',
-                            color: 'var(--text-primary)',
-                            border: '1px solid var(--border)',
-                            borderRadius: 6,
-                            fontFamily: 'var(--font-mono)',
-                            fontSize: 11.5,
-                          }}
-                        >
-                          {JSON.stringify(backendStatus ?? {}, null, 2)}
-                        </pre>
+                        {mcpTestResult && (
+                          <div style={{ marginTop: 12 }}>
+                            <div className="settings-label" style={{ marginBottom: 6 }}>
+                              {t('settings.mcp.liveTools')}{' '}
+                              <span className={`badge ${mcpTestResult.ok ? 'success' : 'danger'}`}>
+                                {mcpTestResult.ok
+                                  ? t('common.connected')
+                                  : t('common.failed')}
+                              </span>
+                            </div>
+                            {mcpTestResult.error && (
+                              <div style={{ fontSize: 11.5, color: '#fbbf24', marginBottom: 6 }}>
+                                {mcpTestResult.error}
+                              </div>
+                            )}
+                            {(mcpTestResult.tools || []).length === 0 ? (
+                              <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
+                                {t('settings.mcp.noTools')}
+                              </div>
+                            ) : (
+                              <div style={{ maxHeight: 220, overflow: 'auto' }}>
+                                {mcpTestResult.tools.map((mcpTool) => {
+                                  const disabledSet = new Set(
+                                    (ideSettings.mcpServers || []).flatMap(
+                                      (s: any) => s.disabledTools || []
+                                    )
+                                  );
+                                  const isDisabled = disabledSet.has(mcpTool.qualifiedName);
+                                  return (
+                                    <div
+                                      key={mcpTool.qualifiedName}
+                                      style={{
+                                        fontSize: 11.5,
+                                        padding: '4px 0',
+                                        borderBottom: '1px solid var(--border)',
+                                        display: 'flex',
+                                        justifyContent: 'space-between',
+                                        gap: 8,
+                                        alignItems: 'center',
+                                        opacity: isDisabled ? 0.55 : 1,
+                                      }}
+                                    >
+                                      <div>
+                                        <code>{mcpTool.qualifiedName}</code>
+                                        <span
+                                          style={{ color: 'var(--text-secondary)', marginLeft: 8 }}
+                                        >
+                                          {mcpTool.description || mcpTool.serverName || ''}
+                                        </span>
+                                      </div>
+                                      <button
+                                        className="btn"
+                                        style={{ padding: '1px 7px', fontSize: 10.5 }}
+                                        onClick={() => {
+                                          const idMatch = /^mcp__([^_]+)__/.exec(
+                                            mcpTool.qualifiedName
+                                          );
+                                          const ownerId = idMatch?.[1];
+                                          const next = (ideSettings.mcpServers ?? []).map(
+                                            (s: any) => {
+                                              const owns =
+                                                (ownerId && s.id === ownerId) ||
+                                                s.name === mcpTool.serverName ||
+                                                (ideSettings.mcpServers || []).length === 1;
+                                              if (!owns) return s;
+                                              const cur = new Set<string>(s.disabledTools || []);
+                                              if (cur.has(mcpTool.qualifiedName)) {
+                                                cur.delete(mcpTool.qualifiedName);
+                                              } else {
+                                                cur.add(mcpTool.qualifiedName);
+                                              }
+                                              return { ...s, disabledTools: [...cur] };
+                                            }
+                                          );
+                                          void persistIdeSettings({
+                                            ...ideSettings,
+                                            mcpServers: next,
+                                          });
+                                        }}
+                                      >
+                                        {isDisabled
+                                          ? t('settings.mcp.enableTool')
+                                          : t('settings.mcp.disableTool')}
+                                      </button>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}
 
                   {settingsCategory === 'extensions' && (
                     <div>
-                      <div className="settings-section-title">
-                        Open VSX Compatibility Matrix & Legal VSIX Installer (Section 8 / DA-005)
-                      </div>
+                      <div className="settings-section-title">{t('settings.ext.title')}</div>
                       <div className="settings-section-desc">
                         {extensionsCatalog?.policyNote}
                       </div>
 
                       <div className="settings-card">
                         <div className="settings-label" style={{ marginBottom: 8 }}>
-                          Manual Local VSIX Package Installer
+                          {t('settings.ext.manual')}
                         </div>
                         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
                           <input
@@ -6191,7 +7717,7 @@ export function App() {
                               checked={vsixConfirmed}
                               onChange={(e) => setVsixConfirmed(e.target.checked)}
                             />
-                            I confirm I hold a valid license for this VSIX extension
+                            {t('settings.ext.license')}
                           </label>
                           <button
                             className="btn primary"
@@ -6207,7 +7733,7 @@ export function App() {
                               setStatusNotice(res.message || res.error);
                             }}
                           >
-                            Install VSIX
+                            {t('settings.ext.install')}
                           </button>
                         </div>
                       </div>
@@ -6225,8 +7751,8 @@ export function App() {
                                   }`}
                                 >
                                   {ext.openVsxAvailable
-                                    ? 'Open VSX Verified'
-                                    : 'Proprietary Restricted'}
+                                    ? t('settings.ext.verified')
+                                    : t('settings.ext.restricted')}
                                 </span>
                               </div>
                               <div className="settings-sublabel">{ext.notes}</div>
@@ -6247,10 +7773,12 @@ export function App() {
                                   setStatusNotice(`Installed ${ext.id}`);
                                 }}
                               >
-                                {ext.installed ? 'Installed ✓' : 'Install from Open VSX'}
+                                {ext.installed
+                                  ? t('settings.ext.installed')
+                                  : t('settings.ext.installOpenVsx')}
                               </button>
                             ) : (
-                              <span className="badge warning">Use Open-Source Alternative</span>
+                              <span className="badge warning">{t('settings.ext.useAlt')}</span>
                             )}
                           </div>
                         ))}
@@ -6718,13 +8246,29 @@ export function App() {
                     <div className="welcome-hero-text">
                       <div className="welcome-title-row">
                         <h1 className="welcome-title">DeepAutoCode</h1>
-                        <span className="welcome-version-pill">v1.1 Agentic IDE</span>
+                        <span className="welcome-version-pill">{t('welcome.version')}</span>
                       </div>
                       <p className="welcome-subtitle">
                         {workspaceRoot
-                          ? `Active Workspace: ${workspaceName} — Select a file from Explorer or press Ctrl+P to jump to code`
-                          : 'AI-Native Agentic IDE — Open a local folder or connect to a remote SSH host to start building'}
+                          ? t('welcome.subtitle.active', {
+                              name: displayWorkspaceName,
+                            })
+                          : t('welcome.subtitle.empty')}
                       </p>
+                      <div className="welcome-lang-row" role="group" aria-label={t('welcome.lang')}>
+                        <span className="welcome-lang-label">{t('welcome.lang')}</span>
+                        {APP_LOCALES.map((loc) => (
+                          <button
+                            key={loc.id}
+                            type="button"
+                            className={`welcome-lang-btn ${locale === loc.id ? 'active' : ''}`}
+                            onClick={() => setAppLocale(loc.id)}
+                            title={loc.englishLabel}
+                          >
+                            {loc.nativeLabel}
+                          </button>
+                        ))}
+                      </div>
                     </div>
                   </div>
 
@@ -6739,10 +8283,8 @@ export function App() {
                         <span className="welcome-card-icon">📂</span>
                         <kbd className="welcome-kbd">Ctrl+O</kbd>
                       </div>
-                      <div className="welcome-card-title">Open Folder</div>
-                      <div className="welcome-card-desc">
-                        Open a local repository or project directory
-                      </div>
+                      <div className="welcome-card-title">{t('welcome.openFolder')}</div>
+                      <div className="welcome-card-desc">{t('welcome.openFolder.desc')}</div>
                     </button>
 
                     <button
@@ -6754,10 +8296,8 @@ export function App() {
                         <span className="welcome-card-icon">🌐</span>
                         <kbd className="welcome-kbd">Ctrl+Alt+O</kbd>
                       </div>
-                      <div className="welcome-card-title">Connect via SSH</div>
-                      <div className="welcome-card-desc">
-                        Develop on a remote Linux server or GPU cluster
-                      </div>
+                      <div className="welcome-card-title">{t('welcome.ssh')}</div>
+                      <div className="welcome-card-desc">{t('welcome.ssh.desc')}</div>
                     </button>
 
                     <button
@@ -6769,10 +8309,8 @@ export function App() {
                         <span className="welcome-card-icon">🤖</span>
                         <kbd className="welcome-kbd">Ctrl+Shift+J</kbd>
                       </div>
-                      <div className="welcome-card-title">Configure AI Models</div>
-                      <div className="welcome-card-desc">
-                        Set up DeepSeek, OpenAI-Compatible, or Claude keys
-                      </div>
+                      <div className="welcome-card-title">{t('welcome.models')}</div>
+                      <div className="welcome-card-desc">{t('welcome.models.desc')}</div>
                     </button>
                   </div>
 
@@ -6781,7 +8319,7 @@ export function App() {
                     {/* Left Column: Recent Workspaces & SSH Hosts */}
                     <div className="welcome-section">
                       <div className="welcome-section-header">
-                        <span>Recent Workspaces & Remote Hosts</span>
+                        <span>{t('welcome.recent')}</span>
                         {((ideSettings.recentWorkspaces ?? []).length > 0 ||
                           sshProfiles.length > 0) && (
                           <span className="welcome-section-count">
@@ -6791,10 +8329,7 @@ export function App() {
                       </div>
                       {(ideSettings.recentWorkspaces ?? []).length === 0 &&
                       sshProfiles.length === 0 ? (
-                        <div className="welcome-empty-recent">
-                          No recent workspaces yet. Choose <strong>Open Folder</strong> or{' '}
-                          <strong>Connect via SSH</strong> above to open your first project.
-                        </div>
+                        <div className="welcome-empty-recent">{t('welcome.recent.empty')}</div>
                       ) : (
                         <div className="welcome-recent-list">
                           {(ideSettings.recentWorkspaces ?? []).slice(0, 5).map((ws: string) => {
@@ -6806,7 +8341,9 @@ export function App() {
                                 onClick={() => void switchProjectFolder(ws)}
                               >
                                 <div className="welcome-recent-main">
-                                  <span className="welcome-recent-badge local">LOCAL</span>
+                                  <span className="welcome-recent-badge local">
+                                    {t('welcome.local')}
+                                  </span>
                                   <span className="welcome-recent-name">{folderLabel}</span>
                                 </div>
                                 <div className="welcome-recent-path" title={ws}>
@@ -6822,7 +8359,9 @@ export function App() {
                               onClick={() => void openSshConnectionModal()}
                             >
                               <div className="welcome-recent-main">
-                                <span className="welcome-recent-badge ssh">SSH</span>
+                                <span className="welcome-recent-badge ssh">
+                                  {t('welcome.sshBadge')}
+                                </span>
                                 <span className="welcome-recent-name">
                                   {prof.name || `${prof.username}@${prof.host}`}
                                 </span>
@@ -6839,35 +8378,35 @@ export function App() {
                     {/* Right Column: Quick Shortcuts & Essential Commands */}
                     <div className="welcome-section">
                       <div className="welcome-section-header">
-                        <span>Quick Shortcuts & Navigation</span>
+                        <span>{t('welcome.shortcuts')}</span>
                       </div>
                       <div className="welcome-shortcuts-list">
                         <div
                           className="welcome-shortcut-row"
                           onClick={() => setShowPalette(true)}
                         >
-                          <span>Command Palette</span>
+                          <span>{t('welcome.shortcut.palette')}</span>
                           <kbd className="welcome-kbd">Ctrl+Shift+P</kbd>
                         </div>
                         <div
                           className="welcome-shortcut-row"
                           onClick={() => setShowRightAiDock((v) => !v)}
                         >
-                          <span>Toggle AI Agent Dock</span>
+                          <span>{t('welcome.shortcut.ai')}</span>
                           <kbd className="welcome-kbd">Ctrl+L</kbd>
                         </div>
                         <div
                           className="welcome-shortcut-row"
                           onClick={() => setShowBottomPanel((v) => !v)}
                         >
-                          <span>Toggle Terminal & Output</span>
+                          <span>{t('welcome.shortcut.terminal')}</span>
                           <kbd className="welcome-kbd">Ctrl+`</kbd>
                         </div>
                         <div
                           className="welcome-shortcut-row"
                           onClick={() => setShowLeftSidebar((v) => !v)}
                         >
-                          <span>Toggle Project Explorer</span>
+                          <span>{t('welcome.shortcut.explorer')}</span>
                           <kbd className="welcome-kbd">Ctrl+B</kbd>
                         </div>
                       </div>
@@ -6884,33 +8423,21 @@ export function App() {
                     <button
                       type="button"
                       className="ag-codelens-btn"
-                      onClick={() =>
-                        handleInlineCommandSubmit(
-                          `Explain the logic and invariants around line ${cursorPos.line} in ${activeTab?.path}`
-                        )
-                      }
+                      onClick={() => triggerCodeLensAction('explain')}
                     >
                       ✨ Explain
                     </button>
                     <button
                       type="button"
                       className="ag-codelens-btn"
-                      onClick={() =>
-                        handleInlineCommandSubmit(
-                          `Refactor and optimize the function around line ${cursorPos.line} in ${activeTab?.path}`
-                        )
-                      }
+                      onClick={() => triggerCodeLensAction('refactor')}
                     >
                       🛠️ Refactor
                     </button>
                     <button
                       type="button"
                       className="ag-codelens-btn"
-                      onClick={() =>
-                        handleInlineCommandSubmit(
-                          `Write unit/verification tests for the code around line ${cursorPos.line} in ${activeTab?.path}`
-                        )
-                      }
+                      onClick={() => triggerCodeLensAction('tests')}
                     >
                       🧪 Write Tests
                     </button>
@@ -6931,8 +8458,16 @@ export function App() {
                       <span>
                         ✨ <strong>Antigravity Inline Command</strong> —{' '}
                         <code>
-                          {activeTab?.path}:{cursorPos.line}
+                          {activeTab?.path}:
+                          {editorSelection.hasSelection &&
+                          editorSelection.startLine !== editorSelection.endLine
+                            ? `L${editorSelection.startLine}-L${editorSelection.endLine}`
+                            : `L${cursorPos.line}`}
+                          {editorSelection.hasSelection ? ' (selection)' : ''}
                         </code>
+                        <span style={{ marginLeft: 8, opacity: 0.75, fontSize: 11 }}>
+                          → same Agent tools as Composer
+                        </span>
                       </span>
                       <button
                         type="button"
@@ -6981,21 +8516,42 @@ export function App() {
                   } as React.CSSProperties
                 }
               >
-                {/* Synchronized Line Gutter with Active Line Highlight & Fold Chevrons */}
+                {/* Synchronized Line Gutter: line numbers + diagnostic / Diff marks */}
                 <div className="ag-line-gutter" ref={codeGutterRef}>
-                  {codeLines.map((lineText, idx) => {
+                  {codeLines.map((_lineText, idx) => {
                     const lineNumber = idx + 1;
                     const isActive = cursorPos.line === lineNumber;
-                    const isFoldable =
-                      /(\{\s*$|<\w+[^/>]*>\s*$)/.test(lineText.trim()) &&
-                      !lineText.trim().startsWith('//');
+                    const diffKind = pendingDiffMarks.get(lineNumber);
+                    const problemTip = problemGutterLines.get(lineNumber);
+                    const problemSev = problemTip?.startsWith('error')
+                      ? 'error'
+                      : problemTip?.startsWith('warning')
+                        ? 'warning'
+                        : problemTip
+                          ? 'info'
+                          : '';
                     return (
                       <div
                         key={idx}
-                        className={`ag-gutter-row ${isActive ? 'active' : ''}`}
+                        className={`ag-gutter-row ${isActive ? 'active' : ''} ${
+                          diffKind === 'add'
+                            ? 'diff-add'
+                            : diffKind === 'mod'
+                              ? 'diff-mod'
+                              : ''
+                        } ${problemSev ? `diag-${problemSev}` : ''}`.trim()}
+                        title={
+                          problemTip
+                            ? problemTip
+                            : diffKind
+                              ? `Pending Agent Diff (${diffKind})`
+                              : undefined
+                        }
                       >
                         <span className="ag-gutter-num">{lineNumber}</span>
-                        <span className="ag-gutter-fold">{isFoldable ? '▾' : ''}</span>
+                        {problemSev ? (
+                          <span className={`ag-gutter-diag ${problemSev}`} aria-hidden />
+                        ) : null}
                       </div>
                     );
                   })}
@@ -7003,6 +8559,25 @@ export function App() {
 
                 {/* Live Syntax-Highlighted Code Layer + Transparent Editable Textarea */}
                 <div className="ag-code-stage">
+                  {pendingDiffForActive && (
+                    <div
+                      style={{
+                        position: 'absolute',
+                        top: 4,
+                        right: 8,
+                        zIndex: 3,
+                        fontSize: 11,
+                        background: 'rgba(210,153,34,0.18)',
+                        border: '1px solid #d29922',
+                        borderRadius: 4,
+                        padding: '2px 8px',
+                        color: '#d29922',
+                        pointerEvents: 'none',
+                      }}
+                    >
+                      Pending Diff · {pendingDiffMarks.size} changed line(s)
+                    </div>
+                  )}
                   <div
                     className="ag-code-highlight-layer"
                     ref={codeHighlightRef}
@@ -7012,7 +8587,8 @@ export function App() {
                       renderSyntaxHighlightedLine(
                         line,
                         idx,
-                        cursorPos.line === idx + 1
+                        cursorPos.line === idx + 1,
+                        pendingDiffMarks.get(idx + 1)
                       )
                     )}
                   </div>
@@ -7065,6 +8641,7 @@ export function App() {
                         )
                       );
                       triggerDebouncedGhostAutocomplete(val, selStart);
+                      if (activeTabPath) triggerDebouncedLiveDiagnostics(activeTabPath, val);
                     }}
                     onKeyUp={(e) => {
                       const target = e.currentTarget;
@@ -7074,6 +8651,7 @@ export function App() {
                         line: lines.length,
                         col: (lines[lines.length - 1]?.length ?? 0) + 1,
                       });
+                      syncEditorSelectionFromTextarea(target);
                       triggerDebouncedGhostAutocomplete(target.value, target.selectionStart);
                     }}
                     onClick={(e) => {
@@ -7084,15 +8662,45 @@ export function App() {
                         line: lines.length,
                         col: (lines[lines.length - 1]?.length ?? 0) + 1,
                       });
+                      syncEditorSelectionFromTextarea(target);
                       triggerDebouncedGhostAutocomplete(target.value, target.selectionStart);
+                    }}
+                    onSelect={(e) => {
+                      syncEditorSelectionFromTextarea(e.currentTarget);
+                    }}
+                    onMouseUp={(e) => {
+                      syncEditorSelectionFromTextarea(e.currentTarget);
                     }}
                   />
                 </div>
 
-                {/* Antigravity Right Minimap Rail */}
-                {ideSettings.editor?.minimap !== false && (
-                  <aside className="ag-minimap" aria-hidden="true">
-                    <div className="ag-minimap-viewport" />
+                {/* Optional Minimap — click a stripe to jump; off by default */}
+                {ideSettings.editor?.minimap === true && (
+                  <aside
+                    className="ag-minimap"
+                    title="Minimap — click to jump · toolbar Minimap to hide"
+                    onClick={(e) => {
+                      const rail = e.currentTarget;
+                      const rect = rail.getBoundingClientRect();
+                      const y = e.clientY - rect.top;
+                      const shown = Math.min(140, Math.max(1, codeLines.length));
+                      const ratio = Math.max(0, Math.min(1, y / Math.max(1, rect.height)));
+                      const targetLine = Math.max(1, Math.min(codeLines.length, Math.ceil(ratio * shown)));
+                      void openFileInTab(activeTabPath, true, true, targetLine);
+                    }}
+                  >
+                    <div
+                      className="ag-minimap-viewport"
+                      style={{
+                        top: `${Math.max(
+                          0,
+                          Math.min(
+                            88,
+                            ((cursorPos.line - 1) / Math.max(1, Math.min(140, codeLines.length))) * 100
+                          )
+                        )}%`,
+                      }}
+                    />
                     {codeLines.slice(0, 140).map((line, idx) => {
                       const indent = Math.min(24, (line.match(/^\s*/)?.[0]?.length ?? 0) * 1.5);
                       const len = Math.min(46, Math.max(4, line.trim().length * 0.75));
@@ -7144,7 +8752,10 @@ export function App() {
                   { id: 'terminal', label: 'Terminal' },
                   { id: 'audit', label: 'Security & Capability Audit' },
                   { id: 'output', label: `Runtime Output (${runtimeLogs.length})` },
-                  { id: 'problems', label: 'Problems (0)' },
+                  {
+                    id: 'problems',
+                    label: `Problems (${workspaceProblems.length})`,
+                  },
                 ].map((t) => (
                   <div
                     key={t.id}
@@ -7228,29 +8839,82 @@ export function App() {
             )}
 
             {activeBottomTab === 'problems' && (
-              <div
-                className="terminal-body"
-                style={{
-                  color: '#3fb950',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                }}
-              >
-                <span>✓ No TypeScript or workspace security policy violations detected.</span>
-                <button
-                  className="btn primary"
-                  style={{ padding: '4px 10px', fontSize: 11.5 }}
-                  onClick={() =>
-                    void handleSendPrompt(
-                      'Check all issues in the current project (code defects, build configs, and failing tests), directly apply fixes to the project files, and automatically build and run verification tests.',
-                      'auto'
-                    )
-                  }
-                >
-                  🛠️ Auto-Fix All Issues
-                </button>
+              <div className="terminal-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center' }}>
+                  <span style={{ color: workspaceProblems.length ? 'var(--warning, #d29922)' : '#3fb950' }}>
+                    {workspaceProblems.length
+                      ? `${workspaceProblems.length} issue(s) from build/terminal (Agent Outline / search — not a live LSP host)`
+                      : '✓ No build/compiler problems recorded yet. Run build/test in Terminal to populate.'}
+                  </span>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <button
+                      className="btn"
+                      style={{ padding: '4px 10px', fontSize: 11.5 }}
+                      onClick={() => {
+                        void fetch('/api/workspace/problems', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({ clear: true }),
+                        }).then(() => setWorkspaceProblems([]));
+                      }}
+                    >
+                      Clear
+                    </button>
+                    <button
+                      className="btn primary"
+                      style={{ padding: '4px 10px', fontSize: 11.5 }}
+                      onClick={() =>
+                        void handleSendPrompt(
+                          workspaceProblems.length
+                            ? `@problems Fix the listed Problems panel diagnostics in-place, then re-run verify/build.`
+                            : 'Check all issues in the current project (code defects, build configs, and failing tests), directly apply fixes to the project files, and automatically build and run verification tests.',
+                          'auto'
+                        )
+                      }
+                    >
+                      🛠️ Auto-Fix All Issues
+                    </button>
+                  </div>
+                </div>
+                <div style={{ overflowY: 'auto', flex: 1 }}>
+                  {workspaceProblems.map((p, idx) => (
+                    <div
+                      key={`${p.file}:${p.line}:${idx}`}
+                      style={{
+                        padding: '4px 2px',
+                        borderBottom: '1px solid var(--border)',
+                        cursor: 'pointer',
+                        fontSize: 12,
+                        display: 'flex',
+                        gap: 8,
+                      }}
+                      onClick={() => void openFileInTab(p.file, true, false, p.line)}
+                      title="Open file at diagnostic line"
+                    >
+                      <span
+                        style={{
+                          color:
+                            p.severity === 'error'
+                              ? '#f85149'
+                              : p.severity === 'warning'
+                                ? '#d29922'
+                                : '#8b949e',
+                          minWidth: 56,
+                          textTransform: 'uppercase',
+                          fontSize: 11,
+                        }}
+                      >
+                        {p.severity}
+                      </span>
+                      <span style={{ color: 'var(--accent-bright)' }}>
+                        {p.file}:{p.line}
+                        {p.column ? `:${p.column}` : ''}
+                      </span>
+                      <span style={{ color: 'var(--text-secondary)' }}>[{p.source}]</span>
+                      <span style={{ color: 'var(--text-primary)' }}>{p.message}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </section>
@@ -7275,7 +8939,17 @@ export function App() {
               >
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
                   <BrandMark size={14} radius={3} />
-                  <span>Agent</span>
+                  <span>{t('dock.composer')}</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                className={`ai-dock-tab ${aiTab === 'changes' ? 'active' : ''}`}
+                onClick={() => setAiTab('changes')}
+              >
+                <span>📝 {t('dock.changes')}</span>
+                <span className="ai-dock-count">
+                  {diffs.filter((d) => d.status === 'pending').length}
                 </span>
               </button>
               <button
@@ -7286,15 +8960,19 @@ export function App() {
                   void refreshArtifactsAndCustomizations();
                 }}
               >
-                <span>📑 Artifacts</span>
+                <span>📑 {t('dock.artifacts')}</span>
                 <span className="ai-dock-count">{artifactsList.length}</span>
               </button>
               <button
                 type="button"
                 className={`ai-dock-tab ${aiTab === 'sessions' ? 'active' : ''}`}
-                onClick={() => setAiTab('sessions')}
+                onClick={() => {
+                  setAiTab('sessions');
+                  void refreshSessionCheckpoints();
+                  void refreshAgentMemory();
+                }}
               >
-                <span>🕒 History</span>
+                <span>🕒 {t('dock.history')}</span>
                 <span className="ai-dock-count">{sessions.length}</span>
               </button>
             </div>
@@ -7316,7 +8994,292 @@ export function App() {
             </div>
           </div>
 
-          {aiTab === 'artifacts' ? (
+          {(composerSessionTabs.length > 0 || runningSessionIds.length > 0) && (
+            <div
+              style={{
+                display: 'flex',
+                gap: 4,
+                padding: '4px 8px',
+                borderBottom: '1px solid var(--border)',
+                overflowX: 'auto',
+                flexShrink: 0,
+              }}
+            >
+              {composerSessionTabs.map((sid) => {
+                const s = sessions.find((x) => x.sessionId === sid);
+                const running = runningSessionIds.includes(sid);
+                const active = sid === activeSessionId;
+                return (
+                  <button
+                    key={sid}
+                    type="button"
+                    className="btn"
+                    style={{
+                      padding: '2px 8px',
+                      fontSize: 10.5,
+                      whiteSpace: 'nowrap',
+                      borderColor: active ? 'var(--accent-bright)' : 'var(--border)',
+                      background: active ? 'var(--accent-soft)' : 'var(--bg-card)',
+                    }}
+                    title={s?.title || sid}
+                    onClick={() => {
+                      void selectAndResumeSession(sid);
+                      void refreshSessionCheckpoints(sid);
+                      setAiTab('composer');
+                    }}
+                  >
+                    {running ? '● ' : ''}
+                    {(s?.title || sid).slice(0, 18)}
+                  </button>
+                );
+              })}
+              {runningSessionIds.length > 1 && (
+                <span
+                  className="badge info"
+                  style={{ fontSize: 10, alignSelf: 'center' }}
+                  title="Multiple Composers running in parallel"
+                >
+                  ∥ {runningSessionIds.length}
+                </span>
+              )}
+            </div>
+          )}
+
+          {aiTab === 'changes' ? (
+            <div className="ai-messages-stream">
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 8,
+                  marginBottom: 8,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <span style={{ fontSize: 12, fontWeight: 700 }}>
+                  Multi-file Changes (
+                  {diffs.filter((d) => d.status === 'pending').length} pending / {diffs.length} total)
+                </span>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: '3px 8px', fontSize: 11 }}
+                    title="Open next pending Diff file"
+                    onClick={() => {
+                      const pending = diffs.filter((d) => d.status === 'pending');
+                      if (pending.length === 0) {
+                        setStatusNotice('No pending Diff files');
+                        return;
+                      }
+                      const idx = pending.findIndex(
+                        (d) =>
+                          d.filePath.replace(/\\/g, '/') ===
+                          String(activeTabPath || '').replace(/\\/g, '/')
+                      );
+                      const next = pending[(idx + 1) % pending.length];
+                      void openFileInTab(next.filePath, true, true);
+                      setStatusNotice(
+                        `Next Diff file (${((idx + 1) % pending.length) + 1}/${pending.length}): ${next.filePath}`
+                      );
+                    }}
+                  >
+                    Next File →
+                  </button>
+                  <button
+                    type="button"
+                    className="btn success"
+                    style={{ padding: '3px 8px', fontSize: 11 }}
+                    onClick={() => void handleReviewAllPending('accept')}
+                  >
+                    Accept All
+                  </button>
+                  <button
+                    type="button"
+                    className="btn danger"
+                    style={{ padding: '3px 8px', fontSize: 11 }}
+                    onClick={() => void handleReviewAllPending('reject')}
+                  >
+                    Reject All
+                  </button>
+                </div>
+              </div>
+              {diffs.length === 0 ? (
+                <div className="ai-empty-state">
+                  <div className="ai-empty-title">No Agent Diffs Yet</div>
+                  <div className="ai-empty-desc">
+                    When the Agent proposes file edits, they appear here for Accept / Reject — Stop keeps
+                    pending diffs for review.
+                  </div>
+                </div>
+              ) : (
+                diffs.map((d) => (
+                  <div key={d.diffId} className="chat-bubble assistant">
+                    <div className="chat-bubble-header">
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <span
+                          className={`badge ${
+                            d.status === 'accepted'
+                              ? 'success'
+                              : d.status === 'rejected'
+                                ? 'danger'
+                                : 'warning'
+                          }`}
+                        >
+                          {String(d.status || 'pending').toUpperCase()}
+                        </span>
+                        <strong style={{ fontSize: 12 }}>{d.filePath}</strong>
+                        <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                          {d.operation}
+                          {d.appliedToDisk ? ' · on disk' : ' · review-before-write'}
+                        </span>
+                      </div>
+                    </div>
+                    {(() => {
+                      const hunks =
+                        d.status === 'pending' ? getDiffHunks(d) : [];
+                      const decisions =
+                        hunkDecisions[d.diffId] &&
+                        hunkDecisions[d.diffId].length === hunks.length
+                          ? hunkDecisions[d.diffId]
+                          : hunks.map(() => 'pending' as const);
+                      return (
+                        <>
+                          {hunks.length > 0 ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
+                              {hunks.map((h) => {
+                                const decision = decisions[h.index] || 'pending';
+                                return (
+                                  <div
+                                    key={`${d.diffId}-h${h.index}`}
+                                    style={{
+                                      border: '1px solid var(--border)',
+                                      borderRadius: 6,
+                                      padding: 8,
+                                      background: 'var(--bg-elevated)',
+                                      opacity: decision === 'pending' ? 1 : 0.65,
+                                    }}
+                                  >
+                                    <div
+                                      style={{
+                                        display: 'flex',
+                                        justifyContent: 'space-between',
+                                        gap: 8,
+                                        marginBottom: 4,
+                                        fontSize: 11,
+                                      }}
+                                    >
+                                      <code>{h.header}</code>
+                                      <span className={`badge ${decision === 'accepted' ? 'success' : decision === 'rejected' ? 'danger' : 'warning'}`}>
+                                        {decision}
+                                      </span>
+                                    </div>
+                                    <pre
+                                      style={{
+                                        fontSize: 10.5,
+                                        maxHeight: 72,
+                                        overflow: 'auto',
+                                        whiteSpace: 'pre-wrap',
+                                        margin: 0,
+                                        color: 'var(--text-secondary)',
+                                      }}
+                                    >
+                                      {h.preview}
+                                    </pre>
+                                    <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                                      <button
+                                        type="button"
+                                        className="btn"
+                                        style={{ padding: '2px 7px', fontSize: 10.5 }}
+                                        onClick={() => jumpToDiffHunk(d, h.index)}
+                                      >
+                                        Jump →
+                                      </button>
+                                      {decision === 'pending' && (
+                                        <>
+                                          <button
+                                            type="button"
+                                            className="btn success"
+                                            style={{ padding: '2px 7px', fontSize: 10.5 }}
+                                            onClick={() => void handleHunkDecision(d, h.index, 'accepted')}
+                                          >
+                                            Accept Hunk
+                                          </button>
+                                          <button
+                                            type="button"
+                                            className="btn danger"
+                                            style={{ padding: '2px 7px', fontSize: 10.5 }}
+                                            onClick={() => void handleHunkDecision(d, h.index, 'rejected')}
+                                          >
+                                            Reject Hunk
+                                          </button>
+                                        </>
+                                      )}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ) : (
+                            <pre
+                              style={{
+                                fontSize: 11,
+                                maxHeight: 120,
+                                overflow: 'auto',
+                                whiteSpace: 'pre-wrap',
+                                color: 'var(--text-secondary)',
+                              }}
+                            >
+                              {String(d.unifiedDiff || '').slice(0, 900)}
+                            </pre>
+                          )}
+                        </>
+                      );
+                    })()}
+                    <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="btn"
+                        style={{ padding: '3px 8px', fontSize: 11 }}
+                        onClick={() => openDiffInTab(d)}
+                      >
+                        Open Diff
+                      </button>
+                      {d.status === 'pending' && (
+                        <>
+                          <button
+                            type="button"
+                            className="btn success"
+                            style={{ padding: '3px 8px', fontSize: 11 }}
+                            onClick={() => void handleDiffReview(d.diffId, 'accept', d.sessionId)}
+                          >
+                            Accept File
+                          </button>
+                          <button
+                            type="button"
+                            className="btn danger"
+                            style={{ padding: '3px 8px', fontSize: 11 }}
+                            onClick={() => void handleDiffReview(d.diffId, 'reject', d.sessionId)}
+                          >
+                            Reject File
+                          </button>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: '3px 8px', fontSize: 11 }}
+                            onClick={() => void handleDiffReview(d.diffId, 'revise', d.sessionId)}
+                          >
+                            Revise
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          ) : aiTab === 'artifacts' ? (
             <div className="ai-messages-stream">
               <div
                 style={{
@@ -7362,20 +9325,41 @@ export function App() {
                         </span>
                         <strong>{art.title}</strong>
                       </div>
-                      {art.artifactType === 'plan' && (
+                      {(art.artifactType === 'plan' ||
+                        art.artifactType === 'task_list' ||
+                        art.artifactType === 'report') && (
                         <button
                           type="button"
                           className="btn success"
                           style={{ padding: '3px 9px', fontSize: 11 }}
                           onClick={() => {
+                            const kind =
+                              art.artifactType === 'task_list'
+                                ? 'Task List'
+                                : art.artifactType === 'report'
+                                  ? 'Report'
+                                  : 'Implementation Plan';
+                            setExecutionMode('auto');
+                            setManualIntentChoice('auto-action');
                             setAiTab('composer');
+                            setShowRightAiDock(true);
                             void handleSendPrompt(
-                              `Execute the approved Implementation Plan "${art.title}" step by step, apply the code changes via edit_file/write_file, and run build & verification tests:\n\n${art.content}`,
+                              `[FORCE_AUTO_ACTION] Execute the approved ${kind} "${art.title}" end-to-end.\n` +
+                                `1) Sync steps into manage_todo (mark in_progress/completed as you go).\n` +
+                                `2) Prefer apply_patch for surgical edits; use edit_file/write_file when needed.\n` +
+                                `3) After edits, run build/verify and self-heal failures.\n` +
+                                `4) Do not stop at analysis — land the code changes.\n\n` +
+                                `${String(art.content || '').slice(0, 12000)}`,
                               'auto'
                             );
                           }}
                         >
-                          ▶ Proceed & Execute Plan
+                          ▶{' '}
+                          {art.artifactType === 'task_list'
+                            ? 'Execute Tasks'
+                            : art.artifactType === 'report'
+                              ? 'Act on Report'
+                              : 'Proceed & Execute Plan'}
                         </button>
                       )}
                     </div>
@@ -7388,6 +9372,25 @@ export function App() {
             </div>
           ) : aiTab === 'sessions' ? (
             <div className="ai-messages-stream">
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                <span style={{ fontSize: 12, fontWeight: 700 }}>Sessions</span>
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ padding: '3px 8px', fontSize: 11 }}
+                  onClick={() =>
+                    activeSessionId &&
+                    void bridge
+                      .request('session.checkpoint.create', {
+                        sessionId: activeSessionId,
+                        label: 'Manual checkpoint',
+                      }, activeSessionId)
+                      .then(() => refreshSessionCheckpoints(activeSessionId))
+                  }
+                >
+                  + Checkpoint Now
+                </button>
+              </div>
               {sessions.map((s) => (
                 <div
                   key={s.sessionId}
@@ -7399,10 +9402,14 @@ export function App() {
                   }}
                   onClick={() => {
                     void selectAndResumeSession(s.sessionId);
+                    void refreshSessionCheckpoints(s.sessionId);
                     setAiTab('composer');
                   }}
                 >
-                  <div style={{ fontWeight: 700, marginBottom: 4 }}>{s.title}</div>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                    {runningSessionIds.includes(s.sessionId) ? '● ' : ''}
+                    {s.title}
+                  </div>
                   <div
                     style={{
                       display: 'flex',
@@ -7411,14 +9418,263 @@ export function App() {
                       color: '#8b949e',
                     }}
                   >
-                    <span>Status: {s.status}</span>
+                    <span>
+                      Status:{' '}
+                      {runningSessionIds.includes(s.sessionId) ? 'running (parallel)' : s.status}
+                    </span>
                     <span>Mode: {s.executionMode}</span>
                   </div>
                 </div>
               ))}
+              <div
+                style={{
+                  marginTop: 14,
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                }}
+              >
+                <span style={{ fontSize: 12, fontWeight: 700 }}>
+                  Cross-session Memory ({agentMemoryEntries.length})
+                </span>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: '2px 7px', fontSize: 10.5 }}
+                    onClick={() => void refreshAgentMemory()}
+                  >
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="btn danger"
+                    style={{ padding: '2px 7px', fontSize: 10.5 }}
+                    onClick={() =>
+                      void fetch('/api/agent-memory', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ clear: true }),
+                      }).then(() => {
+                        setAgentMemoryEntries([]);
+                        setStatusNotice('Agent memory cleared');
+                      })
+                    }
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
+                Digests from <code>/compact</code> and checkpoints inject into new Agent turns.
+              </div>
+              {agentMemoryEntries.length === 0 ? (
+                <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 6 }}>
+                  No memory yet. Run <code>/compact</code> or create a checkpoint.
+                </div>
+              ) : (
+                agentMemoryEntries.slice(0, 8).map((m) => (
+                  <div key={m.id} className="chat-bubble" style={{ marginTop: 6 }}>
+                    <div style={{ fontWeight: 600, fontSize: 12 }}>
+                      {m.title}{' '}
+                      <span className="badge info" style={{ fontSize: 9 }}>
+                        {m.source}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
+                      {m.summary.slice(0, 280)}
+                      {m.summary.length > 280 ? '…' : ''}
+                    </div>
+                  </div>
+                ))
+              )}
+              <div style={{ marginTop: 12, fontSize: 12, fontWeight: 700 }}>
+                Checkpoints ({sessionCheckpoints.length})
+              </div>
+              {sessionCheckpoints.length === 0 ? (
+                <div style={{ fontSize: 11.5, color: 'var(--text-secondary)', marginTop: 6 }}>
+                  Checkpoints are created after Agent file edits. Restore rolls files back to the
+                  captured baseline.
+                </div>
+              ) : (
+                sessionCheckpoints.map((ck) => (
+                  <div key={ck.checkpointId} className="chat-bubble" style={{ marginTop: 6 }}>
+                    <div style={{ fontWeight: 600, fontSize: 12 }}>{ck.label}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                      {ck.createdAt} · {ck.files?.length || 0} files
+                    </div>
+                    <button
+                      type="button"
+                      className="btn danger"
+                      style={{ padding: '3px 8px', fontSize: 11, marginTop: 6 }}
+                      onClick={() =>
+                        activeSessionId &&
+                        void bridge
+                          .request(
+                            'session.checkpoint.restore',
+                            { sessionId: activeSessionId, checkpointId: ck.checkpointId },
+                            activeSessionId
+                          )
+                          .then(async (r: any) => {
+                            await refreshWorkspaceTree();
+                            setStatusNotice(
+                              `Restored checkpoint (${r?.restored ?? 0} files, deleted ${r?.deleted ?? 0})`
+                            );
+                            setAiTab('changes');
+                          })
+                      }
+                    >
+                      Restore
+                    </button>
+                  </div>
+                ))
+              )}
             </div>
           ) : (
             <>
+              {sessionCheckpoints.length > 0 && (
+                <div
+                  style={{
+                    borderBottom: '1px solid var(--border)',
+                    padding: '6px 10px',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 4,
+                    background: 'var(--bg-elevated)',
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      fontSize: 11,
+                      fontWeight: 700,
+                    }}
+                  >
+                    <span>Checkpoint timeline</span>
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ padding: '1px 6px', fontSize: 10 }}
+                      onClick={() => activeSessionId && void refreshSessionCheckpoints(activeSessionId)}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, overflowX: 'auto', paddingBottom: 2 }}>
+                    {sessionCheckpoints.slice(0, 12).map((ck) => (
+                      <div
+                        key={ck.checkpointId}
+                        style={{
+                          minWidth: 150,
+                          border: `1px solid ${
+                            checkpointPreviewId === ck.checkpointId
+                              ? 'var(--accent-bright)'
+                              : 'var(--border)'
+                          }`,
+                          borderRadius: 6,
+                          padding: '5px 7px',
+                          background: 'var(--bg)',
+                        }}
+                      >
+                        <div style={{ fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap' }}>
+                          {(ck.label || ck.checkpointId).slice(0, 28)}
+                        </div>
+                        <div style={{ fontSize: 10, color: 'var(--text-secondary)' }}>
+                          {(ck.files?.length || 0)} files
+                        </div>
+                        <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: '1px 5px', fontSize: 10 }}
+                            onClick={() => {
+                              setCheckpointPreviewId((id) => {
+                                const next = id === ck.checkpointId ? '' : ck.checkpointId;
+                                if (next) void loadCheckpointPreviewDiffs(ck);
+                                else setCheckpointPreviewDiffs([]);
+                                return next;
+                              });
+                            }}
+                          >
+                            Preview
+                          </button>
+                          <button
+                            type="button"
+                            className="btn danger"
+                            style={{ padding: '1px 5px', fontSize: 10 }}
+                            onClick={() =>
+                              activeSessionId &&
+                              void bridge
+                                .request(
+                                  'session.checkpoint.restore',
+                                  {
+                                    sessionId: activeSessionId,
+                                    checkpointId: ck.checkpointId,
+                                  },
+                                  activeSessionId
+                                )
+                                .then(async (r: any) => {
+                                  await refreshWorkspaceTree();
+                                  await refreshGitStatus();
+                                  setStatusNotice(
+                                    `Restored checkpoint (${r?.restored ?? 0} files, deleted ${r?.deleted ?? 0})`
+                                  );
+                                  setAiTab('changes');
+                                })
+                            }
+                          >
+                            Restore
+                          </button>
+                        </div>
+                        {checkpointPreviewId === ck.checkpointId && (
+                          <div
+                            style={{
+                              marginTop: 4,
+                              fontSize: 10,
+                              color: 'var(--text-secondary)',
+                              maxHeight: 160,
+                              overflow: 'auto',
+                            }}
+                          >
+                            {checkpointPreviewDiffs.length === 0 ? (
+                              <div>
+                                {(ck.files || [])
+                                  .slice(0, 8)
+                                  .map((f: any) => String(f.path || f.filePath || f))
+                                  .join('\n') || '(loading content diff…)'}
+                              </div>
+                            ) : (
+                              checkpointPreviewDiffs.map((d) => (
+                                <div key={d.path} style={{ marginBottom: 6 }}>
+                                  <div style={{ fontWeight: 600 }}>
+                                    {d.path} · {d.summary}
+                                  </div>
+                                  <pre
+                                    style={{
+                                      margin: '2px 0 0',
+                                      whiteSpace: 'pre-wrap',
+                                      fontSize: 9.5,
+                                      maxHeight: 72,
+                                      overflow: 'auto',
+                                      background: 'var(--bg-elevated)',
+                                      padding: 4,
+                                      borderRadius: 4,
+                                    }}
+                                  >
+                                    {d.preview}
+                                  </pre>
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="ai-messages-stream">
                 {messages.length === 0 && !isSendingPrompt && !streamingText && (
                   <div className="ai-empty-state">
@@ -7589,7 +9845,13 @@ export function App() {
                       {completedSteps > 0 && (
                         <div
                           className="progress-summary-pill"
-                          style={{ marginTop: 0, marginBottom: 8 }}
+                          style={{
+                            marginTop: 0,
+                            marginBottom: 8,
+                            flexWrap: 'wrap',
+                            alignItems: 'flex-start',
+                            gap: 6,
+                          }}
                         >
                           <span style={{ color: '#4ade80', fontWeight: 600 }}>
                             ✓ Completed {completedSteps} file/tool action(s)
@@ -7606,6 +9868,39 @@ export function App() {
                           >
                             {stepSummaryText}
                           </span>
+                          {/* Stage V: chat tool cards → Diff hunk Jump (beyond live chips) */}
+                          <div
+                            style={{
+                              display: 'flex',
+                              flexWrap: 'wrap',
+                              gap: 4,
+                              width: '100%',
+                              marginTop: 2,
+                            }}
+                          >
+                            {(m.toolCalls || [])
+                              .filter((tc: any) =>
+                                /edit_file|write_file|apply_patch|editor|reveal-diff/i.test(
+                                  String(tc?.toolName || '')
+                                )
+                              )
+                              .map((tc: any, ti: number) => {
+                                const diff = findPendingDiffForTool(tc);
+                                if (!diff) return null;
+                                return (
+                                  <button
+                                    key={`${m.id}-jump-${tc.toolCallId || ti}`}
+                                    type="button"
+                                    className="btn"
+                                    style={{ padding: '1px 6px', fontSize: 10 }}
+                                    title={`Jump to Diff hunk · ${diff.filePath}`}
+                                    onClick={() => jumpToDiffHunk(diff, 0)}
+                                  >
+                                    ↗ {formatToolStepLabel(tc)}
+                                  </button>
+                                );
+                              })}
+                          </div>
                         </div>
                       )}
 
@@ -7688,6 +9983,42 @@ export function App() {
                         }}
                       />
                     </div>
+                    {liveToolCalls.length > 0 && (
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          gap: 4,
+                          marginTop: 8,
+                          maxHeight: 72,
+                          overflow: 'auto',
+                        }}
+                      >
+                        {liveToolCalls
+                          .filter((tc) =>
+                            /edit_file|write_file|apply_patch|editor/i.test(
+                              String(tc.toolName || '')
+                            )
+                          )
+                          .slice(-6)
+                          .map((tc) => {
+                            const diff = findPendingDiffForTool(tc);
+                            if (!diff) return null;
+                            return (
+                              <button
+                                key={tc.toolCallId || diff.diffId}
+                                type="button"
+                                className="btn"
+                                style={{ padding: '1px 6px', fontSize: 10 }}
+                                title={`Open Diff hunk for ${diff.filePath}`}
+                                onClick={() => jumpToDiffHunk(diff, 0)}
+                              >
+                                ↗ {formatToolStepLabel(tc)}
+                              </button>
+                            );
+                          })}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -7822,7 +10153,7 @@ export function App() {
 
                         <span
                           className="intent-mode-chip"
-                          title="Attach @ Context (@git, @terminal, @rules, @file)"
+                          title="Attach @ Context (@git, @terminal, @rules, @file, @code, @tabs)"
                           style={{
                             background: 'var(--bg-card)',
                             border: '1px solid var(--border)',
@@ -7837,16 +10168,97 @@ export function App() {
                           <span>@</span>
                           <span>Context</span>
                         </span>
+
+                        <span
+                          className="intent-mode-chip"
+                          title="Pin current editor selection as @code"
+                          style={{
+                            background: 'var(--bg-card)',
+                            border: '1px solid var(--border)',
+                            color: 'var(--text-secondary)',
+                          }}
+                          onClick={() => {
+                            if (!editorSelection.hasSelection) {
+                              setStatusNotice('Select code in the editor first');
+                              return;
+                            }
+                            addContextChip({
+                              kind: 'code',
+                              label: `Selection L${editorSelection.startLine}-L${editorSelection.endLine}`,
+                              value: '@code',
+                            });
+                          }}
+                        >
+                          <span>{'</>'}</span>
+                          <span>@code</span>
+                        </span>
+
+                        <span
+                          className="intent-mode-chip"
+                          title="Pin open tabs as @tabs"
+                          style={{
+                            background: 'var(--bg-card)',
+                            border: '1px solid var(--border)',
+                            color: 'var(--text-secondary)',
+                          }}
+                          onClick={() =>
+                            addContextChip({
+                              kind: 'tabs',
+                              label: `Tabs (${tabs.filter((t) => t.kind === 'code').length})`,
+                              value: '@tabs',
+                            })
+                          }
+                        >
+                          <span>🗂</span>
+                          <span>@tabs</span>
+                        </span>
                       </>
                     );
                   })()}
                 </div>
 
+                {contextChips.length > 0 && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      gap: 6,
+                      padding: '0 2px 8px',
+                    }}
+                  >
+                    {contextChips.map((chip) => (
+                      <span
+                        key={chip.id}
+                        className="badge"
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: 4,
+                          cursor: 'default',
+                        }}
+                        title={chip.value}
+                      >
+                        {chip.label}
+                        <button
+                          type="button"
+                          className="icon-btn"
+                          style={{ padding: '0 4px', fontSize: 11 }}
+                          onClick={() =>
+                            setContextChips((prev) => prev.filter((c) => c.id !== chip.id))
+                          }
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
                 {/* Antigravity Interactive / Slash Commands & @ Context Mentions Popup */}
                 {(() => {
                   const trimmedStart = promptInput.trimStart();
                   const slashMatch = trimmedStart.match(/^\/([a-zA-Z0-9_-]*)$/);
-                  const mentionMatch = promptInput.match(/(?:^|\s)@([a-zA-Z0-9_./\\-]*)$/);
+                  const mentionMatch = promptInput.match(/(?:^|\s)@([a-zA-Z0-9_./\\:-]*)$/);
 
                   if (slashMatch) {
                     const q = slashMatch[1].toLowerCase();
@@ -7914,36 +10326,136 @@ export function App() {
 
                   if (mentionMatch) {
                     const q = mentionMatch[1].toLowerCase();
+                    const qSymbol = q.replace(/^symbol:/, '');
                     const builtinMentions = [
-                      { tag: '@git', desc: 'Attach Git working tree status & diff' },
-                      { tag: '@terminal', desc: 'Attach recent terminal command output' },
-                      { tag: '@rules', desc: 'Attach workspace .agents/rules & AGENTS.md' },
-                      { tag: '@problems', desc: 'Attach workspace compiler/linter diagnostics' },
+                      { tag: '@git', desc: 'Attach Git working tree status & diff', kind: 'builtin' },
+                      { tag: '@terminal', desc: 'Attach recent terminal command output', kind: 'builtin' },
+                      { tag: '@rules', desc: 'Attach workspace .agents/rules & AGENTS.md', kind: 'builtin' },
+                      { tag: '@problems', desc: 'Attach workspace compiler/linter diagnostics', kind: 'builtin' },
+                      { tag: '@codebase', desc: 'Semantic/hybrid retrieval across the workspace', kind: 'builtin' },
+                      { tag: '@docs', desc: 'Attach README / docs / USER-GUIDE markdown', kind: 'builtin' },
+                      { tag: '@web', desc: 'Fetch a URL (@web https://…)', kind: 'builtin' },
+                      { tag: '@skill', desc: 'Expand workspace Skill bodies on demand', kind: 'builtin' },
+                      { tag: '@symbol', desc: 'Pick a symbol from the active file outline', kind: 'builtin' },
+                      { tag: '@code', desc: 'Attach current editor selection', kind: 'code' },
+                      { tag: '@tabs', desc: 'Attach open editor tabs', kind: 'tabs' },
+                      { tag: '@folder/src', desc: 'Attach folder listing (edit path after insert)', kind: 'folder' },
                     ];
+                    const recentTabMentions = tabs
+                      .filter((t) => t.kind === 'code' && t.path)
+                      .slice(0, 8)
+                      .map((t) => ({
+                        tag: `@${t.path.replace(/\\/g, '/')}`,
+                        desc: `Recent tab · ${t.name}`,
+                        kind: 'file' as const,
+                      }));
                     const fileMentions = files
                       .filter((f) => f.toLowerCase().includes(q))
-                      .slice(0, 6)
-                      .map((f) => ({ tag: `@${f}`, desc: 'Workspace file' }));
+                      .slice(0, 12)
+                      .map((f) => ({ tag: `@${f}`, desc: 'Workspace file', kind: 'file' as const }));
+                    const skillMentions = (workspaceCustomizations.skills || [])
+                      .filter(
+                        (s) =>
+                          !q ||
+                          q.startsWith('skill') ||
+                          s.name.toLowerCase().includes(q.replace(/^skill:/, ''))
+                      )
+                      .slice(0, 8)
+                      .map((s) => ({
+                        tag: `@skill:${s.name}`,
+                        desc: s.description || 'Workspace skill',
+                        kind: 'builtin' as const,
+                      }));
+                    const symbolMentions = composerSymbols
+                      .filter(
+                        (s) =>
+                          !q ||
+                          q.startsWith('symbol') ||
+                          s.name.toLowerCase().includes(qSymbol) ||
+                          s.kind.toLowerCase().includes(qSymbol)
+                      )
+                      .slice(0, 16)
+                      .map((s) => ({
+                        tag: `@symbol:${s.name}`,
+                        desc: `${s.kind} · ${s.filePath}:L${s.startLine}-L${s.endLine}`,
+                        kind: 'symbol' as const,
+                        value: `${s.filePath}#${s.name}`,
+                      }));
+                    const seen = new Set<string>();
                     const allMentions = [
-                      ...builtinMentions.filter((m) => m.tag.slice(1).includes(q)),
+                      ...builtinMentions.filter((m) => m.tag.slice(1).toLowerCase().includes(q)),
+                      ...skillMentions,
+                      ...symbolMentions,
+                      ...recentTabMentions.filter((m) => m.tag.slice(1).toLowerCase().includes(q)),
                       ...fileMentions,
-                    ];
+                    ].filter((m) => {
+                      if (seen.has(m.tag)) return false;
+                      seen.add(m.tag);
+                      return true;
+                    });
+
+                    const applyMention = (item: {
+                      tag: string;
+                      kind: string;
+                      value?: string;
+                    }) => {
+                      setPromptInput((prev) =>
+                        prev.replace(/@([a-zA-Z0-9_./\\:-]*)$/, `${item.tag} `)
+                      );
+                      if (item.kind === 'file') {
+                        addContextChip({
+                          kind: 'file',
+                          label: item.tag.slice(1),
+                          value: item.tag.slice(1),
+                        });
+                      } else if (item.kind === 'folder') {
+                        addContextChip({
+                          kind: 'folder',
+                          label: item.tag,
+                          value: item.tag.replace(/^@folder\//, ''),
+                        });
+                      } else if (item.kind === 'symbol') {
+                        addContextChip({
+                          kind: 'symbol',
+                          label: item.tag,
+                          value: item.value || item.tag.replace(/^@symbol:/, ''),
+                        });
+                      } else if (item.tag === '@symbol') {
+                        // Keep @symbol: prefix so the user can continue filtering
+                        setPromptInput((prev) =>
+                          prev.replace(/@([a-zA-Z0-9_./\\:-]*)$/, '@symbol:')
+                        );
+                        return;
+                      } else {
+                        addContextChip({
+                          kind: item.kind,
+                          label: item.tag,
+                          value: item.tag,
+                        });
+                      }
+                      setMentionActiveIndex(0);
+                    };
 
                     if (allMentions.length > 0) {
+                      const active = Math.min(
+                        Math.max(0, mentionActiveIndex),
+                        allMentions.length - 1
+                      );
                       return (
                         <div className="ag-composer-popup">
                           <div className="ag-composer-popup-title">
-                            Antigravity @ Context Mentions
+                            @ Context · ↑↓ Enter · Esc
                           </div>
-                          {allMentions.map((item) => (
+                          {allMentions.map((item, idx) => (
                             <div
                               key={item.tag}
                               className="ag-composer-popup-item"
-                              onClick={() => {
-                                setPromptInput((prev) =>
-                                  prev.replace(/@([a-zA-Z0-9_./\\-]*)$/, `${item.tag} `)
-                                );
+                              style={{
+                                background:
+                                  idx === active ? 'var(--bg-hover, rgba(96,165,250,0.12))' : undefined,
                               }}
+                              onMouseEnter={() => setMentionActiveIndex(idx)}
+                              onClick={() => applyMention(item)}
                             >
                               <code>{item.tag}</code>
                               <span>{item.desc}</span>
@@ -7959,15 +10471,188 @@ export function App() {
 
                 <textarea
                   className="composer-textarea"
-                  placeholder="Type / for workflows (/plan, /goal, /fix), @ to attach context (@git, @terminal, @file), or ask anything..."
+                  placeholder={t('composer.placeholder')}
                   value={promptInput}
                   onChange={(e) => {
                     if (manualIntentChoice === 'build-fix') {
                       setManualIntentChoice(null);
                     }
                     setPromptInput(e.target.value);
+                    setMentionActiveIndex(0);
                   }}
                   onKeyDown={(e) => {
+                    const mentionMatch = promptInput.match(/(?:^|\s)@([a-zA-Z0-9_./\\:-]*)$/);
+                    if (mentionMatch) {
+                      const q = mentionMatch[1].toLowerCase();
+                      const qSymbol = q.replace(/^symbol:/, '');
+                      const builtins = [
+                        '@git',
+                        '@terminal',
+                        '@rules',
+                        '@problems',
+                        '@codebase',
+                        '@docs',
+                        '@web',
+                        '@skill',
+                        '@symbol',
+                        '@code',
+                        '@tabs',
+                        '@folder/src',
+                      ];
+                      const symbolCount = composerSymbols.filter(
+                        (s) =>
+                          !q ||
+                          q.startsWith('symbol') ||
+                          s.name.toLowerCase().includes(qSymbol)
+                      ).length;
+                      const count =
+                        builtins.filter((t) => t.slice(1).includes(q)).length +
+                        Math.min(16, symbolCount) +
+                        Math.min(
+                          12,
+                          files.filter((f) => f.toLowerCase().includes(q)).length
+                        ) +
+                        tabs.filter(
+                          (t) =>
+                            t.kind === 'code' &&
+                            t.path &&
+                            t.path.toLowerCase().includes(q)
+                        ).length;
+                      if (count > 0) {
+                        if (e.key === 'ArrowDown') {
+                          e.preventDefault();
+                          setMentionActiveIndex((i) => i + 1);
+                          return;
+                        }
+                        if (e.key === 'ArrowUp') {
+                          e.preventDefault();
+                          setMentionActiveIndex((i) => Math.max(0, i - 1));
+                          return;
+                        }
+                        if (e.key === 'Escape') {
+                          e.preventDefault();
+                          setPromptInput((prev) => prev.replace(/@([a-zA-Z0-9_./\\:-]*)$/, ''));
+                          setMentionActiveIndex(0);
+                          return;
+                        }
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          // Trigger click on active item via re-using popup selection:
+                          // synthesize by finding the same list order as the popup.
+                          const builtinMentions = [
+                            { tag: '@git', kind: 'builtin' },
+                            { tag: '@terminal', kind: 'builtin' },
+                            { tag: '@rules', kind: 'builtin' },
+                            { tag: '@problems', kind: 'builtin' },
+                            { tag: '@codebase', kind: 'builtin' },
+                            { tag: '@docs', kind: 'builtin' },
+                            { tag: '@web', kind: 'builtin' },
+                            { tag: '@skill', kind: 'builtin' },
+                            { tag: '@symbol', kind: 'builtin' },
+                            { tag: '@code', kind: 'code' },
+                            { tag: '@tabs', kind: 'tabs' },
+                            { tag: '@folder/src', kind: 'folder' },
+                          ];
+                          const recentTabMentions = tabs
+                            .filter((t) => t.kind === 'code' && t.path)
+                            .slice(0, 8)
+                            .map((t) => ({
+                              tag: `@${t.path.replace(/\\/g, '/')}`,
+                              kind: 'file' as const,
+                            }));
+                          const fileMentions = files
+                            .filter((f) => f.toLowerCase().includes(q))
+                            .slice(0, 12)
+                            .map((f) => ({ tag: `@${f}`, kind: 'file' as const }));
+                          const skillMentions = (workspaceCustomizations.skills || [])
+                            .filter(
+                              (s) =>
+                                !q ||
+                                q.startsWith('skill') ||
+                                s.name.toLowerCase().includes(q.replace(/^skill:/, ''))
+                            )
+                            .slice(0, 8)
+                            .map((s) => ({
+                              tag: `@skill:${s.name}`,
+                              kind: 'builtin' as const,
+                            }));
+                          const symbolMentions = composerSymbols
+                            .filter(
+                              (s) =>
+                                !q ||
+                                q.startsWith('symbol') ||
+                                s.name.toLowerCase().includes(qSymbol)
+                            )
+                            .slice(0, 16)
+                            .map((s) => ({
+                              tag: `@symbol:${s.name}`,
+                              kind: 'symbol' as const,
+                              value: `${s.filePath}#${s.name}`,
+                            }));
+                          const seen = new Set<string>();
+                          const allMentions = [
+                            ...builtinMentions.filter((m) =>
+                              m.tag.slice(1).toLowerCase().includes(q)
+                            ),
+                            ...skillMentions,
+                            ...symbolMentions,
+                            ...recentTabMentions.filter((m) =>
+                              m.tag.slice(1).toLowerCase().includes(q)
+                            ),
+                            ...fileMentions,
+                          ].filter((m) => {
+                            if (seen.has(m.tag)) return false;
+                            seen.add(m.tag);
+                            return true;
+                          });
+                          const item =
+                            allMentions[
+                              Math.min(Math.max(0, mentionActiveIndex), allMentions.length - 1)
+                            ];
+                          if (item) {
+                            if (item.tag === '@symbol') {
+                              setPromptInput((prev) =>
+                                prev.replace(/@([a-zA-Z0-9_./\\:-]*)$/, '@symbol:')
+                              );
+                              setMentionActiveIndex(0);
+                              return;
+                            }
+                            setPromptInput((prev) =>
+                              prev.replace(/@([a-zA-Z0-9_./\\:-]*)$/, `${item.tag} `)
+                            );
+                            if (item.kind === 'file') {
+                              addContextChip({
+                                kind: 'file',
+                                label: item.tag.slice(1),
+                                value: item.tag.slice(1),
+                              });
+                            } else if (item.kind === 'folder') {
+                              addContextChip({
+                                kind: 'folder',
+                                label: item.tag,
+                                value: item.tag.replace(/^@folder\//, ''),
+                              });
+                            } else if (item.kind === 'symbol') {
+                              addContextChip({
+                                kind: 'symbol',
+                                label: item.tag,
+                                value:
+                                  (item as { value?: string }).value ||
+                                  item.tag.replace(/^@symbol:/, ''),
+                              });
+                            } else {
+                              addContextChip({
+                                kind: item.kind,
+                                label: item.tag,
+                                value: item.tag,
+                              });
+                            }
+                            setMentionActiveIndex(0);
+                          }
+                          return;
+                        }
+                      }
+                    }
                     if (e.key === 'Enter' && !e.shiftKey) {
                       e.preventDefault();
                       void handleSendPrompt();
@@ -7982,38 +10667,75 @@ export function App() {
                       value={executionMode}
                       onChange={(e) => setExecutionMode(e.target.value as any)}
                     >
-                      <option value="auto">∞ Agent (Auto)</option>
-                      <option value="plan">📖 Plan (Read)</option>
-                      <option value="manual">🛡️ Manual</option>
+                      <option value="auto">∞ {t('composer.auto')}</option>
+                      <option value="plan">📖 {t('composer.plan')}</option>
+                      <option value="manual">🛡️ {t('composer.manual')}</option>
                     </select>
 
                     <select
                       className="composer-select model"
                       value={modelInput}
                       onChange={(e) => setModelInput(e.target.value)}
-                      title="AI Model Routing: deepseek-auto automatically routes file discovery & build turns to deepseek-chat and root-cause/self-heal turns to deepseek-reasoner"
+                      title="AI Model Routing: Auto / Force Fast / Force Reasoner"
                     >
-                      <option value="deepseek-auto">⚡ deepseek-auto (Smart Router)</option>
-                      <option value="deepseek-chat">deepseek-chat (Fast V3)</option>
-                      <option value="deepseek-reasoner">deepseek-reasoner (Reasoning R1)</option>
+                      <option value="deepseek-auto">⚡ Auto Router</option>
+                      <option value="deepseek-chat">Force Fast (chat)</option>
+                      <option value="deepseek-reasoner">Force Reasoner (R1)</option>
                       <option value="qwen2.5-coder:14b">qwen2.5-coder</option>
                       <option value="claude-3-7-sonnet-latest">claude-3.7-sonnet</option>
                     </select>
+                    {lastModelTier?.effectiveModelId && (
+                      <span
+                        className="badge info"
+                        title={lastModelTier.reason || ''}
+                        style={{ fontSize: 10 }}
+                      >
+                        {lastModelTier.tier}:{lastModelTier.effectiveModelId}
+                      </span>
+                    )}
+                    {goalTokenUsage && (
+                      <span
+                        className={`badge ${
+                          goalTokenUsage.tokensUsed / Math.max(1, goalTokenUsage.tokenBudget) > 0.85
+                            ? 'warning'
+                            : 'success'
+                        }`}
+                        title={`Goal tokens used ${goalTokenUsage.tokensUsed.toLocaleString()} / budget ${goalTokenUsage.tokenBudget.toLocaleString()} (remaining ${goalTokenUsage.remaining.toLocaleString()})`}
+                        style={{ fontSize: 10 }}
+                      >
+                        tok {formatCompactTokens(goalTokenUsage.tokensUsed)}/
+                        {formatCompactTokens(goalTokenUsage.tokenBudget)}
+                      </span>
+                    )}
                   </div>
 
                   <div className="composer-controls-right">
-                    <button
-                      className="btn danger"
-                      onClick={() => activeSessionId && void bridge.cancelSession(activeSessionId)}
-                    >
-                      Stop
+                    <button className="btn danger" onClick={() => void handleStopAgent()}>
+                      {t('composer.stop')}
                     </button>
                     <button
                       className="btn primary"
-                      disabled={isSendingPrompt || !promptInput.trim()}
+                      disabled={!promptInput.trim()}
                       onClick={() => void handleSendPrompt()}
+                      title={
+                        isSendingPrompt ||
+                        (activeSessionId
+                          ? runningSessionIds.includes(activeSessionId)
+                          : false)
+                          ? tr(
+                              '当前 Composer 忙碌 — 发送将加入排队，当前任务结束后自动继续',
+                              'This Composer is busy — Send queues a follow-up for after the current turn'
+                            )
+                          : tr('发送提示', 'Send prompt')
+                      }
                     >
-                      Send ⏎
+                      {isSendingPrompt ||
+                      (activeSessionId
+                        ? runningSessionIds.includes(activeSessionId)
+                        : false)
+                        ? `${t('composer.queue')} ⏎`
+                        : `${t('composer.send')} ⏎`}
+                      {pendingPromptQueue.length > 0 ? ` (${pendingPromptQueue.length})` : ''}
                     </button>
                   </div>
                 </div>
@@ -8094,17 +10816,50 @@ export function App() {
 
       {/* 5. Modal: Command Palette (Ctrl+Shift+P) */}
       {showPalette && (
-        <div className="palette-backdrop" onClick={() => setShowPalette(false)}>
+        <div
+          className="palette-backdrop"
+          onClick={() => {
+            setShowPalette(false);
+            setPaletteMode('commands');
+          }}
+        >
           <div className="palette-modal" onClick={(e) => e.stopPropagation()}>
             <input
               autoFocus
               className="palette-input"
-              placeholder="Type a command, setting, or file name..."
+              placeholder={
+                paletteMode === 'symbols'
+                  ? 'Go to Symbol in active file…'
+                  : paletteMode === 'definitions'
+                    ? 'Pick a definition candidate…'
+                    : 'Type a command, setting, or file name...'
+              }
               value={paletteQuery}
               onChange={(e) => setPaletteQuery(e.target.value)}
             />
             <div className="palette-list">
-              {[
+              {(paletteMode === 'symbols' || paletteMode === 'definitions'
+                ? symbolPaletteItems
+                : [
+                {
+                  label: 'Go to Symbol in Editor…',
+                  hint: 'Ctrl+Shift+O',
+                  run: () => void openGoToSymbolPalette(),
+                },
+                {
+                  label: 'Go to Definition under Cursor',
+                  hint: 'F12',
+                  run: () => void jumpToDefinitionAtCursor(),
+                },
+                {
+                  label: 'View Problems Panel',
+                  hint: 'Problems',
+                  run: () => {
+                    setShowBottomPanel(true);
+                    setActiveBottomTab('problems');
+                    void refreshWorkspaceProblems();
+                  },
+                },
                 {
                   label: 'Help: Open DeepAutoCode User Guide & Manual (使用说明中心)',
                   hint: 'F1',
@@ -8136,8 +10891,23 @@ export function App() {
                   run: () => openUserGuide('inline'),
                 },
                 {
-                  label: 'Help: Keyboard Shortcuts Reference (快捷键速查表)',
+                  label: 'Help: Artifacts, Subagents, Todos & Tokens',
+                  hint: 'Guide 6',
+                  run: () => openUserGuide('artifacts'),
+                },
+                {
+                  label: 'Help: Agent Coding Engine (Search / Patch / Verify)',
+                  hint: 'Guide 7',
+                  run: () => openUserGuide('agent'),
+                },
+                {
+                  label: 'Help: Live Web Preview & Remote SSH',
                   hint: 'Guide 8',
+                  run: () => openUserGuide('preview-ssh'),
+                },
+                {
+                  label: 'Help: Keyboard Shortcuts Reference (快捷键速查表)',
+                  hint: 'Guide 9',
                   run: () => openUserGuide('shortcuts'),
                 },
                 {
@@ -8170,9 +10940,24 @@ export function App() {
                   run: () => void openSshConnectionModal(),
                 },
                 {
+                  label: 'Remote-SSH: Reconnect Current Remote Host',
+                  hint: 'SSH',
+                  run: () => void handleSshReconnect(),
+                },
+                {
+                  label: 'Remote-SSH: Check Conflict on Active File',
+                  hint: 'SSH',
+                  run: () => void handleSshConflictCheck(),
+                },
+                {
                   label: 'Remote-SSH: Disconnect Current Remote SSH Host',
                   hint: 'SSH',
                   run: () => void handleDisconnectSshHost(),
+                },
+                {
+                  label: 'Language: Refresh LSP Diagnostics for Active File',
+                  hint: 'LSP',
+                  run: () => void refreshLspDiagnosticsForActiveFile(),
                 },
                 {
                   label: 'Preferences: Open DeepAutoCode Settings (General & Project)',
@@ -8223,15 +11008,17 @@ export function App() {
                   run: () => void handleExportDiagnostics(),
                 },
               ]
+              )
                 .filter((item) =>
                   item.label.toLowerCase().includes(paletteQuery.toLowerCase())
                 )
                 .map((item) => (
                   <div
-                    key={item.label}
+                    key={item.label + item.hint}
                     className="palette-item"
                     onClick={() => {
                       setShowPalette(false);
+                      setPaletteMode('commands');
                       item.run();
                     }}
                   >
@@ -8694,12 +11481,23 @@ export function App() {
 
                   <div style={{ display: 'flex', gap: 8 }}>
                     {sshStatus?.connected && (
-                      <button
-                        className="btn danger"
-                        onClick={() => void handleDisconnectSshHost()}
-                      >
-                        🔌 Disconnect Remote
-                      </button>
+                      <>
+                        <button className="btn" onClick={() => void handleSshReconnect()}>
+                          🔄 Reconnect
+                        </button>
+                        <button
+                          className="btn"
+                          onClick={() => void handleSshConflictCheck()}
+                        >
+                          ⚠ Conflict Check
+                        </button>
+                        <button
+                          className="btn danger"
+                          onClick={() => void handleDisconnectSshHost()}
+                        >
+                          🔌 Disconnect Remote
+                        </button>
+                      </>
                     )}
                     <button
                       className="btn primary"
@@ -8739,6 +11537,21 @@ export function App() {
           <span>🌿 {gitState.branch}*</span>
           <span>ⓘ 0 Errors</span>
           <span>Backend: {backendStatus?.diagnostics?.effectiveMode ?? 'local'}</span>
+          {goalTokenUsage && (
+            <span
+              title={`Remaining ${goalTokenUsage.remaining.toLocaleString()} tokens`}
+              style={{
+                color:
+                  goalTokenUsage.tokensUsed / Math.max(1, goalTokenUsage.tokenBudget) > 0.85
+                    ? '#fbbf24'
+                    : '#34d399',
+                fontWeight: 600,
+              }}
+            >
+              Tokens: {formatCompactTokens(goalTokenUsage.tokensUsed)}/
+              {formatCompactTokens(goalTokenUsage.tokenBudget)}
+            </span>
+          )}
           <span>Status: {statusNotice}</span>
         </div>
         <div className="status-group">

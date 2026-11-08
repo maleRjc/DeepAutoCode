@@ -156,6 +156,14 @@ import type {
 } from '../types.js';
 import type { CapabilityRegistry } from '../capabilities/CapabilityRegistry.js';
 import type { ProviderManager } from '../../providers/index.js';
+import {
+  captureWorkspaceFiles,
+  listSessionCheckpoints,
+  readSessionCheckpoint,
+  restoreWorkspaceFiles,
+  saveSessionCheckpoint,
+  type SessionCheckpoint,
+} from '../core/SessionCheckpoint.js';
 import { BackendManager } from './BackendManager.js';
 
 export interface ClineRuntimeEvent {
@@ -166,8 +174,15 @@ export interface ClineRuntimeEvent {
     | 'tool_call_completed'
     | 'tool_call_failed'
     | 'diff_proposed'
+    | 'diff_updated'
+    | 'model_tier'
+    | 'checkpoint_created'
     | 'session_state'
-    | 'error';
+    | 'error'
+    | 'sandbox_branch_created'
+    | 'circuit_breaker_triggered'
+    | 'artifact_created'
+    | 'goal_usage';
   sessionId: string;
   payload: Record<string, unknown>;
 }
@@ -176,6 +191,8 @@ export interface StartSessionInput {
   sessionId?: string;
   title?: string;
   prompt?: string;
+  /** Stage W: isolate parallel Composer in a git worktree */
+  useWorktree?: boolean;
   config: {
     providerId: string;
     modelId: string;
@@ -221,6 +238,27 @@ export interface IClineCoreInstance {
     status: DiffChangeRecord['status'],
     feedback?: string
   ): Promise<DiffChangeRecord | null>;
+  updateDiffProposed(
+    sessionId: string,
+    diffId: string,
+    proposedContent: string,
+    options?: { writeToDisk?: boolean; finalize?: 'accept' | 'reject' | 'keep' }
+  ): Promise<DiffChangeRecord | null>;
+  reviewAllPendingDiffs(
+    sessionId: string,
+    action: 'accept' | 'reject'
+  ): Promise<DiffChangeRecord[]>;
+  createCheckpoint(
+    sessionId: string,
+    label?: string
+  ): Promise<import('../core/SessionCheckpoint.js').SessionCheckpoint | null>;
+  listCheckpoints(
+    sessionId: string
+  ): Promise<import('../core/SessionCheckpoint.js').SessionCheckpoint[]>;
+  restoreCheckpoint(
+    sessionId: string,
+    checkpointId: string
+  ): Promise<{ ok: boolean; restored: number; deleted: number; checkpointId: string }>;
   abort(sessionId: string, reason?: string): Promise<boolean>;
   stop(sessionId: string): Promise<boolean>;
   delete(sessionId: string): Promise<boolean>;
@@ -379,10 +417,31 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     const sessionId =
       input.sessionId ?? `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
+    let workspaceRoot = path.resolve(input.config.workspaceRoot);
+    let worktreeMeta: { worktreePath?: string; branch?: string; message?: string } | undefined;
+    if (input.useWorktree) {
+      try {
+        const { ensureAgentWorktree } = await import('../core/WorkspaceSafety.js');
+        const wt = await ensureAgentWorktree({
+          workspaceRoot,
+          sessionId,
+        });
+        if (wt.enabled && wt.worktreePath) {
+          workspaceRoot = path.resolve(wt.worktreePath);
+          worktreeMeta = {
+            worktreePath: wt.worktreePath,
+            branch: wt.branch,
+            message: wt.message,
+          };
+        }
+      } catch {
+        // fall back to main workspace
+      }
+    }
     const manifest: SessionManifest = {
       sessionId,
       title: input.title ?? (input.prompt ? input.prompt.slice(0, 48) : 'New AI Session'),
-      workspaceRoot: path.resolve(input.config.workspaceRoot),
+      workspaceRoot,
       providerId: input.config.providerId,
       modelId: input.config.modelId,
       backendMode: this.backendMode,
@@ -393,6 +452,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       lastSequence: 0,
       sdkManaged: true,
       storagePath: this.getSessionDir(sessionId),
+      ...(worktreeMeta ? { worktree: worktreeMeta } : {}),
     };
 
     const manifestPath = await this.saveManifest(manifest);
@@ -551,6 +611,37 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       },
     });
 
+    // Stage U: persist /compact (or explicit memory) digests for future sessions
+    try {
+      const { appendAgentMemory, digestTextToMemorySummary, expandSlashCommandPrompt } =
+        await import('../core/index.js');
+      const slash = expandSlashCommandPrompt?.(input.prompt);
+      const wantsMemory =
+        slash?.slashCommand === 'compact' ||
+        /(?:^|\s)(?:\/compact|save\s+memory|记住这次|保存记忆)\b/i.test(input.prompt);
+      if (wantsMemory && assistantContent.trim()) {
+        await appendAgentMemory(manifest.workspaceRoot, {
+          sessionId: input.sessionId,
+          source: slash?.slashCommand === 'compact' ? 'compact' : 'manual',
+          title:
+            slash?.slashCommand === 'compact'
+              ? `Compact · ${new Date().toLocaleString()}`
+              : `Memory · ${new Date().toLocaleString()}`,
+          summary: digestTextToMemorySummary(assistantContent),
+        });
+      }
+    } catch {
+      // non-fatal
+    }
+
+    // Auto-create a user-restorable checkpoint after turns that touched files
+    if (Array.isArray(diffIds) && diffIds.length > 0) {
+      await this.createCheckpoint(
+        input.sessionId,
+        `After turn · ${diffIds.length} file change(s)`
+      ).catch(() => null);
+    }
+
     this.emit({
       type: 'session_state',
       sessionId: input.sessionId,
@@ -681,10 +772,11 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         signal,
         runCapabilityTool,
         diffIds,
+        applyImmediately: true,
       });
 
       await streamText(
-        `### 代码变更已应用\n- **目标文件**: \`${targetFile}\`\n- **变更预览**: Diff ID \`${writeRes.diffId}\`（${writeRes.bytesWritten} 字节）\n- **操作说明**: 您可以在中间编辑器 Diff 标签页或下方卡片中选择 **Accept** 或 **Reject**。`
+        `### 代码变更已应用\n- **目标文件**: \`${targetFile}\`\n- **变更预览**: Diff ID \`${writeRes.diffId}\`（${writeRes.bytesWritten} 字节）\n- **操作说明**: Manual 模式已通过审批卡；您仍可在 Diff 审阅中 **Reject** 回滚。`
       );
       return { content: chunks.join('') };
     }
@@ -944,12 +1036,23 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       risk?: ToolCallRecord['risk']
     ) => Promise<unknown>;
     diffIds: string[];
-  }): Promise<{ diffId: string; bytesWritten: number; operation: string }> {
+    /**
+     * When true (default for auto), write immediately then allow Reject to roll back.
+     * When false (manual), keep review-before-write until the user Accepts.
+     */
+    applyImmediately?: boolean;
+    onBeforeFirstMutation?: () => Promise<void>;
+    trackOriginal?: (filePath: string, originalContent: string, operation: 'create' | 'modify') => void;
+  }): Promise<{ diffId: string; bytesWritten: number; operation: string; appliedToDisk: boolean }> {
     const { sessionId, manifest, proposedContent, signal, runCapabilityTool, diffIds } = params;
     const targetFile = this.normalizeWorkspaceRelativePath(
       params.targetFile,
       manifest.workspaceRoot
     );
+    // Auto: write immediately (Reject can roll back).
+    // Manual: write-file goes through ApprovalBridge first (human-in-the-loop), then disk.
+    const applyImmediately =
+      params.applyImmediately ?? true;
 
     let originalContent = '';
     try {
@@ -968,32 +1071,37 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       originalContent = '';
     }
 
+    const operation: 'create' | 'modify' = originalContent ? 'modify' : 'create';
+    params.trackOriginal?.(targetFile, originalContent, operation);
+
+    if (applyImmediately && params.onBeforeFirstMutation) {
+      await params.onBeforeFirstMutation();
+    }
+
     const diffId = `diff_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const unifiedDiff = createUnifiedDiff(targetFile, originalContent, proposedContent);
     const diffRecord: DiffChangeRecord = {
       diffId,
       sessionId,
       filePath: targetFile,
-      operation: originalContent ? 'modify' : 'create',
+      operation,
       originalContent,
       proposedContent,
       unifiedDiff,
       status: 'pending',
+      appliedToDisk: false,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
     await this.saveDiff(sessionId, diffRecord);
     diffIds.push(diffId);
 
-    const writeOut = (await runCapabilityTool(
-      'write-file',
-      {
-        filePath: targetFile,
-        content: proposedContent,
-        createDirectories: true,
-      },
-      'medium'
-    )) as { bytesWritten: number; operation: string };
+    // P0-2: emit Diff proposal before any disk write so UI can show pending change first.
+    this.emit({
+      type: 'diff_proposed',
+      sessionId,
+      payload: { ...diffRecord },
+    });
 
     await runCapabilityTool(
       'reveal-diff',
@@ -1002,25 +1110,67 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         filePath: targetFile,
         originalContent,
         proposedContent,
-        title: `DeepAutoCode Diff: ${targetFile}`,
+        title:
+          manifest.executionMode === 'manual'
+            ? `DeepAutoCode Diff (awaiting approval): ${targetFile}`
+            : `DeepAutoCode Diff: ${targetFile}`,
       },
       'low'
     );
 
-    this.emit({
-      type: 'diff_proposed',
-      sessionId,
-      payload: { ...diffRecord },
-    });
+    let bytesWritten = Buffer.byteLength(proposedContent, 'utf-8');
+    let writeOperation = operation;
 
-    // Keep diffRecord.status as 'pending' so the user can review and click Accept / Reject in the IDE
+    if (applyImmediately) {
+      try {
+        // Manual → ApprovalBridge gates write-file; Auto writes immediately.
+        const writeOut = (await runCapabilityTool(
+          'write-file',
+          {
+            filePath: targetFile,
+            content: proposedContent,
+            createDirectories: true,
+          },
+          'medium'
+        )) as { bytesWritten: number; operation: string };
+        bytesWritten = writeOut?.bytesWritten ?? bytesWritten;
+        writeOperation = (writeOut?.operation as 'create' | 'modify') ?? operation;
+        diffRecord.appliedToDisk = true;
+        diffRecord.status = 'pending';
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('USER_REJECTED')) {
+          diffRecord.status = 'rejected';
+          diffRecord.appliedToDisk = false;
+          diffRecord.feedback = msg;
+          diffRecord.updatedAt = new Date().toISOString();
+          await this.saveDiff(sessionId, diffRecord);
+          this.emit({
+            type: 'diff_proposed',
+            sessionId,
+            payload: { ...diffRecord },
+          });
+        }
+        throw err;
+      }
+    }
+
     diffRecord.updatedAt = new Date().toISOString();
     await this.saveDiff(sessionId, diffRecord);
 
+    if (diffRecord.appliedToDisk) {
+      this.emit({
+        type: 'diff_proposed',
+        sessionId,
+        payload: { ...diffRecord },
+      });
+    }
+
     return {
       diffId,
-      bytesWritten: writeOut?.bytesWritten ?? Buffer.byteLength(proposedContent, 'utf-8'),
-      operation: writeOut?.operation ?? (originalContent ? 'modify' : 'create'),
+      bytesWritten,
+      operation: writeOperation,
+      appliedToDisk: Boolean(diffRecord.appliedToDisk),
     };
   }
 
@@ -1074,11 +1224,97 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       expandSlashCommandPrompt,
       createToolPoliciesWithPreset,
       FileStateCache,
+      WorkspaceFileIndex,
+      searchIndexedFiles,
       createGoalState,
       buildGoalContinuationPrompt,
+      buildGoalBudgetLimitPrompt,
+      isGoalTokenBudgetExceeded,
+      DEFAULT_GOAL_TOKEN_BUDGET,
       resolveTieredModelForTurn,
       classifyPromptIntent,
+      ensureAgentSandboxBranch,
+      rollbackSessionMutations,
+      loadVerifyConfig,
+      formatVerifyCommandsForPrompt,
+      isVerifiableSourcePath,
+      parseBuildDiagnostics,
+      formatDiagnosticsForPrompt,
+      extractFailedTestHints,
+      diagnoseTypeScriptFile,
+      diagnoseEditedFile,
+      attachDiagnosticSnippets,
+      loadWorkspaceProblemsText,
+      applyPatchToContent,
+      applyMultiFilePatch,
+      listPatchFiles,
+      McpHost,
+      loadMcpConfigsFromWorkspace,
+      applyStandardToolAliases,
+      SessionTodoList,
+      runResearchSubagent,
+      runPlannerSubagent,
+      runEditSubagent,
+      createSubagentSandbox,
+      runDiagnoseAndVerify,
+      loadAgentMemory,
+      formatAgentMemoryForPrompt,
+      appendAgentMemory,
+      digestTextToMemorySummary,
+      MAX_SELF_HEAL_ATTEMPTS,
+      MAX_VERIFY_NUDGES,
     } = sdk;
+    const selfHealBudget =
+      typeof MAX_SELF_HEAL_ATTEMPTS === 'number' ? MAX_SELF_HEAL_ATTEMPTS : 5;
+    const verifyNudgeBudget =
+      typeof MAX_VERIFY_NUDGES === 'number' ? MAX_VERIFY_NUDGES : 4;
+
+    const verifyConfig =
+      typeof loadVerifyConfig === 'function'
+        ? await loadVerifyConfig(manifest.workspaceRoot)
+        : {
+            buildCommand: 'npm run build',
+            testCommand: 'npm test',
+            combinedCommand: 'npm run build && npm test',
+            sourceGlobs: ['**/*.{ts,tsx,js,jsx,c,cc,cpp,h,hpp}'],
+            enableEvolveSandbox: true,
+            source: 'default' as const,
+          };
+    const verifyPromptBlock =
+      typeof formatVerifyCommandsForPrompt === 'function'
+        ? formatVerifyCommandsForPrompt(verifyConfig)
+        : `Build: \`${verifyConfig.buildCommand}\`\nTest: \`${verifyConfig.testCommand}\``;
+    const preferredVerifyCommand =
+      verifyConfig.combinedCommand?.trim() ||
+      `${verifyConfig.buildCommand} && ${verifyConfig.testCommand}`;
+
+    const mcpHost = typeof McpHost === 'function' ? new McpHost() : null;
+    let mcpBootstrapNote = '';
+    let mcpConfigsCached: any[] = [];
+    if (mcpHost && typeof loadMcpConfigsFromWorkspace === 'function') {
+      try {
+        mcpConfigsCached = await loadMcpConfigsFromWorkspace(manifest.workspaceRoot);
+        if (mcpConfigsCached.length > 0) {
+          await mcpHost.connectAll(mcpConfigsCached, manifest.workspaceRoot);
+          const toolsListed = mcpHost.listTools();
+          const disabledCount = mcpConfigsCached.reduce(
+            (n: number, c: any) => n + (Array.isArray(c.disabledTools) ? c.disabledTools.length : 0),
+            0
+          );
+          mcpBootstrapNote =
+            toolsListed.length > 0
+              ? `Connected MCP tools: ${toolsListed
+                  .slice(0, 24)
+                  .map((t: any) => t.qualifiedName)
+                  .join(', ')}${toolsListed.length > 24 ? '…' : ''}${
+                  disabledCount ? ` (${disabledCount} disabled)` : ''
+                }`
+              : mcpHost.getLastError() || 'MCP configs found but no tools connected.';
+        }
+      } catch (err) {
+        mcpBootstrapNote = `MCP bootstrap failed: ${(err as Error).message || String(err)}`;
+      }
+    }
 
     const slashExpanded =
       typeof expandSlashCommandPrompt === 'function'
@@ -1087,7 +1323,17 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     const basePromptForTurn = slashExpanded.expandedPrompt || prompt;
 
     const fileStateCache = new FileStateCache();
-    const activeGoal = createGoalState(basePromptForTurn);
+    const workspaceFileIndex =
+      typeof WorkspaceFileIndex === 'function'
+        ? new WorkspaceFileIndex(manifest.workspaceRoot, { ttlMs: 30_000, maxFiles: 12_000 })
+        : null;
+    // Warm the path index in the background so the first search_codebase is faster.
+    void workspaceFileIndex?.ensureFresh().catch(() => undefined);
+    const activeGoal = createGoalState(
+      basePromptForTurn,
+      typeof DEFAULT_GOAL_TOKEN_BUDGET === 'number' ? DEFAULT_GOAL_TOKEN_BUDGET : 180_000
+    );
+    let budgetLimitNotified = false;
     const promptIntent = classifyPromptIntent(basePromptForTurn);
     const isReadOnlyTurn =
       slashExpanded.suggestedMode === 'plan' ||
@@ -1182,19 +1428,137 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     }
 
     const sessionWrittenFiles: string[] = [];
+    const sessionOriginalContents = new Map<string, string>();
+    const sessionCreatedFiles = new Set<string>();
     const readCountsByRange = new Map<string, number>();
     const executedCommandCounts = new Map<string, number>();
     let hasUnverifiedCompiledEdit = false;
     let hasUnverifiedTestAfterEdit = false;
     let lastBuildOrTestFailed = false;
+    let lastSemanticFailed = false;
+    let lastSemanticDiagSnippet = '';
     let lastFailureOutputSnippet = '';
+    let lastFailedTestHints: string[] = [];
     let selfHealCount = 0;
+    let verifyNudgeCount = 0;
     let autoContinuationCount = 0;
+    let editMismatchCount = 0;
+    let lastVerifierPass: boolean | null = null;
+    let sandboxBranchEnsured = false;
+    let circuitBroken = false;
+    let circuitBreakerNotified = false;
+    const sessionTodos =
+      typeof SessionTodoList === 'function' ? new SessionTodoList() : null;
+
+    const persistSessionArtifact = async (params: {
+      artifactType: 'plan' | 'task_list' | 'walkthrough' | 'report';
+      title: string;
+      content: string;
+      source?: string;
+    }): Promise<{ artifactId: string; artifactType: string; title: string }> => {
+      const artifactId = `art_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const artifactsDir = path.join(this.storageDir, '..', 'artifacts');
+      await fs.mkdir(artifactsDir, { recursive: true });
+      const artifactRecord = {
+        id: artifactId,
+        sessionId,
+        artifactType: params.artifactType,
+        title: params.title,
+        content: params.content,
+        workspaceRoot: manifest.workspaceRoot,
+        source: params.source || 'agent',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      await fs.writeFile(
+        path.join(artifactsDir, `${artifactId}.json`),
+        JSON.stringify(artifactRecord, null, 2),
+        'utf-8'
+      );
+      this.emit({
+        type: 'artifact_created',
+        sessionId,
+        payload: {
+          artifactId,
+          artifactType: params.artifactType,
+          title: params.title,
+          source: params.source || 'agent',
+        },
+      });
+      return {
+        artifactId,
+        artifactType: params.artifactType,
+        title: params.title,
+      };
+    };
 
     const hasTestTargetInContext =
       /(?:_perf\b|nccl-test\b|\btests?\b|\bctest\b|\bpytest\b|测试)/i.test(
         `${workspaceFilesHint} ${prompt}`
       );
+
+    const ensureSandboxOnce = async () => {
+      if (
+        sandboxBranchEnsured ||
+        manifest.executionMode === 'manual' ||
+        isReadOnlyTurn ||
+        verifyConfig.enableEvolveSandbox === false
+      ) {
+        return;
+      }
+      sandboxBranchEnsured = true;
+      if (typeof ensureAgentSandboxBranch === 'function') {
+        const sandbox = await ensureAgentSandboxBranch(manifest.workspaceRoot).catch(() => null);
+        if (sandbox?.enabled && sandbox.branch) {
+          this.emit({
+            type: 'sandbox_branch_created',
+            sessionId,
+            payload: {
+              branch: sandbox.branch,
+              previousBranch: sandbox.previousBranch,
+              message: sandbox.message,
+            },
+          });
+        }
+      }
+    };
+
+    const trackOriginalForRollback = (
+      filePath: string,
+      originalContent: string,
+      operation: 'create' | 'modify'
+    ) => {
+      if (operation === 'create') {
+        sessionCreatedFiles.add(filePath);
+        return;
+      }
+      if (!sessionOriginalContents.has(filePath)) {
+        sessionOriginalContents.set(filePath, originalContent);
+      }
+    };
+
+    const applyFileEdit = (targetFile: string, proposedContent: string) => {
+      if (circuitBroken) {
+        return Promise.reject(
+          new Error(
+            'CIRCUIT_BREAKER_ACTIVE: Session mutations were rolled back after repeated verification failures. Do not edit files further; summarize the failure instead.'
+          )
+        );
+      }
+      return this.proposeAndApplyFileEdit({
+        sessionId,
+        manifest,
+        targetFile,
+        proposedContent,
+        signal,
+        runCapabilityTool,
+        diffIds,
+        // Always write after policy/approval: Manual hits ApprovalBridge; Auto writes directly.
+        applyImmediately: true,
+        onBeforeFirstMutation: ensureSandboxOnce,
+        trackOriginal: trackOriginalForRollback,
+      });
+    };
 
     const recordCompiledFileEdit = (filePath: string) => {
       sessionWrittenFiles.push(filePath);
@@ -1205,9 +1569,13 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           readCountsByRange.delete(k);
         }
       }
-      if (/\.(?:c|cc|cpp|cu|h|hpp)$/i.test(filePath)) {
+      const needsVerify =
+        typeof isVerifiableSourcePath === 'function'
+          ? isVerifiableSourcePath(filePath, verifyConfig)
+          : /\.(?:c|cc|cpp|cu|h|hpp|ts|tsx|js|jsx|py|go|rs)$/i.test(filePath);
+      if (needsVerify) {
         hasUnverifiedCompiledEdit = true;
-        if (hasTestTargetInContext) {
+        if (hasTestTargetInContext || Boolean(verifyConfig.testCommand)) {
           hasUnverifiedTestAfterEdit = true;
         }
       }
@@ -1238,10 +1606,130 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       if (hasRuntimeOrCompileFailure) {
         activeGoal.consecutiveBlockedTurns += 1;
         lastFailureOutputSnippet = combinedOut.trim().slice(-1200);
+        lastFailedTestHints =
+          typeof extractFailedTestHints === 'function'
+            ? extractFailedTestHints(combinedOut, 6)
+            : [];
+        sessionTodos?.ensureVerifyTodo(preferredVerifyCommand);
       } else {
         activeGoal.consecutiveBlockedTurns = 0;
         activeGoal.verifiedByCommand = true;
         lastFailureOutputSnippet = '';
+        lastFailedTestHints = [];
+        lastSemanticFailed = false;
+        lastSemanticDiagSnippet = '';
+        sessionTodos?.completeMatching((c) => /verify|test|build|编译|测试|验证/i.test(c));
+      }
+    };
+
+    const runPostEditDiagnostics = async (
+      filePath: string,
+      content: string
+    ): Promise<{
+      diagnostics?: unknown[];
+      semanticErrors?: string;
+      mandatoryFixHint?: string;
+      workspaceProblems?: string;
+    }> => {
+      const diagnose =
+        typeof diagnoseEditedFile === 'function'
+          ? diagnoseEditedFile
+          : typeof diagnoseTypeScriptFile === 'function'
+            ? async (p: {
+                workspaceRoot: string;
+                filePath: string;
+                content: string;
+              }) => diagnoseTypeScriptFile(p)
+            : null;
+
+      let workspaceProblems = '';
+      if (typeof loadWorkspaceProblemsText === 'function') {
+        try {
+          const all = await loadWorkspaceProblemsText(manifest.workspaceRoot, 60);
+          const norm = filePath.replace(/\\/g, '/');
+          const base = path.basename(norm);
+          workspaceProblems = all
+            .split('\n')
+            .filter((line) => {
+              const l = line.replace(/\\/g, '/');
+              return l.includes(norm) || l.includes(`/${base}:`) || l.includes(`${base}:`);
+            })
+            .slice(0, 20)
+            .join('\n');
+        } catch {
+          workspaceProblems = '';
+        }
+      }
+
+      if (!diagnose) {
+        if (workspaceProblems) {
+          lastSemanticFailed = true;
+          lastSemanticDiagSnippet = workspaceProblems.slice(0, 3500);
+          return {
+            workspaceProblems,
+            semanticErrors: lastSemanticDiagSnippet,
+            mandatoryFixHint:
+              'WORKSPACE_PROBLEMS: Fix Problems-panel diagnostics for this file via edit_file/apply_patch, then re-verify.',
+          };
+        }
+        return {};
+      }
+      try {
+        const diags = await diagnose({
+          workspaceRoot: manifest.workspaceRoot,
+          filePath,
+          content,
+        });
+        const errors = (diags || []).filter((d: { severity: string }) => d.severity === 'error');
+        if (errors.length === 0 && !workspaceProblems) {
+          lastSemanticFailed = false;
+          lastSemanticDiagSnippet = '';
+          return { diagnostics: diags, workspaceProblems: '' };
+        }
+        if (errors.length === 0 && workspaceProblems) {
+          lastSemanticFailed = true;
+          lastSemanticDiagSnippet = workspaceProblems.slice(0, 3500);
+          return {
+            diagnostics: diags,
+            workspaceProblems,
+            semanticErrors: lastSemanticDiagSnippet,
+            mandatoryFixHint:
+              'WORKSPACE_PROBLEMS: IDE/build Problems remain for this file. Fix them before claiming success.',
+          };
+        }
+        lastSemanticFailed = true;
+        const formatted =
+          typeof formatDiagnosticsForPrompt === 'function'
+            ? formatDiagnosticsForPrompt(errors, 20)
+            : errors
+                .map(
+                  (d: { severity: string; file: string; line: number; message: string }) =>
+                    `${d.severity} ${d.file}:${d.line} ${d.message}`
+                )
+                .join('\n');
+        const snippets =
+          typeof attachDiagnosticSnippets === 'function'
+            ? attachDiagnosticSnippets(content, errors, 2)
+            : '';
+        const merged = `${formatted}${snippets ? `\n${snippets}` : ''}${
+          workspaceProblems ? `\n\n[Workspace Problems for file]\n${workspaceProblems}` : ''
+        }`;
+        lastSemanticDiagSnippet = merged.slice(0, 3500);
+        return {
+          diagnostics: errors,
+          workspaceProblems: workspaceProblems || undefined,
+          semanticErrors: lastSemanticDiagSnippet,
+          mandatoryFixHint:
+            'SEMANTIC_DIAGNOSTICS_FAILED: Fix the language diagnostics above via edit_file or apply_patch before claiming success. Prefer fixing types/imports/syntax, then re-run verify.',
+        };
+      } catch {
+        return workspaceProblems
+          ? {
+              workspaceProblems,
+              semanticErrors: workspaceProblems.slice(0, 3500),
+              mandatoryFixHint: 'WORKSPACE_PROBLEMS: Fix Problems-panel diagnostics, then re-verify.',
+            }
+          : {};
       }
     };
 
@@ -1305,22 +1793,19 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       stdout: string,
       stderr: string
     ): Promise<string> => {
-      const combined = `${stdout || ''}\n${stderr || ''}`;
-      const errorPattern =
-        /([a-zA-Z0-9_./\\-]+\.(?:c|cc|cpp|cxx|cu|cuh|h|hh|hpp|py|ts|tsx|js|jsx|go|rs)):(\d+)(?::\d+)?:\s*(?:fatal\s+)?error:\s*([^\r\n]+)/gi;
+      const parsed =
+        typeof parseBuildDiagnostics === 'function'
+          ? parseBuildDiagnostics(stdout || '', stderr || '', { maxItems: 12 })
+          : [];
       const seenLocs = new Set<string>();
       const targets: Array<{ relFile: string; line: number; msg: string }> = [];
-
-      let match: RegExpExecArray | null;
-      while ((match = errorPattern.exec(combined)) !== null) {
-        const rawPath = match[1].replace(/^\.\//, '');
-        const lineNum = Number(match[2]);
-        const errMsg = match[3].trim();
-        const relFile = this.normalizeWorkspaceRelativePath(rawPath, manifest.workspaceRoot);
-        const key = `${relFile}:${ Math.floor(lineNum / 20) }`;
+      for (const d of parsed) {
+        if (d.severity !== 'error') continue;
+        const relFile = this.normalizeWorkspaceRelativePath(d.file, manifest.workspaceRoot);
+        const key = `${relFile}:${Math.floor(d.line / 20)}`;
         if (!relFile || relFile.startsWith('..') || seenLocs.has(key)) continue;
         seenLocs.add(key);
-        targets.push({ relFile, line: lineNum, msg: errMsg });
+        targets.push({ relFile, line: d.line, msg: d.message });
         if (targets.length >= 3) break;
       }
 
@@ -1369,29 +1854,38 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       shell: isSshMirrorWorkspace ? '/bin/bash' : undefined,
       enableEditor: manifest.executionMode !== 'plan',
       enableApplyPatch: false,
+      ...(workspaceFileIndex ? { fileIndex: workspaceFileIndex } : {}),
       executors: {
-        ...(isSshMirrorWorkspace
-          ? {
-              search: async (query: string, subDir?: string, contextLines = 3) => {
-                const safeQuery = String(query || '').replace(/'/g, `'\\''`);
-                const safeSubDir = subDir
-                  ? this.normalizeWorkspaceRelativePath(subDir, manifest.workspaceRoot).replace(
-                      /'/g,
-                      `'\\''`
-                    )
-                  : '.';
-                const ctx = Math.max(0, Math.min(8, Number(contextLines) || 3));
-                const res = (await runCapabilityTool(
-                  'run-build',
-                  {
-                    command: `grep -rnI -C ${ctx} --exclude-dir=.git --exclude-dir=build -- '${safeQuery}' '${safeSubDir}' 2>/dev/null | head -n 120`,
-                  },
-                  'low'
-                )) as { stdout: string };
-                return res.stdout?.trim() || 'No matches found.';
+        search: async (query: string, subDir?: string, contextLines = 3) => {
+          if (isSshMirrorWorkspace) {
+            const safeQuery = String(query || '').replace(/'/g, `'\\''`);
+            const safeSubDir = subDir
+              ? this.normalizeWorkspaceRelativePath(subDir, manifest.workspaceRoot).replace(
+                  /'/g,
+                  `'\\''`
+                )
+              : '.';
+            const ctx = Math.max(0, Math.min(8, Number(contextLines) || 3));
+            const res = (await runCapabilityTool(
+              'run-build',
+              {
+                command: `(command -v rg >/dev/null 2>&1 && rg -n -C ${ctx} --hidden -g '!node_modules/**' -g '!.git/**' -F -- '${safeQuery}' '${safeSubDir}' 2>/dev/null || grep -rnI -C ${ctx} --exclude-dir=.git --exclude-dir=build --exclude-dir=node_modules -- '${safeQuery}' '${safeSubDir}' 2>/dev/null) | head -n 120`,
               },
-            }
-          : {}),
+              'low'
+            )) as { stdout: string };
+            return res.stdout?.trim() || 'No matches found.';
+          }
+          if (workspaceFileIndex && typeof searchIndexedFiles === 'function') {
+            return searchIndexedFiles({
+              root: manifest.workspaceRoot,
+              index: workspaceFileIndex,
+              query,
+              under: subDir,
+              contextLines,
+            });
+          }
+          return 'No matches found.';
+        },
         readFile: async (item: any) => {
           const rawFilePath = typeof item === 'string' ? item : item?.path;
           const filePath = this.normalizeWorkspaceRelativePath(
@@ -1447,18 +1941,11 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             const idx = Math.max(0, Math.min(lines.length, input.insert_line ?? lines.length));
             lines.splice(idx, 0, newText);
             const updated = lines.join('\n');
-            const writeRes = await this.proposeAndApplyFileEdit({
-              sessionId,
-              manifest,
-              targetFile: filePath,
-              proposedContent: updated,
-              signal,
-              runCapabilityTool,
-              diffIds,
-            });
+            const writeRes = await applyFileEdit(filePath, updated);
             fileStateCache.recordRead({ filePath, content: updated, isPartialView: false });
             recordCompiledFileEdit(filePath);
-            return `Inserted into ${filePath} (${writeRes.bytesWritten} bytes, diffId=${writeRes.diffId})`;
+            workspaceFileIndex?.invalidate();
+            return `Inserted into ${filePath} (${writeRes.bytesWritten} bytes, diffId=${writeRes.diffId}${writeRes.appliedToDisk ? '' : ', pending user Accept'})`;
           }
 
           if (oldText != null && oldText.length > 0) {
@@ -1478,32 +1965,18 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
               const diag = fileStateCache.diagnoseEditMismatch(filePath, current.content, oldText);
               throw new Error(diag.hintMessage);
             }
-            const writeRes = await this.proposeAndApplyFileEdit({
-              sessionId,
-              manifest,
-              targetFile: filePath,
-              proposedContent: updated,
-              signal,
-              runCapabilityTool,
-              diffIds,
-            });
+            const writeRes = await applyFileEdit(filePath, updated);
             fileStateCache.recordRead({ filePath, content: updated, isPartialView: false });
             recordCompiledFileEdit(filePath);
-            return `Updated ${filePath} (${writeRes.bytesWritten} bytes, diffId=${writeRes.diffId})`;
+            workspaceFileIndex?.invalidate();
+            return `Updated ${filePath} (${writeRes.bytesWritten} bytes, diffId=${writeRes.diffId}${writeRes.appliedToDisk ? '' : ', pending user Accept'})`;
           }
 
-          const writeRes = await this.proposeAndApplyFileEdit({
-            sessionId,
-            manifest,
-            targetFile: filePath,
-            proposedContent: newText,
-            signal,
-            runCapabilityTool,
-            diffIds,
-          });
+          const writeRes = await applyFileEdit(filePath, newText);
           fileStateCache.recordRead({ filePath, content: newText, isPartialView: false });
           recordCompiledFileEdit(filePath);
-          return `Created/Updated ${filePath} (${writeRes.bytesWritten} bytes, diffId=${writeRes.diffId})`;
+          workspaceFileIndex?.invalidate();
+          return `Created/Updated ${filePath} (${writeRes.bytesWritten} bytes, diffId=${writeRes.diffId}${writeRes.appliedToDisk ? '' : ', pending user Accept'})`;
         },
         bash: async (input: any) => {
           let cmd = '';
@@ -1574,7 +2047,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       createTool({
         name: 'outline_file',
         description:
-          'Extract all functions, structs, classes, enums, and macro definitions with their exact 1-based line numbers from a source file. Ideal for quickly navigating large files (>300 lines) before calling read_file with start_line and end_line.',
+          'Extract functions/structs/classes/enums/macros with exact 1-based start–end line ranges (TS/JS via AST, C/C++/other via enhanced heuristics). Ideal for navigating large files before read_file with start_line/end_line.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1595,7 +2068,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             byteLength: number;
           };
           const totalLines = res.content.split(/\r?\n/).length;
-          const symbols = extractCodeOutline(res.content, 150);
+          const symbols = extractCodeOutline(res.content, 150, filePath);
           return {
             filePath,
             totalLines,
@@ -1673,7 +2146,9 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             res.truncated || contentOut.length > 48000 || (totalLines > 350 && startLine === 0)
           );
           const symbolOutline =
-            isTruncatedOrLarge ? extractCodeOutline(res.content, 80).join('\n') : undefined;
+            isTruncatedOrLarge
+              ? extractCodeOutline(res.content, 80, filePath).join('\n')
+              : undefined;
           return {
             filePath,
             totalLines,
@@ -1682,7 +2157,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             content: contentOut.slice(0, 48000),
             ...(symbolOutline
               ? {
-                  symbolOutlineHint: `[文件符号大纲导航 (共 ${totalLines} 行，可用 start_line/end_line 精确读取对应函数/结构体)]:\n${symbolOutline}`,
+                  symbolOutlineHint: `[文件符号大纲导航 (共 ${totalLines} 行；格式 Lstart-Lend: kind name — 用 start_line/end_line 精确读取)]:\n${symbolOutline}`,
                 }
               : {}),
           };
@@ -1735,6 +2210,16 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                   )) as { stdout: string };
                   return `### Search: \`${q}\`\n${(res.stdout || 'No matches.').trim().slice(0, 1400)}`;
                 }
+                if (workspaceFileIndex && typeof searchIndexedFiles === 'function') {
+                  const localHits = await searchIndexedFiles({
+                    root: manifest.workspaceRoot,
+                    index: workspaceFileIndex,
+                    query: q,
+                    contextLines: 2,
+                    maxMatches: 20,
+                  });
+                  return `### Search: \`${q}\`\n${localHits.slice(0, 1400)}`;
+                }
                 return `### Search: \`${q}\` (use search_codebase for local details)`;
               })
             ),
@@ -1764,7 +2249,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                     .map((line, idx) => `${s + idx}: ${line}`)
                     .join('\n')
                     .slice(0, 1800);
-                  const outline = extractCodeOutline(res.content, 30).join('\n');
+                  const outline = extractCodeOutline(res.content, 30, relPath).join('\n');
                   return `### File: \`${relPath}\` (lines ${s}-${e} of ${allLines.length})\n${snippet}${
                     outline ? `\n[Outline]:\n${outline}` : ''
                   }`;
@@ -1783,7 +2268,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       createTool({
         name: 'edit_file',
         description:
-          'Directly modify an existing file in the workspace by replacing a target snippet (oldText) with updated code (newText). Automatically syncs to Remote SSH if connected and updates the IDE Code Editor.',
+          'Directly modify an existing file in the workspace by replacing a target snippet (oldText) with updated code (newText). Supports multi-hunk edits via `hunks: [{oldText,newText}, ...]`. Automatically syncs to Remote SSH if connected and updates the IDE Code Editor.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -1794,70 +2279,137 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             },
             oldText: {
               type: 'string',
-              description: 'Exact existing lines of code in the file to be replaced',
+              description: 'Exact existing lines of code in the file to be replaced (single-hunk mode)',
             },
             newText: {
               type: 'string',
-              description: 'New replacement lines of code',
+              description: 'New replacement lines of code (single-hunk mode)',
+            },
+            hunks: {
+              type: 'array',
+              description:
+                'Optional multi-hunk replacements for the same file: [{ oldText, newText }, ...]. Prefer this over multiple edit_file calls when changing several spots in one file.',
+              items: {
+                type: 'object',
+                properties: {
+                  oldText: { type: 'string' },
+                  newText: { type: 'string' },
+                },
+                required: ['oldText', 'newText'],
+              },
             },
           },
-          required: ['filePath', 'oldText', 'newText'],
+          required: ['filePath'],
         },
         execute: async (rawArgs: Record<string, unknown>) => {
           const filePath = this.normalizeWorkspaceRelativePath(
             String(rawArgs?.filePath || rawArgs?.path || rawArgs?.file_path || ''),
             manifest.workspaceRoot
           );
-          const oldText = String(rawArgs?.oldText ?? rawArgs?.old_text ?? rawArgs?.old_str ?? '');
-          const newText = String(rawArgs?.newText ?? rawArgs?.new_text ?? rawArgs?.new_str ?? '');
-          if (!filePath || !oldText) {
+          const hunksRaw = Array.isArray(rawArgs?.hunks) ? rawArgs.hunks : null;
+          const hunks: Array<{ oldText: string; newText: string }> = hunksRaw
+            ? hunksRaw.map((h: any) => ({
+                oldText: String(h?.oldText ?? h?.old_text ?? ''),
+                newText: String(h?.newText ?? h?.new_text ?? ''),
+              }))
+            : [
+                {
+                  oldText: String(rawArgs?.oldText ?? rawArgs?.old_text ?? rawArgs?.old_str ?? ''),
+                  newText: String(rawArgs?.newText ?? rawArgs?.new_text ?? rawArgs?.new_str ?? ''),
+                },
+              ];
+          if (!filePath || !hunks.some((h) => h.oldText)) {
             return {
               ok: false,
-              error: 'Both filePath and oldText are required for edit_file.',
+              error: 'filePath and oldText (or hunks[].oldText) are required for edit_file.',
             };
           }
-          const current = (await runCapabilityTool('read-file', { filePath }, 'low')) as {
+          let current = (await runCapabilityTool('read-file', { filePath }, 'low')) as {
             content: string;
           };
           fileStateCache.makeSnapshot(filePath, current.content);
           let updated: string;
+          const replaceOne = (content: string, oldText: string, newText: string) =>
+            this.applySmartTextReplacement(content, oldText, newText, filePath);
+          const tryApply = (content: string) =>
+            typeof FileStateCache.applyMultiHunkReplacements === 'function'
+              ? FileStateCache.applyMultiHunkReplacements(content, hunks, replaceOne)
+              : hunks.reduce((acc, h) => replaceOne(acc, h.oldText, h.newText), content);
           try {
-            updated = this.applySmartTextReplacement(
-              current.content,
-              oldText,
-              newText,
-              filePath
-            );
+            updated = tryApply(current.content);
+            editMismatchCount = 0;
           } catch {
-            const diag = fileStateCache.diagnoseEditMismatch(filePath, current.content, oldText);
-            return {
-              ok: false,
-              filePath,
-              error: diag.hintMessage,
-            };
+            // Stage P: one-shot auto recovery — re-read disk and retry once with fresh content
+            editMismatchCount += 1;
+            try {
+              const refreshed = (await runCapabilityTool('read-file', { filePath }, 'low')) as {
+                content: string;
+              };
+              current = refreshed;
+              fileStateCache.makeSnapshot(filePath, refreshed.content);
+              fileStateCache.recordRead({
+                filePath,
+                content: refreshed.content,
+                isPartialView: false,
+              });
+              updated = tryApply(refreshed.content);
+              editMismatchCount = 0;
+            } catch {
+              editMismatchCount += 1;
+              const diag = fileStateCache.diagnoseEditMismatch(
+                filePath,
+                current.content,
+                hunks[0]?.oldText || ''
+              );
+              // Attach a numbered window around the best fuzzy match for the model
+              const lines = String(current.content || '').split(/\r?\n/);
+              const needle = (hunks[0]?.oldText || '').split(/\r?\n/)[0]?.trim() || '';
+              let approxLine = 1;
+              if (needle) {
+                const hit = lines.findIndex((l) => l.includes(needle.slice(0, 48)));
+                if (hit >= 0) approxLine = hit + 1;
+              }
+              const s = Math.max(1, approxLine - 8);
+              const e = Math.min(lines.length, approxLine + 16);
+              const window = lines
+                .slice(s - 1, e)
+                .map((l, i) => `${s + i}: ${l}`)
+                .join('\n');
+              return {
+                ok: false,
+                filePath,
+                error: diag.hintMessage,
+                editMismatchCount,
+                autoRetryAttempted: true,
+                refreshedSnippet: window,
+                mandatoryNextStep:
+                  `EDIT_RECOVERY: oldText still missing after auto re-read. Use this numbered window (L${s}-L${e}) to craft a fresh oldText, then retry edit_file/apply_patch once:\n${window}`,
+              };
+            }
           }
-          const writeRes = await this.proposeAndApplyFileEdit({
-            sessionId,
-            manifest,
-            targetFile: filePath,
-            proposedContent: updated,
-            signal,
-            runCapabilityTool,
-            diffIds,
-          });
+          const writeRes = await applyFileEdit(filePath, updated);
           fileStateCache.recordRead({ filePath, content: updated, isPartialView: false });
           recordCompiledFileEdit(filePath);
+          const postDiag = await runPostEditDiagnostics(filePath, updated);
           const isCompiledSrc = /\.(?:c|cc|cpp|cu|h|hpp)$/i.test(filePath);
+          const needsVerify =
+            typeof isVerifiableSourcePath === 'function'
+              ? isVerifiableSourcePath(filePath, verifyConfig)
+              : isCompiledSrc || /\.(?:ts|tsx|js|jsx)$/i.test(filePath);
           return {
             ok: true,
             filePath,
             diffId: writeRes.diffId,
             bytesWritten: writeRes.bytesWritten,
             operation: writeRes.operation,
-            ...(isCompiledSrc
+            appliedToDisk: writeRes.appliedToDisk,
+            hunksApplied: hunks.length,
+            ...postDiag,
+            ...(needsVerify
               ? {
-                  mandatoryNextStep:
-                    'CRITICAL: You just modified a C/C++/HIP file. Your NEXT tool call MUST be run_command to compile (e.g. cd build && make -j16) and run the verification test binary (e.g. export LD_LIBRARY_PATH=$PWD/build/lib:$LD_LIBRARY_PATH && ./nccl-test/build/sendrecv_perf -b 4 -e 32 -f 2) to verify 0 compile errors and #wrong=0!',
+                  mandatoryNextStep: postDiag.semanticErrors
+                    ? `Fix SEMANTIC_DIAGNOSTICS_FAILED first, then run_command: ${preferredVerifyCommand}`
+                    : `CRITICAL: You just modified a verifiable source file. Your NEXT tool call MUST be run_command with: ${preferredVerifyCommand}`,
                 }
               : {}),
           };
@@ -1902,29 +2454,335 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                 'Missing filePath parameter for write_file (tool call JSON may have been truncated). Please use edit_file for targeted changes or call write_file for one file at a time.',
             };
           }
-          const writeRes = await this.proposeAndApplyFileEdit({
-            sessionId,
-            manifest,
-            targetFile: filePath,
-            proposedContent: content,
-            signal,
-            runCapabilityTool,
-            diffIds,
-          });
+          try {
+            const existing = (await runCapabilityTool('read-file', { filePath }, 'low')) as {
+              content: string;
+            };
+            if (existing?.content != null) {
+              fileStateCache.makeSnapshot(filePath, existing.content);
+            }
+          } catch {
+            // new file
+          }
+          const writeRes = await applyFileEdit(filePath, content);
+          fileStateCache.recordRead({ filePath, content, isPartialView: false });
           recordCompiledFileEdit(filePath);
-          const isCompiledSrc = /\.(?:c|cc|cpp|cu|h|hpp)$/i.test(filePath);
+          const postDiag = await runPostEditDiagnostics(filePath, content);
+          const needsVerify =
+            typeof isVerifiableSourcePath === 'function'
+              ? isVerifiableSourcePath(filePath, verifyConfig)
+              : /\.(?:c|cc|cpp|cu|h|hpp|ts|tsx|js|jsx|py|go|rs)$/i.test(filePath);
           return {
             ok: true,
             filePath,
             diffId: writeRes.diffId,
             bytesWritten: writeRes.bytesWritten,
             operation: writeRes.operation,
-            ...(isCompiledSrc
+            appliedToDisk: writeRes.appliedToDisk,
+            ...postDiag,
+            ...(needsVerify
               ? {
-                  mandatoryNextStep:
-                    'CRITICAL: You just modified a C/C++/HIP file. Your NEXT tool call MUST be run_command to compile (e.g. cd build && make -j16) and run the verification test binary (e.g. export LD_LIBRARY_PATH=$PWD/build/lib:$LD_LIBRARY_PATH && ./nccl-test/build/sendrecv_perf -b 4 -e 32 -f 2) to verify 0 compile errors and #wrong=0!',
+                  mandatoryNextStep: postDiag.semanticErrors
+                    ? `Fix SEMANTIC_DIAGNOSTICS_FAILED first, then run_command: ${preferredVerifyCommand}`
+                    : `CRITICAL: You just modified a verifiable source file. Your NEXT tool call MUST be run_command with: ${preferredVerifyCommand}`,
                 }
               : {}),
+          };
+        },
+      }),
+      createTool({
+        name: 'apply_patch',
+        description:
+          'Apply a unified diff / multi-hunk patch to one or more workspace files. Prefer this over many edit_file calls for large or multi-site changes. Supports classic ---/+++ @@ hunks and *** Update File: path blocks.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            patch: {
+              type: 'string',
+              description: 'Unified diff text (may include multiple files)',
+            },
+            filePath: {
+              type: 'string',
+              description:
+                'Optional single target file when the patch omits paths or targets one file',
+            },
+          },
+          required: ['patch'],
+        },
+        execute: async (rawArgs: Record<string, unknown>) => {
+          if (
+            typeof applyPatchToContent !== 'function' &&
+            typeof applyMultiFilePatch !== 'function'
+          ) {
+            return { ok: false, error: 'apply_patch unavailable in this runtime build.' };
+          }
+          const patch = String(rawArgs?.patch || rawArgs?.diff || '');
+          if (!patch.trim()) {
+            return { ok: false, error: 'patch text is required.' };
+          }
+          const preferred = rawArgs?.filePath
+            ? this.normalizeWorkspaceRelativePath(
+                String(rawArgs.filePath),
+                manifest.workspaceRoot
+              )
+            : '';
+
+          const contentCache = new Map<string, string | null>();
+          const readCached = async (rel: string): Promise<string | null> => {
+            const filePath = this.normalizeWorkspaceRelativePath(rel, manifest.workspaceRoot);
+            if (contentCache.has(filePath)) return contentCache.get(filePath) ?? null;
+            try {
+              const current = (await runCapabilityTool(
+                'read-file',
+                { filePath },
+                'low'
+              )) as { content: string };
+              const text = current?.content ?? '';
+              contentCache.set(filePath, text);
+              fileStateCache.makeSnapshot(filePath, text);
+              return text;
+            } catch {
+              contentCache.set(filePath, null);
+              return null;
+            }
+          };
+
+          let targets =
+            typeof listPatchFiles === 'function' ? listPatchFiles(patch) : [];
+          if (targets.length === 0 && preferred) targets = [preferred];
+          if (targets.length === 0) {
+            return {
+              ok: false,
+              error:
+                'PATCH_NO_TARGETS: Include *** Update/Add/Delete File: path or ---/+++ paths, or pass filePath.',
+            };
+          }
+
+          // Prefetch contents for multi-file in-memory apply
+          for (const t of targets.slice(0, 8)) {
+            await readCached(t);
+          }
+
+          const runPatchPlan = () => {
+            const multi =
+              typeof applyMultiFilePatch === 'function'
+                ? applyMultiFilePatch(patch, (p) => {
+                    const norm = this.normalizeWorkspaceRelativePath(p, manifest.workspaceRoot);
+                    return contentCache.has(norm) ? contentCache.get(norm) ?? null : null;
+                  })
+                : null;
+            return multi;
+          };
+
+          let multi = runPatchPlan();
+
+          // Stage S5: one-shot auto recovery — clear cache, re-read disk, retry patch once
+          if (multi && !multi.ok) {
+            for (const t of targets.slice(0, 8)) {
+              const norm = this.normalizeWorkspaceRelativePath(t, manifest.workspaceRoot);
+              contentCache.delete(norm);
+              await readCached(norm);
+            }
+            multi = runPatchPlan();
+          }
+
+          if (multi && !multi.ok) {
+            editMismatchCount += 1;
+            const failedPath =
+              (multi.files || []).find((f: any) => f.error)?.filePath || targets[0] || '';
+            let recoveryWindow = '';
+            if (failedPath) {
+              try {
+                const fresh = (await readCached(failedPath)) || '';
+                const lines = fresh.split(/\r?\n/);
+                const needle = (multi.hint || '').match(/L(\d+)/)?.[1];
+                const mid = needle ? Number(needle) : Math.min(40, lines.length);
+                const s = Math.max(1, mid - 12);
+                const e = Math.min(lines.length, mid + 12);
+                recoveryWindow = lines
+                  .slice(s - 1, e)
+                  .map((ln, i) => `L${s + i}|${ln}`)
+                  .join('\n');
+              } catch {
+                // ignore
+              }
+            }
+            return {
+              ok: false,
+              error: multi.error,
+              hint: multi.hint,
+              files: multi.files,
+              refreshedSnippet: recoveryWindow || undefined,
+              mandatoryNextStep: recoveryWindow
+                ? `PATCH_RECOVERY: old context still missing after auto re-read. Use this numbered window to craft a fresh patch or fall back to edit_file:\n${recoveryWindow}`
+                : 'Fix PATCH failures using the hint windows, or fall back to edit_file for the failing hunks. Re-read the file with line numbers before retrying.',
+            };
+          }
+
+          let planned =
+            multi?.files ||
+            (
+              await Promise.all(
+                targets.slice(0, 8).map(async (target) => {
+                  const filePath = this.normalizeWorkspaceRelativePath(
+                    target,
+                    manifest.workspaceRoot
+                  );
+                  const currentContent = (await readCached(filePath)) ?? '';
+                  const applied = applyPatchToContent(filePath, currentContent, patch);
+                  return {
+                    filePath,
+                    beforeContent: currentContent,
+                    afterContent: applied.ok ? applied.content ?? null : null,
+                    deleted: Boolean(applied.deleted),
+                    created: Boolean(applied.created),
+                    hunksApplied: applied.hunksApplied,
+                    error: applied.ok ? undefined : applied.error,
+                    hint: applied.hint,
+                  };
+                })
+              )
+            );
+
+          // Stage S5 (single-file path): retry once on first planned item failure
+          if (
+            Array.isArray(planned) &&
+            planned.some((p: any) => p.error || (p.afterContent == null && !p.deleted))
+          ) {
+            for (const t of targets.slice(0, 8)) {
+              const norm = this.normalizeWorkspaceRelativePath(t, manifest.workspaceRoot);
+              contentCache.delete(norm);
+              await readCached(norm);
+            }
+            planned = await Promise.all(
+              targets.slice(0, 8).map(async (target) => {
+                const filePath = this.normalizeWorkspaceRelativePath(
+                  target,
+                  manifest.workspaceRoot
+                );
+                const currentContent = (await readCached(filePath)) ?? '';
+                const applied = applyPatchToContent(filePath, currentContent, patch);
+                return {
+                  filePath,
+                  beforeContent: currentContent,
+                  afterContent: applied.ok ? applied.content ?? null : null,
+                  deleted: Boolean(applied.deleted),
+                  created: Boolean(applied.created),
+                  hunksApplied: applied.hunksApplied,
+                  error: applied.ok ? undefined : applied.error,
+                  hint: applied.hint,
+                };
+              })
+            );
+          }
+
+          const results: Array<Record<string, unknown>> = [];
+          const written: Array<{ filePath: string; before: string | null }> = [];
+
+          const unlinkWorkspaceFile = async (relFile: string) => {
+            const abs = path.resolve(manifest.workspaceRoot, relFile);
+            if (!abs.startsWith(path.resolve(manifest.workspaceRoot))) {
+              throw new Error(`PATH_BOUNDARY_VIOLATION: ${relFile}`);
+            }
+            await fs.unlink(abs);
+          };
+
+          const rollbackWritten = async () => {
+            for (const w of written.reverse()) {
+              try {
+                if (w.before == null) {
+                  await unlinkWorkspaceFile(w.filePath).catch(() => undefined);
+                } else {
+                  await applyFileEdit(w.filePath, w.before);
+                }
+              } catch {
+                // best-effort rollback
+              }
+            }
+          };
+
+          for (const item of planned as Array<any>) {
+            const filePath = this.normalizeWorkspaceRelativePath(
+              item.filePath,
+              manifest.workspaceRoot
+            );
+            if (item.error || (item.afterContent == null && !item.deleted)) {
+              editMismatchCount += 1;
+              await rollbackWritten();
+              return {
+                ok: false,
+                error: item.error || `Failed applying patch to ${filePath}`,
+                hint: item.hint,
+                files: results,
+                rolledBack: written.map((w) => w.filePath),
+                mandatoryNextStep:
+                  'Fix PATCH failures using the hint windows, or fall back to edit_file. Re-read the file before retrying.',
+              };
+            }
+
+            if (item.deleted) {
+              try {
+                await unlinkWorkspaceFile(filePath);
+                written.push({ filePath, before: item.beforeContent ?? null });
+                results.push({
+                  ok: true,
+                  filePath,
+                  deleted: true,
+                  hunksApplied: item.hunksApplied,
+                });
+              } catch (err) {
+                await rollbackWritten();
+                return {
+                  ok: false,
+                  error: `Failed deleting ${filePath}: ${(err as Error).message}`,
+                  files: results,
+                  rolledBack: written.map((w) => w.filePath),
+                };
+              }
+              continue;
+            }
+
+            try {
+              const writeRes = await applyFileEdit(filePath, String(item.afterContent));
+              written.push({ filePath, before: item.beforeContent ?? null });
+              fileStateCache.recordRead({
+                filePath,
+                content: String(item.afterContent),
+                isPartialView: false,
+              });
+              recordCompiledFileEdit(filePath);
+              const postDiag = await runPostEditDiagnostics(
+                filePath,
+                String(item.afterContent)
+              );
+              editMismatchCount = 0;
+              results.push({
+                ok: true,
+                filePath,
+                diffId: writeRes.diffId,
+                bytesWritten: writeRes.bytesWritten,
+                hunksApplied: item.hunksApplied,
+                created: Boolean(item.created),
+                ...postDiag,
+              });
+            } catch (err) {
+              await rollbackWritten();
+              return {
+                ok: false,
+                error: `Write failed for ${filePath}: ${(err as Error).message}`,
+                files: results,
+                rolledBack: written.map((w) => w.filePath),
+              };
+            }
+          }
+
+          const anySemantic = results.some((r) => Boolean(r.semanticErrors));
+          return {
+            ok: true,
+            files: results,
+            mandatoryNextStep: anySemantic
+              ? `Fix SEMANTIC_DIAGNOSTICS_FAILED first, then run_command: ${preferredVerifyCommand}`
+              : `CRITICAL: After apply_patch, run_command with: ${preferredVerifyCommand}`,
           };
         },
       }),
@@ -2065,16 +2923,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         execute: async (rawArgs: Record<string, unknown>) => {
           let cmd = String(rawArgs?.customBuildCommand || '').trim();
           if (!cmd) {
-            if (isSshMirrorWorkspace || workspaceFilesHint.includes('build/') || workspaceFilesHint.includes('CMakeLists.txt')) {
-              const hasNcclTest = workspaceFilesHint.includes('nccl-test');
-              cmd = hasNcclTest
-                ? 'cd build && make -j16 && cd ../nccl-test && export LD_LIBRARY_PATH=$PWD/../build/lib:$LD_LIBRARY_PATH && ./build/sendrecv_perf -b 4 -e 32 -f 2'
-                : 'if [ -d build ]; then cd build && make -j16; elif [ -f Makefile ]; then make -j16; fi';
-            } else if (workspaceFilesHint.includes('package.json')) {
-              cmd = 'npm test';
-            } else {
-              cmd = 'make -j16';
-            }
+            cmd = preferredVerifyCommand;
           }
           const res = (await runCapabilityTool('run-build', { command: cmd }, 'high')) as {
             exitCode: number;
@@ -2141,32 +2990,22 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           required: ['title', 'content'],
         },
         execute: async (rawArgs: Record<string, unknown>) => {
-          const artifactType = String(rawArgs?.artifactType || 'plan');
+          const artifactType = String(rawArgs?.artifactType || 'plan') as
+            | 'plan'
+            | 'task_list'
+            | 'walkthrough'
+            | 'report';
           const title = String(rawArgs?.title || 'Implementation Plan').trim();
           const content = String(rawArgs?.content || '').trim();
-          const artifactId = `art_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-          const artifactsDir = path.join(this.storageDir, '..', 'artifacts');
-          await fs.mkdir(artifactsDir, { recursive: true });
-          const artifactRecord = {
-            id: artifactId,
-            sessionId,
+          const saved = await persistSessionArtifact({
             artifactType,
             title,
             content,
-            workspaceRoot: manifest.workspaceRoot,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-          await fs.writeFile(
-            path.join(artifactsDir, `${artifactId}.json`),
-            JSON.stringify(artifactRecord, null, 2),
-            'utf-8'
-          );
+            source: 'write_artifact',
+          });
           return {
             ok: true,
-            artifactId,
-            artifactType,
-            title,
+            ...saved,
             notice: `Artifact "${title}" (${artifactType}) saved to IDE Artifacts Pane.`,
           };
         },
@@ -2174,13 +3013,13 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       createTool({
         name: 'invoke_subagent',
         description:
-          'Invoke a specialized Antigravity subagent (role: "research" | "planner" | "verifier") to perform parallel codebase exploration, symbol lookup, or build/test verification in an isolated context and return a concise structured report.',
+          'Invoke a specialized Antigravity subagent (role: "research" | "planner" | "verifier" | "editor") to perform parallel codebase exploration, symbol lookup, build/test verification, or a budgeted isolated edit (max 3 files / 6 hunks, rollback on diagnose fail).',
         inputSchema: {
           type: 'object',
           properties: {
             role: {
               type: 'string',
-              enum: ['research', 'planner', 'verifier'],
+              enum: ['research', 'planner', 'verifier', 'editor'],
               description: 'Subagent role',
             },
             task: {
@@ -2208,18 +3047,477 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             : [];
           const files = Array.isArray(rawArgs?.files)
             ? rawArgs.files.map((f) => String(f).trim()).filter(Boolean).slice(0, 4)
-            : [];
+            : sessionWrittenFiles.slice(-6);
 
           const digestLines: string[] = [
             `[Subagent (${role.toUpperCase()}) Completed Task: ${task}]`,
           ];
+
+          if (role === 'editor' && typeof runEditSubagent === 'function') {
+            const sandbox =
+              typeof createSubagentSandbox === 'function'
+                ? createSubagentSandbox('editor')
+                : null;
+            const targetFiles =
+              files.length > 0
+                ? files
+                    .map((f) => this.normalizeWorkspaceRelativePath(f, manifest.workspaceRoot))
+                    .slice(0, 3)
+                : Array.from(new Set(sessionWrittenFiles.slice(-4)));
+            const result = await runEditSubagent({
+              task,
+              files: targetFiles,
+              maxFiles: 3,
+              maxEdits: 6,
+              readFile: async (relPath: string) => {
+                const run = async () => {
+                  const res = (await runCapabilityTool(
+                    'read-file',
+                    { filePath: relPath },
+                    'low'
+                  )) as { content: string };
+                  return res?.content || '';
+                };
+                return sandbox ? sandbox.wrap('read_file', relPath, run) : run();
+              },
+              // Stage S1: always go through applyFileEdit so Diff / Manual approval apply
+              writeFile: async (relPath: string, content: string) => {
+                const run = async () => {
+                  const writeRes = await applyFileEdit(relPath, content);
+                  recordCompiledFileEdit(relPath);
+                  fileStateCache.recordRead({
+                    filePath: relPath,
+                    content,
+                    isPartialView: false,
+                  });
+                  void writeRes;
+                };
+                return sandbox ? sandbox.wrap('write_file', relPath, run) : run();
+              },
+              applyEdit: async (relPath: string, oldText: string, newText: string) => {
+                const run = async () => {
+                  try {
+                    const current = (await runCapabilityTool(
+                      'read-file',
+                      { filePath: relPath },
+                      'low'
+                    )) as { content: string };
+                    const next = this.applySmartTextReplacement(
+                      current.content || '',
+                      oldText,
+                      newText,
+                      relPath
+                    );
+                    const writeRes = await applyFileEdit(relPath, next);
+                    recordCompiledFileEdit(relPath);
+                    fileStateCache.recordRead({
+                      filePath: relPath,
+                      content: next,
+                      isPartialView: false,
+                    });
+                    return { ok: true, content: next, diffId: writeRes.diffId };
+                  } catch (err) {
+                    return { ok: false, error: (err as Error).message };
+                  }
+                };
+                return sandbox ? sandbox.wrap('edit_file', relPath, run) : run();
+              },
+              diagnose: async (relPath: string, content: string) => {
+                const run = async () => {
+                  try {
+                    const post = await runPostEditDiagnostics(relPath, content);
+                    return post.semanticErrors || null;
+                  } catch {
+                    return null;
+                  }
+                };
+                return sandbox ? sandbox.wrap('diagnose', relPath, run) : run();
+              },
+              // Stage T4: shared diagnose→verify contract with verifier
+              verify: async () => {
+                const run = async () => {
+                  if (!preferredVerifyCommand) {
+                    return { skipped: true, reason: 'no verify command configured' };
+                  }
+                  try {
+                    const res = (await runCapabilityTool(
+                      'run-build',
+                      { command: preferredVerifyCommand },
+                      'high'
+                    )) as { exitCode: number; stdout: string; stderr: string };
+                    recordCommandOutcome(preferredVerifyCommand, res);
+                    return {
+                      exitCode: res.exitCode,
+                      stdout: (res.stdout || '').slice(0, 2000),
+                      stderr: (res.stderr || '').slice(0, 1200),
+                    };
+                  } catch (err) {
+                    return { exitCode: 1, stderr: (err as Error).message };
+                  }
+                };
+                return sandbox ? sandbox.wrap('verify', preferredVerifyCommand, run) : run();
+              },
+              llmPropose: async ({ task: editTask, snippets }) => {
+                const run = async () => {
+                  try {
+                    const resp = await postJsonResilient({
+                      url: endpoint,
+                      headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${apiKey}`,
+                      },
+                      body: {
+                        model: /deepseek/i.test(manifest.modelId || provider.defaultModelId)
+                          ? 'deepseek-chat'
+                          : manifest.modelId || provider.defaultModelId,
+                        messages: [
+                          {
+                            role: 'system',
+                            content:
+                              'You are a budgeted edit subagent. Reply with JSON only: [{"filePath":"...","oldText":"...","newText":"..."}]. Max 6 edits across at most 3 files. oldText must be an exact contiguous snippet from the provided files. No markdown except optional ```json fence.',
+                          },
+                          {
+                            role: 'user',
+                            content: [
+                              `Task: ${editTask.slice(0, 1500)}`,
+                              '',
+                              ...snippets.map(
+                                (s) => `### FILE ${s.filePath}\n\`\`\`\n${s.content}\n\`\`\``
+                              ),
+                            ].join('\n'),
+                          },
+                        ],
+                        max_tokens: 2500,
+                        temperature: 0.1,
+                      },
+                      signal,
+                      timeoutMs: 20_000,
+                    });
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    const data = JSON.parse(resp.text || '{}');
+                    return String(data?.choices?.[0]?.message?.content || '');
+                  } catch {
+                    return '[]';
+                  }
+                };
+                return sandbox ? sandbox.wrap('llm_propose', undefined, run) : run();
+              },
+            });
+            const report = sandbox
+              ? sandbox.capReport(
+                  `${result.report}\n\n## Sandbox transcript\n${sandbox.formatTranscript()}`
+                )
+              : result.report;
+            try {
+              await persistSessionArtifact({
+                artifactType: 'report',
+                title: `Editor: ${task.slice(0, 80)}`,
+                content: report || '',
+                source: 'invoke_subagent:editor',
+              });
+            } catch {
+              // best-effort
+            }
+            return {
+              ok: result.ok,
+              role: 'editor',
+              task,
+              filesInspected: result.filesInspected,
+              filesEdited: result.filesEdited,
+              editsApplied: result.editsApplied,
+              rolledBack: result.rolledBack,
+              verified: result.verified,
+              report,
+              errors: result.errors,
+              sandbox: sandbox?.summary(),
+            };
+          }
+
+          if (role === 'verifier') {
+            const sandbox =
+              typeof createSubagentSandbox === 'function'
+                ? createSubagentSandbox('verifier')
+                : null;
+            const targetFiles =
+              files.length > 0
+                ? files.map((f) =>
+                    this.normalizeWorkspaceRelativePath(f, manifest.workspaceRoot)
+                  )
+                : Array.from(new Set(sessionWrittenFiles.slice(-8)));
+
+            const gate =
+              typeof runDiagnoseAndVerify === 'function'
+                ? await runDiagnoseAndVerify({
+                    files: targetFiles.slice(0, 6),
+                    alwaysVerify: true,
+                    readFile: async (relPath: string) => {
+                      const run = async () => {
+                        const res = (await runCapabilityTool(
+                          'read-file',
+                          { filePath: relPath },
+                          'low'
+                        )) as { content: string };
+                        return res?.content || '';
+                      };
+                      return sandbox ? sandbox.wrap('read_file', relPath, run) : run();
+                    },
+                    diagnose: async (relPath: string, content: string) => {
+                      const run = async () => {
+                        try {
+                          const post = await runPostEditDiagnostics(relPath, content);
+                          return post.semanticErrors || null;
+                        } catch {
+                          return null;
+                        }
+                      };
+                      return sandbox ? sandbox.wrap('diagnose', relPath, run) : run();
+                    },
+                    verify: async () => {
+                      const run = async () => {
+                        if (!preferredVerifyCommand) {
+                          return { skipped: true, reason: 'no verify command configured' };
+                        }
+                        try {
+                          const res = (await runCapabilityTool(
+                            'run-build',
+                            { command: preferredVerifyCommand },
+                            'high'
+                          )) as { exitCode: number; stdout: string; stderr: string };
+                          recordCommandOutcome(preferredVerifyCommand, res);
+                          return {
+                            exitCode: res.exitCode,
+                            stdout: (res.stdout || '').slice(0, 2500),
+                            stderr: (res.stderr || '').slice(0, 1500),
+                          };
+                        } catch (err) {
+                          return { exitCode: 1, stderr: (err as Error).message };
+                        }
+                      };
+                      return sandbox
+                        ? sandbox.wrap('verify', preferredVerifyCommand, run)
+                        : run();
+                    },
+                  })
+                : null;
+
+            const passed = gate ? gate.passed : false;
+            lastVerifierPass = passed;
+            if (!passed) {
+              if (gate?.semanticFailed) lastSemanticFailed = true;
+              if (gate?.verifyFailed) lastBuildOrTestFailed = true;
+            }
+
+            const reportBody = [
+              `[Subagent (VERIFIER) Completed Task: ${task}]`,
+              `## Verdict: ${passed ? 'PASS' : 'FAIL'}`,
+              `## Language diagnostics\n${gate?.diagLines.join('\n\n') || '(no files)'}`,
+              `## Verify command\n\`${preferredVerifyCommand}\`\nexit=${gate?.verifyResult.exitCode ?? 'n/a'}\n${
+                gate?.verifyResult.stdout || ''
+              }\n${gate?.verifyResult.stderr || ''}${
+                gate?.verifyResult.skipped ? `\n(skipped: ${gate.verifyResult.reason})` : ''
+              }`,
+              sandbox ? `## Sandbox transcript\n${sandbox.formatTranscript()}` : '',
+            ]
+              .filter(Boolean)
+              .join('\n\n');
+
+            return {
+              ok: true,
+              role,
+              task,
+              passed,
+              filesInspected: targetFiles,
+              report: sandbox ? sandbox.capReport(reportBody, 7000) : reportBody.slice(0, 7000),
+              sandbox: sandbox?.summary(),
+            };
+          }
+
+          // research / planner: multi-round read-only exploration (no nested LLM)
+          if (
+            (role === 'research' || role === 'planner') &&
+            typeof runResearchSubagent === 'function'
+          ) {
+            const sandbox =
+              typeof createSubagentSandbox === 'function'
+                ? createSubagentSandbox(role === 'planner' ? 'planner' : 'research')
+                : null;
+            const runner =
+              role === 'planner' && typeof runPlannerSubagent === 'function'
+                ? runPlannerSubagent
+                : runResearchSubagent;
+            const result = await runner({
+              workspaceRoot: manifest.workspaceRoot,
+              task,
+              queries,
+              files: files.map((f) =>
+                this.normalizeWorkspaceRelativePath(f, manifest.workspaceRoot)
+              ),
+              index: workspaceFileIndex || undefined,
+              maxRounds: role === 'planner' ? 2 : 4,
+              maxReportChars: 5500,
+              llmDecompose: async (researchTask: string) => {
+                const run = async () => {
+                  try {
+                    const resp = await postJsonResilient({
+                      url: endpoint,
+                      headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${apiKey}`,
+                      },
+                      body: {
+                        model: /deepseek/i.test(manifest.modelId || provider.defaultModelId)
+                          ? 'deepseek-chat'
+                          : manifest.modelId || provider.defaultModelId,
+                        messages: [
+                          {
+                            role: 'system',
+                            content:
+                              'You decompose coding research tasks into sharp questions and search queries. Reply with JSON only: {"questions":["..."],"searchQueries":["ident","path.ts"]}. Max 6 questions and 8 searchQueries. No markdown.',
+                          },
+                          { role: 'user', content: researchTask.slice(0, 1200) },
+                        ],
+                        max_tokens: 400,
+                        temperature: 0.1,
+                      },
+                      signal,
+                      timeoutMs: 8000,
+                    });
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    const data = JSON.parse(resp.text || '{}');
+                    return String(data?.choices?.[0]?.message?.content || '');
+                  } catch {
+                    return '';
+                  }
+                };
+                return sandbox ? sandbox.wrap('llm_decompose', undefined, run) : run();
+              },
+              llmSynthesize: async ({ task: researchTask, evidence }) => {
+                const run = async () => {
+                  try {
+                    const resp = await postJsonResilient({
+                      url: endpoint,
+                      headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${apiKey}`,
+                      },
+                      body: {
+                        model: /deepseek/i.test(manifest.modelId || provider.defaultModelId)
+                          ? 'deepseek-chat'
+                          : manifest.modelId || provider.defaultModelId,
+                        messages: [
+                          {
+                            role: 'system',
+                            content:
+                              'You are a budgeted research subagent. From the evidence, output 5-12 lines: root cause hypothesis with file:line cites, key files, and next edit/verify steps. No tools. Be concrete.',
+                          },
+                          {
+                            role: 'user',
+                            content: `Task: ${researchTask.slice(0, 800)}\n\nEvidence:\n${evidence.slice(0, 4500)}`,
+                          },
+                        ],
+                        max_tokens: 500,
+                        temperature: 0.15,
+                      },
+                      signal,
+                      timeoutMs: 12_000,
+                    });
+                    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                    const data = JSON.parse(resp.text || '{}');
+                    return String(data?.choices?.[0]?.message?.content || '');
+                  } catch {
+                    return '';
+                  }
+                };
+                return sandbox ? sandbox.wrap('llm_synthesize', undefined, run) : run();
+              },
+              search: async (query: string) => {
+                const run = async () => {
+                  if (workspaceFileIndex && typeof searchIndexedFiles === 'function') {
+                    return searchIndexedFiles({
+                      root: manifest.workspaceRoot,
+                      index: workspaceFileIndex,
+                      query,
+                      mode: 'auto',
+                      maxMatches: 30,
+                      contextLines: 2,
+                    });
+                  }
+                  return 'No matches found.';
+                };
+                return sandbox ? sandbox.wrap('search', query, run) : run();
+              },
+              readFile: async (relPath: string) => {
+                const run = async () => {
+                  const res = (await runCapabilityTool(
+                    'read-file',
+                    { filePath: relPath },
+                    'low'
+                  )) as { content: string };
+                  return res?.content || '';
+                };
+                return sandbox ? sandbox.wrap('read_file', relPath, run) : run();
+              },
+            });
+            if (sessionTodos && Array.isArray(result.suggestedTodos) && sessionTodos.list().length === 0) {
+              sessionTodos.manage({
+                action: 'set',
+                items: result.suggestedTodos.map((content: string) => ({
+                  content,
+                  status: 'pending' as const,
+                })),
+              });
+            }
+            const cappedReport = sandbox
+              ? sandbox.capReport(
+                  `${result.report}\n\n## Sandbox transcript\n${sandbox.formatTranscript()}`
+                )
+              : result.report;
+            let artifactId: string | undefined;
+            try {
+              const artType = role === 'planner' ? 'plan' : 'report';
+              const saved = await persistSessionArtifact({
+                artifactType: artType,
+                title:
+                  role === 'planner'
+                    ? `Plan: ${task.slice(0, 80)}`
+                    : `Research: ${task.slice(0, 80)}`,
+                content: cappedReport || '',
+                source: `invoke_subagent:${role}`,
+              });
+              artifactId = saved.artifactId;
+              if (sessionTodos && sessionTodos.list().length > 0) {
+                await persistSessionArtifact({
+                  artifactType: 'task_list',
+                  title: `Todos: ${task.slice(0, 60)}`,
+                  content: `# Session Todos\n\n${sessionTodos.formatForPrompt()}\n`,
+                  source: 'invoke_subagent:todos',
+                });
+              }
+            } catch {
+              // artifact persistence is best-effort
+            }
+            return {
+              ok: true,
+              role: result.role,
+              task,
+              rounds: result.rounds,
+              queries: result.queries,
+              filesInspected: result.filesInspected,
+              suggestedTodos: result.suggestedTodos,
+              sessionTodos: sessionTodos?.list() || [],
+              report: cappedReport,
+              artifactId,
+              sandbox: sandbox?.summary(),
+            };
+          }
+
           for (const f of files) {
             const relPath = this.normalizeWorkspaceRelativePath(f, manifest.workspaceRoot);
             try {
               const res = (await runCapabilityTool('read-file', { filePath: relPath }, 'low')) as {
                 content: string;
               };
-              const outline = extractCodeOutline(res.content, 40).join('\n');
+              const outline = extractCodeOutline(res.content, 40, relPath).join('\n');
               digestLines.push(
                 `### Inspected \`${relPath}\` (${res.content.split(/\r?\n/).length} lines)\n${
                   outline || res.content.slice(0, 1200)
@@ -2240,105 +3538,237 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         },
       }),
       createTool({
-        name: 'browser_action',
+        name: 'manage_todo',
         description:
-          'Autonomous browser inspection tool to inspect, navigate, and test running web applications (e.g. http://localhost:3000/). Can fetch HTML DOM, verify response headers, inspect page elements/buttons/links, check network health, and capture structured console/page diagnostics.',
+          'Session task checklist for long-horizon goals. Use action=set/add/update/complete/list to track what is done vs remaining. Incomplete todos are auto-injected on self-heal continuations.',
         inputSchema: {
           type: 'object',
           properties: {
             action: {
               type: 'string',
-              enum: ['navigate', 'get_html', 'inspect_elements', 'get_console_logs'],
-              description: 'Browser action to execute',
+              enum: ['list', 'set', 'add', 'update', 'complete', 'cancel', 'clear'],
+              description: 'Todo mutation',
             },
-            url: {
-              type: 'string',
-              description: 'Target web URL (defaults to http://localhost:3000/ or current preview URL)',
+            items: {
+              type: 'array',
+              description: 'Full list for action=set: [{ content, status? }]',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  content: { type: 'string' },
+                  status: {
+                    type: 'string',
+                    enum: ['pending', 'in_progress', 'completed', 'cancelled'],
+                  },
+                },
+                required: ['content'],
+              },
             },
-            selector: {
+            id: { type: 'string', description: 'Todo id for update/complete/cancel' },
+            content: { type: 'string', description: 'Todo text for add/update' },
+            status: {
               type: 'string',
-              description: 'Optional CSS selector or keyword to inspect in DOM',
+              enum: ['pending', 'in_progress', 'completed', 'cancelled'],
             },
           },
           required: ['action'],
         },
         execute: async (rawArgs: Record<string, unknown>) => {
-          const action = String(rawArgs?.action || 'navigate');
-          const targetUrl = String(rawArgs?.url || 'http://localhost:3000/').trim();
-          const selector = rawArgs?.selector ? String(rawArgs.selector).trim() : undefined;
-
-          try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 8000);
-            const resp = await fetch(targetUrl, { signal: controller.signal });
-            clearTimeout(timeout);
-            const status = resp.status;
-            const statusText = resp.statusText;
-            const contentType = resp.headers.get('content-type') || '';
-            const html = await resp.text();
-
-            // Extract title
-            const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
-            const pageTitle = titleMatch ? titleMatch[1].trim() : 'Untitled Document';
-
-            // Extract headings
-            const headings = Array.from(html.matchAll(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/gi))
-              .map((m) => m[1].replace(/<[^>]+>/g, '').trim())
-              .filter(Boolean)
-              .slice(0, 10);
-
-            // Extract buttons and links
-            const buttons = Array.from(html.matchAll(/<button[^>]*>([\s\S]*?)<\/button>/gi))
-              .map((m) => m[1].replace(/<[^>]+>/g, '').trim())
-              .filter(Boolean)
-              .slice(0, 15);
-
-            const links = Array.from(
-              html.matchAll(/<a[^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi)
-            )
-              .map((m) => ({ href: m[1], label: m[2].replace(/<[^>]+>/g, '').trim() }))
-              .filter((l) => Boolean(l.label))
-              .slice(0, 15);
-
-            let selectorMatches: string[] = [];
-            if (selector) {
-              const regex = new RegExp(
-                `<[^>]+(?:id|class)=["'][^"']*${selector.replace(/[.#]/g, '')}[^"']*["'][^>]*>[\\s\\S]*?<\\/[^>]+>`,
-                'gi'
-              );
-              selectorMatches = Array.from(html.matchAll(regex))
-                .map((m) => m[0].slice(0, 200))
-                .slice(0, 5);
-            }
-
-            return {
-              ok: resp.ok,
-              action,
-              targetUrl,
-              httpStatus: `${status} ${statusText}`,
-              contentType,
-              pageTitle,
-              headings,
-              interactiveElements: {
-                buttonCount: buttons.length,
-                buttons,
-                links,
-              },
-              ...(selector ? { selector, selectorMatches } : {}),
-              contentLength: html.length,
-              htmlSnippet: action === 'get_html' ? html.slice(0, 4000) : html.slice(0, 1200),
-            };
-          } catch (err) {
-            return {
-              ok: false,
-              action,
-              targetUrl,
-              error: `Browser navigation/inspection failed: ${(err as Error).message}`,
-              hint: 'Verify the local web server is running (e.g. npm run dev / npm start) and listening on this port.',
-            };
+          if (!sessionTodos) {
+            return { ok: false, error: 'Session todos unavailable.' };
           }
+          const result = sessionTodos.manage({
+            action: String(rawArgs?.action || 'list') as any,
+            items: Array.isArray(rawArgs?.items) ? (rawArgs.items as any) : undefined,
+            id: rawArgs?.id ? String(rawArgs.id) : undefined,
+            content: rawArgs?.content ? String(rawArgs.content) : undefined,
+            status: rawArgs?.status as any,
+          });
+          const action = String(rawArgs?.action || 'list');
+          if (
+            result.ok &&
+            ['set', 'add', 'update', 'complete', 'cancel'].includes(action) &&
+            sessionTodos.list().length > 0
+          ) {
+            try {
+              await persistSessionArtifact({
+                artifactType: 'task_list',
+                title: 'Session Todos',
+                content: `# Session Todos\n\n${sessionTodos.formatForPrompt()}\n`,
+                source: 'manage_todo',
+              });
+            } catch {
+              // ignore
+            }
+          }
+          return result;
         },
       }),
+      createTool({
+        name: 'browser_action',
+        description:
+          'Inspect and (with Chrome CDP) interact with running web apps. Actions: navigate, get_html, snapshot, inspect_elements, get_console_logs, click, type, screenshot. Prefers CDP at DEEPAUTOCODE_CDP_URL / localhost:9222; falls back to structured HTTP snapshot.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            action: {
+              type: 'string',
+              enum: [
+                'navigate',
+                'get_html',
+                'snapshot',
+                'inspect_elements',
+                'get_console_logs',
+                'click',
+                'type',
+                'screenshot',
+              ],
+              description: 'Browser action to execute',
+            },
+            url: {
+              type: 'string',
+              description: 'Target web URL (defaults to http://localhost:3000/)',
+            },
+            selector: {
+              type: 'string',
+              description: 'CSS selector for click/type/inspect',
+            },
+            text: {
+              type: 'string',
+              description: 'Text to type into selector (action=type)',
+            },
+          },
+          required: ['action'],
+        },
+        execute: async (rawArgs: Record<string, unknown>) => {
+          const { runBrowserAction } = await import('../core/AgentBrowser.js');
+          return runBrowserAction({
+            action: String(rawArgs?.action || 'navigate'),
+            url: rawArgs?.url ? String(rawArgs.url) : undefined,
+            selector: rawArgs?.selector ? String(rawArgs.selector) : undefined,
+            text: rawArgs?.text ? String(rawArgs.text) : undefined,
+          });
+        },
+      }),
+      createTool({
+        name: 'call_mcp_tool',
+        description:
+          'Call a Model Context Protocol (MCP) tool exposed by workspace .deepautocode/mcp.json servers. Prefer qualified names like mcp__serverId__toolName from the MCP tools list.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            tool: {
+              type: 'string',
+              description: 'Qualified MCP tool name (mcp__server__tool) or unique bare tool name',
+            },
+            arguments: {
+              type: 'object',
+              description: 'JSON arguments for the MCP tool',
+            },
+          },
+          required: ['tool'],
+        },
+        execute: async (rawArgs: Record<string, unknown>) => {
+          if (!mcpHost) {
+            return { ok: false, error: 'MCP host unavailable in this runtime build.' };
+          }
+          const toolName = String(rawArgs?.tool || rawArgs?.name || '');
+          const args =
+            rawArgs?.arguments && typeof rawArgs.arguments === 'object'
+              ? (rawArgs.arguments as Record<string, unknown>)
+              : rawArgs?.args && typeof rawArgs.args === 'object'
+                ? (rawArgs.args as Record<string, unknown>)
+                : {};
+          if (!toolName) return { ok: false, error: 'tool name is required' };
+          if (
+            typeof mcpHost.isToolDisabled === 'function' &&
+            mcpHost.isToolDisabled(toolName, mcpConfigsCached)
+          ) {
+            return { ok: false, error: `MCP tool disabled in Settings: ${toolName}` };
+          }
+          const result = await mcpHost.call(toolName, args);
+          return result;
+        },
+      }),
+      createTool({
+        name: 'list_mcp_resources',
+        description:
+          'List MCP resources discovered from connected servers (Stage W). Use read_mcp_resource to fetch content.',
+        inputSchema: { type: 'object', properties: {} },
+        execute: async () => {
+          if (!mcpHost) return { resources: [], error: 'MCP host unavailable' };
+          return { resources: mcpHost.listResources() };
+        },
+      }),
+      createTool({
+        name: 'read_mcp_resource',
+        description: 'Read an MCP resource by URI (from list_mcp_resources).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            uri: { type: 'string', description: 'Resource URI' },
+          },
+          required: ['uri'],
+        },
+        execute: async (rawArgs: Record<string, unknown>) => {
+          if (!mcpHost) return { ok: false, error: 'MCP host unavailable' };
+          return mcpHost.readResource(String(rawArgs?.uri || ''));
+        },
+      }),
+      createTool({
+        name: 'list_mcp_prompts',
+        description: 'List MCP prompt templates from connected servers.',
+        inputSchema: { type: 'object', properties: {} },
+        execute: async () => {
+          if (!mcpHost) return { prompts: [], error: 'MCP host unavailable' };
+          return { prompts: mcpHost.listPrompts() };
+        },
+      }),
+      createTool({
+        name: 'get_mcp_prompt',
+        description: 'Fetch an MCP prompt template by name (optional serverId + arguments).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            serverId: { type: 'string' },
+            arguments: { type: 'object' },
+          },
+          required: ['name'],
+        },
+        execute: async (rawArgs: Record<string, unknown>) => {
+          if (!mcpHost) return { ok: false, error: 'MCP host unavailable' };
+          const args =
+            rawArgs?.arguments && typeof rawArgs.arguments === 'object'
+              ? (rawArgs.arguments as Record<string, string>)
+              : undefined;
+          return mcpHost.getPrompt(
+            String(rawArgs?.name || ''),
+            args,
+            rawArgs?.serverId ? String(rawArgs.serverId) : undefined
+          );
+        },
+      }),
+      ...(mcpHost
+        ? mcpHost.listTools().slice(0, 32).map((td: any) =>
+            createTool({
+              name: td.qualifiedName,
+              description:
+                `[MCP:${td.serverName}] ${td.description || td.name}. Equivalent to call_mcp_tool({ tool: "${td.qualifiedName}", arguments })`,
+              inputSchema: td.inputSchema || { type: 'object', properties: {} },
+              execute: async (rawArgs: Record<string, unknown>) => {
+                if (
+                  typeof mcpHost.isToolDisabled === 'function' &&
+                  mcpHost.isToolDisabled(td.qualifiedName, mcpConfigsCached)
+                ) {
+                  return { ok: false, error: `MCP tool disabled in Settings: ${td.qualifiedName}` };
+                }
+                return mcpHost.call(td.qualifiedName, rawArgs || {});
+              },
+            })
+          )
+        : []),
     ];
 
     // Convert prior session history into AgentMessage format, ensuring no assistant/user message ever has empty content
@@ -2398,6 +3828,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     let modelTurnIndex = 0;
     const maxToolCallingTurns = 90;
     let lastOpenAiMessages: Array<Record<string, any>> = [];
+    const emitRuntimeEvent = (event: ClineRuntimeEvent) => this.emit(event);
 
     const clineModelAdapter = {
       stream: async function* (request: any) {
@@ -2410,7 +3841,13 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         const allowToolsThisTurn = modelTurnIndex <= maxToolCallingTurns;
 
         const configuredModelId = manifest.modelId || provider.defaultModelId;
-        const { effectiveModelId: activeModelId } = resolveTieredModelForTurn({
+        const routingMode = /force-reasoner|deepseek-reasoner/i.test(configuredModelId)
+          ? ('force-reasoner' as const)
+          : /force-fast|^deepseek-chat$/i.test(configuredModelId)
+            ? ('force-fast' as const)
+            : ('auto' as const);
+        const uniqueEdited = new Set(sessionWrittenFiles);
+        const tierDecision = resolveTieredModelForTurn({
           configuredModelId,
           providerId: manifest.providerId,
           userPrompt: prompt,
@@ -2419,6 +3856,24 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           hasReadFiles: fileStateCache.size > 0,
           hasEditedFiles: sessionWrittenFiles.length > 0,
           hasBuildOrTestFailure: lastBuildOrTestFailed,
+          hasSemanticFailure: lastSemanticFailed,
+          editMismatchCount,
+          multiFilePending: uniqueEdited.size >= 2,
+          routingMode: configuredModelId === 'deepseek-auto' ? 'auto' : routingMode,
+        });
+        const activeModelId = tierDecision.effectiveModelId;
+        emitRuntimeEvent({
+          type: 'model_tier',
+          sessionId,
+          payload: {
+            configuredModelId,
+            effectiveModelId: activeModelId,
+            tokensUsed: activeGoal.tokensUsed,
+            tokenBudget: Number(activeGoal.tokenBudget ?? 180000),
+            tier: tierDecision.tier,
+            reason: tierDecision.reason,
+            turnIndex: modelTurnIndex,
+          },
         });
         const isReasonerModel = /reasoner|r1/i.test(activeModelId);
         activeGoal.turnsExecuted = modelTurnIndex;
@@ -2533,7 +3988,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
 
         const filteredTools = isFinishingStage
           ? (request.tools ?? []).filter((t: any) =>
-              ['edit_file', 'write_file', 'editor', 'run_command', 'run_commands', 'read_file'].includes(
+              ['edit_file', 'write_file', 'apply_patch', 'editor', 'run_command', 'run_commands', 'read_file'].includes(
                 t.name
               )
             )
@@ -2666,6 +4121,19 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           );
           const cacheMissTok = Number(data.usage.prompt_cache_miss_tokens ?? 0);
           activeGoal.tokensUsed += inTok + outTok;
+          const budget = Number(activeGoal.tokenBudget ?? 180000);
+          emitRuntimeEvent({
+            type: 'goal_usage',
+            sessionId,
+            payload: {
+              tokensUsed: activeGoal.tokensUsed,
+              tokenBudget: budget,
+              inputTokens: inTok,
+              outputTokens: outTok,
+              turnIndex: modelTurnIndex,
+              remaining: Math.max(0, budget - activeGoal.tokensUsed),
+            },
+          });
           yield {
             type: 'usage' as const,
             usage: {
@@ -2686,14 +4154,41 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     };
 
     // 4. Build in-tree system prompt + tool policies and instantiate in-tree AgentLoop
+    let memorySection = '';
+    if (typeof loadAgentMemory === 'function' && typeof formatAgentMemoryForPrompt === 'function') {
+      try {
+        const mem = await loadAgentMemory(manifest.workspaceRoot);
+        memorySection = formatAgentMemoryForPrompt(mem, 5);
+      } catch {
+        memorySection = '';
+      }
+    }
+
     const officialClinePrompt =
       typeof getClineDefaultSystemPrompt === 'function'
-        ? getClineDefaultSystemPrompt({
-            ...workspaceInfo,
-            workspaceRoot: manifest.workspaceRoot,
-            planModeSwitchTool: false,
-          })
+        ? getClineDefaultSystemPrompt(
+            {
+              ...workspaceInfo,
+              workspaceRoot: manifest.workspaceRoot,
+              planModeSwitchTool: false,
+            },
+            {
+              // Path-conditional .cursor/rules globs — prefer recently touched + open files
+              activePaths: Array.from(
+                new Set([
+                  ...sessionWrittenFiles.slice(-12),
+                  ...(Array.isArray((manifest as any).openFiles)
+                    ? ((manifest as any).openFiles as string[])
+                    : []),
+                ])
+              ),
+              prompt: basePromptForTurn,
+            }
+          )
         : '';
+    const officialClinePromptWithMemory = memorySection
+      ? `${officialClinePrompt}\n\n${memorySection}`
+      : officialClinePrompt;
 
     const toolPolicies =
       typeof createToolPoliciesWithPreset === 'function'
@@ -2702,9 +4197,20 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           )
         : undefined;
 
-    const activeTurnTools = [...deepAutoCodeTools, ...builtinTools].filter((t) =>
+    const mergedTools =
+      typeof applyStandardToolAliases === 'function'
+        ? applyStandardToolAliases([...deepAutoCodeTools, ...builtinTools])
+        : [...deepAutoCodeTools, ...builtinTools];
+    const activeTurnTools = mergedTools.filter((t) =>
       isReadOnlyTurn
-        ? !['edit_file', 'write_file', 'editor', 'auto_build_and_test'].includes(t.name)
+        ? ![
+            'edit_file',
+            'str_replace',
+            'write_file',
+            'apply_patch',
+            'editor',
+            'auto_build_and_test',
+          ].includes(t.name)
         : true
     );
 
@@ -2720,39 +4226,42 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       clientVersion: '1.1.0',
       model: clineModelAdapter,
       toolPolicies,
+      getContextBudget: () => ({
+        tokensUsed: activeGoal.tokensUsed,
+        tokenBudget: activeGoal.tokenBudget,
+      }),
       systemPrompt:
-        `${officialClinePrompt}\n\n` +
+        `${officialClinePromptWithMemory}\n\n` +
         `# DeepAutoCode Desktop IDE Environment & Guidelines\n` +
         `- Current Workspace Root: ${manifest.workspaceRoot}\n` +
         `- Top-level Workspace Entries: ${workspaceFilesHint || '(empty or unknown)'}\n` +
         `- Execution Mode: ${manifest.executionMode}\n` +
+        `- Workspace Verification Gate (source=${verifyConfig.source}):\n${verifyPromptBlock.split('\n').map((l) => `  ${l}`).join('\n')}\n` +
+        (mcpBootstrapNote
+          ? `- MCP: ${mcpBootstrapNote}\n  Use call_mcp_tool({ tool: "mcp__server__tool", arguments }) or the injected mcp__* tools when external systems are needed.\n`
+          : `- MCP: configure servers in Settings or workspace .deepautocode/mcp.json (stdio). Built-in placeholders are ignored.\n`) +
         (isSshMirrorWorkspace
           ? `- REMOTE SSH LINUX WORKSPACE: This workspace is connected to a Remote Linux SSH server with bidirectional file sync. All shell commands in 'run_command' and 'run_commands' execute directly on the Remote Linux server via /bin/bash (NEVER use Windows PowerShell cmdlets like Get-ChildItem or Select-Object). All file tools ('read_file', 'edit_file', 'editor', 'write_file') automatically pull and push files between the IDE and the Remote SSH server.\n`
           : `- Prefer 'run_command' (PowerShell) over 'run_commands' when running shell commands on Windows.\n`) +
         `- AUTONOMOUS END-TO-END PROBLEM RESOLUTION (自动处理所有问题 — 最高优先级准则):\n` +
         `  1. In 'auto' mode, you are an autonomous problem-solving engineer, NOT a passive report generator.\n` +
-        `  2. Whenever you analyze a project ("帮我分析一下当前项目"), diagnose a bug/error log ("这个问题是什么原因引起的"), or are asked for alternative fixes ("请问还有其他的修改方式可以解决这个错误吗" / "如果这个问题需要在kernel修改，该怎么处理" / "处理所有问题" / "你直接帮我修改"), once you discover ANY concrete code bugs, broken logic, typos, or failing tests in the project:\n` +
+        `  2. Whenever you analyze a project, diagnose a bug/error log, or are asked to fix issues, once you discover concrete code bugs:\n` +
         `     - DO NOT stop after merely listing problems or writing a Markdown modification plan!\n` +
-        `     - NEVER include a "需要你确认的点" section, NEVER say "我未读到 xxx 的完整定义，需确认...", NEVER ask "需要我现在执行吗？", and NEVER tell the user "请先执行上面的 grep 命令..." or "请在远程服务器执行 make -j16..." — in 'auto' mode, YOU must execute all commands and edits yourself via tools!\n` +
-        `     - If you have not read a struct definition, field name, or test source file (e.g. 'nccl-test/src/sendrecv.cc', 'src/device/common_kernel.h', 'src/enqueue.cc'), IMMEDIATELY call 'read_file' (using 'start_line' and 'end_line' for large files) or 'search_codebase' to inspect it yourself!\n` +
-        `     - IMMEDIATELY and AUTOMATICALLY call 'edit_file' or 'write_file' to fix ALL identified bugs directly in the project files!\n` +
-        `     - After modifying the project files, AUTOMATICALLY call 'run_command' to compile/build (e.g. 'cd build && make -j16') AND run the verification tests (e.g. './nccl-test/build/sendrecv_perf -b 4 -e 32 -f 2') to confirm 0 errors and #wrong=0!\n` +
-        `     - NEVER fabricate command outputs or test results. In your final Markdown response, concisely state the root cause, the modified file:line, and the actual compile/test verification result.\n` +
-        `- ULTRA-CONCISE RESPONSE FORMAT (极简输出准则 — 让用户看一眼就明白):\n` +
-        `  1. Keep your final response EXTREMELY CONCISE and SCANNABLE (aim for 8–20 lines total; NEVER write long multi-page essays, never echo the user's input log, and never add redundant summary tables).\n` +
-        `  2. Structure bug-fix / code-analysis replies into at most 3 brief bullet blocks:\n` +
-        `     - **🎯 根因定位**：用 1~2 句话直击本质原因，并附带精确的 \`文件路径:行号\`（例如 \`src/device/common_kernel.h:266\`）。\n` +
-        `     - **🛠️ 修改内容**：列出修改的 \`文件路径:行号\`，仅贴出最核心的 5~12 行修改代码片段（用户点击代码即可在中间编辑器查看完整文件，无需贴大段上下文）。\n` +
-        `     - **✅ 验证结果**：用 1~2 行展示实际编译与测试结果（例如 \`make -j16 编译通过，sendrecv_perf -b 4 -e 32 -f 2 全 0 通过\`）。\n` +
-        `  3. STRICTLY FORBIDDEN in final output: Do NOT write "一、现象特征", "二、根因链表格", "关键代码位置索引表格", or manual "验证步骤（请在远程服务器执行）" bash tutorials.\n` +
-        `- HIGH-SPEED PARALLEL EXECUTION RULES (极速并行排查与验证准则 — 大幅减少往返轮次):\n` +
-        `  1. BATCH MULTIPLE READS IN ONE TURN: Whenever you need to inspect 2–5 files or symbols, ALWAYS emit all 2–5 'read_file' / 'search_codebase' tool calls in a SINGLE turn (the runtime executes them in parallel via Promise.all), NEVER 1 file per turn!\n` +
-        `  2. USE 'read_file' INSTEAD OF SSH 'sed'/'cat': Always prefer 'read_file' (with 'start_line' and 'end_line', e.g. 150-line window) over running 'sed -n' or 'cat' via 'run_command', because 'read_file' hits the local mirror cache (<1ms) whereas 'run_command' spawns a remote SSH process.\n` +
-        `  3. COMBINE BUILD + TEST IN ONE COMMAND: After editing C/C++/HIP code, combine compilation and test execution into a SINGLE 'run_command' call (e.g. "cd build && make -j16 && cd ../nccl-test && LD_LIBRARY_PATH=../build/lib:$LD_LIBRARY_PATH ./build/sendrecv_perf -b 4 -e 32 -f 2") to save an extra LLM round-trip.\n` +
+        `     - NEVER ask the user to run build/test commands manually — execute them yourself via tools!\n` +
+        `     - IMMEDIATELY call 'edit_file' or 'write_file' to fix bugs, then run_command with the workspace verify gate: \`${preferredVerifyCommand}\`\n` +
+        `     - NEVER fabricate command outputs or test results.\n` +
+        `- ULTRA-CONCISE RESPONSE FORMAT:\n` +
+        `  1. Keep final response short and scannable (about 8–20 lines).\n` +
+        `  2. Use at most 3 blocks: root cause (file:line), changes (file:line), verification result from real commands.\n` +
+        `- HIGH-SPEED PARALLEL EXECUTION RULES:\n` +
+        `  1. BATCH MULTIPLE READS IN ONE TURN via parallel read_file / search_codebase calls.\n` +
+        `  2. Prefer 'read_file' over remote sed/cat when possible.\n` +
+        `  3. After edits, prefer ONE combined verify command: \`${preferredVerifyCommand}\`\n` +
         `- DIRECT FILE MODIFICATION RULES:\n` +
         `  1. Always pass workspace-relative paths (e.g. "src/enqueue.cc", "src/device/common_kernel.h", "nccl-test/src/sendrecv.cc") to 'read_file', 'edit_file', 'editor', and 'write_file'.\n` +
         `  2. For large files (>50KB, such as "src/enqueue.cc"), pass 'start_line' and 'end_line' to 'read_file' (e.g. { "filePath": "src/enqueue.cc", "start_line": 740, "end_line": 830 }) instead of running repeated grep/sed shell commands.\n` +
-        `  3. When modifying an existing source file (especially large C/C++/Python/TS files), prefer 'edit_file' ({ filePath, oldText, newText }) to replace the target lines in-place, or 'write_file' ({ filePath, content }) when replacing the whole file or creating a new file.\n` +
+        `  3. When modifying an existing source file (especially large C/C++/Python/TS files), prefer 'edit_file' ({ filePath, oldText, newText }) or multi-hunk 'edit_file.hunks' / 'apply_patch' (unified diff) for multi-site edits; use 'write_file' only for new files or full rewrites.\n` +
+        `  3b. search_codebase supports regex=true, glob="*.ts", mode="symbol"|"content"|"auto".\n` +
         `  4. NEVER claim you cannot modify files, NEVER blame PATH_BOUNDARY_VIOLATION (all deep subdirectory files are 100% accessible), and NEVER ask the user to run manual python/sed scripts instead of modifying the files yourself.\n` +
         `- When writing large new files (> 250 lines), write 1 file per tool-calling turn so your JSON output never hits the 8192 max_tokens limit.\n` +
         `- CRITICAL SAFETY RULE: NEVER run 'taskkill /F /IM node.exe', 'Stop-Process -Name node', or kill all node/electron processes globally, because the DeepAutoCode IDE backend itself runs on Node.js (port 3840). When asked to compile & run ("编译运行" / "启动服务"), run syntax checks (e.g. 'node --check server/server.js') and start the server via 'run_command' (e.g. 'node server/server.js'). If the target port is already in use, the server is already running in the background — simply verify it with 'curl.exe -s -I http://localhost:3000'.\n` +
@@ -2769,63 +4278,202 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           }
         },
         onBeforeFinish: async ({ assistantText, iterations }) => {
-          if (
-            isReadOnlyTurn ||
-            manifest.executionMode !== 'auto' ||
-            autoContinuationCount >= 4 ||
-            iterations >= maxToolCallingTurns - 2
-          ) {
+          if (isReadOnlyTurn || manifest.executionMode !== 'auto' || iterations >= maxToolCallingTurns - 2) {
             return { shouldContinue: false };
           }
 
-          // Case 1: Model modified a compiled C/C++/CUDA/HIP file but hasn't compiled it yet
-          if (hasUnverifiedCompiledEdit) {
+          // Token budget exceeded → ask model to summarize and stop expanding exploration
+          if (
+            typeof isGoalTokenBudgetExceeded === 'function' &&
+            isGoalTokenBudgetExceeded(activeGoal) &&
+            !budgetLimitNotified
+          ) {
+            budgetLimitNotified = true;
+            autoContinuationCount += 1;
+            return {
+              shouldContinue: true,
+              prompt:
+                typeof buildGoalBudgetLimitPrompt === 'function'
+                  ? buildGoalBudgetLimitPrompt(activeGoal)
+                  : `Token budget reached (${activeGoal.tokensUsed}/${activeGoal.tokenBudget}). Summarize progress and stop new exploration.`,
+            };
+          }
+
+          const needsHeal = lastBuildOrTestFailed || lastSemanticFailed;
+          const todoBlock =
+            sessionTodos && sessionTodos.hasIncomplete
+              ? `\nSession todos (incomplete first):\n${sessionTodos.formatForPrompt()}\n`
+              : '';
+
+          // Case 0: Semantic diagnostics failed after edit — heal before claiming done
+          // (shares self-heal budget; does not consume verify-nudge budget)
+          if (lastSemanticFailed && !lastBuildOrTestFailed && selfHealCount < selfHealBudget) {
+            selfHealCount += 1;
+            autoContinuationCount += 1;
+            const problemsExtra =
+              typeof loadWorkspaceProblemsText === 'function'
+                ? await loadWorkspaceProblemsText(manifest.workspaceRoot, 30)
+                : '';
+            lastSemanticFailed = false;
+            return {
+              shouldContinue: true,
+              prompt: buildGoalContinuationPrompt(
+                activeGoal,
+                `编辑后语言服务诊断失败（无需用户 @problems）：\n\`\`\`\n${
+                  lastSemanticDiagSnippet || '(semantic diagnostics)'
+                }\n\`\`\`\n${
+                  problemsExtra ? `Persisted Problems:\n${problemsExtra}\n` : ''
+                }${todoBlock}请立即 edit_file/apply_patch 修复上述诊断，必要时再 run_command：\`${preferredVerifyCommand}\`。自愈进度 ${selfHealCount}/${selfHealBudget}。`
+              ),
+            };
+          }
+
+          // Case 1: Source was edited but build/verify not run yet (verify-nudge budget)
+          if (hasUnverifiedCompiledEdit && verifyNudgeCount < verifyNudgeBudget) {
+            verifyNudgeCount += 1;
             autoContinuationCount += 1;
             hasUnverifiedCompiledEdit = false;
             return {
               shouldContinue: true,
               prompt: buildGoalContinuationPrompt(
                 activeGoal,
-                '你刚刚修改了 C/C++/HIP 源码文件，但尚未在修改后执行编译与测试验证！请立即调用 run_command 执行编译（如 cd build && make -j16）并运行对应的测试程序（如 ./nccl-test/build/sendrecv_perf -b 4 -e 32 -f 2），确认编译 0 报错且测试 #wrong 全为 0 后再输出最终报告！'
+                `你刚刚修改了需要验证的源码，但尚未执行工作区验证门禁！请立即调用 run_command 执行：\n${verifyPromptBlock}\n推荐一条命令：\`${preferredVerifyCommand}\`\n确认构建与测试通过后再输出最终报告。`
               ),
             };
           }
 
-          // Case 2: Model compiled the C/C++/CUDA/HIP edit, but hasn't run the verification test binary yet
-          if (hasUnverifiedTestAfterEdit && !lastBuildOrTestFailed) {
+          // Case 2: Build done-ish but dedicated test command still pending
+          if (
+            hasUnverifiedTestAfterEdit &&
+            !lastBuildOrTestFailed &&
+            verifyNudgeCount < verifyNudgeBudget
+          ) {
+            verifyNudgeCount += 1;
             autoContinuationCount += 1;
             hasUnverifiedTestAfterEdit = false;
             return {
               shouldContinue: true,
               prompt: buildGoalContinuationPrompt(
                 activeGoal,
-                '代码已编译完成，但尚未执行实际测试命令验证修复效果！请立即调用 run_command 运行对应的验证测试（例如 export LD_LIBRARY_PATH=$PWD/build/lib:$LD_LIBRARY_PATH && ./nccl-test/build/sendrecv_perf -b 4 -e 32 -f 2），确认测试真实通过（无 invalid usage 且 #wrong 全为 0）后再输出最终总结！'
+                `代码可能已构建，但仍需运行测试验证！请立即调用 run_command 执行：\`${verifyConfig.testCommand}\`（或组合命令 \`${preferredVerifyCommand}\`），确认测试真实通过后再总结。`
               ),
             };
           }
 
-          // Case 3: The last build or test command failed (non-zero exitCode or FAILED / invalid usage in output)
-          if (lastBuildOrTestFailed && selfHealCount < 3) {
-            autoContinuationCount += 1;
+          // Case 2b: Verifier subagent reported FAIL
+          if (lastVerifierPass === false && selfHealCount < selfHealBudget) {
             selfHealCount += 1;
-            lastBuildOrTestFailed = false;
+            autoContinuationCount += 1;
+            lastVerifierPass = null;
             return {
               shouldContinue: true,
               prompt: buildGoalContinuationPrompt(
                 activeGoal,
-                `上一步编译或测试命令未通过：\n\`\`\`\n${lastFailureOutputSnippet || '命令返回非零退出码或测试输出包含 FAILED / invalid usage'}\n\`\`\`\n请立即启动自愈排查：调用 read_file / edit_file 修复导致报错或失败的代码，并重新调用 run_command 编译与运行测试验证，直到测试完全通过！`
+                `invoke_subagent(verifier) 判定未通过。请根据其报告修复代码，再重新验证（可再次 invoke_subagent role=verifier 或 run_command \`${preferredVerifyCommand}\`）。自愈进度 ${selfHealCount}/${selfHealBudget}。`
               ),
             };
           }
 
-          // Case 4: Model wrote a modification plan or asked the user to confirm / run a command without making any edits yet
+          // Case 3: Build/test failed — independent self-heal budget
+          if (needsHeal && selfHealCount < selfHealBudget) {
+            selfHealCount += 1;
+            autoContinuationCount += 1;
+            const problemsExtra =
+              typeof loadWorkspaceProblemsText === 'function'
+                ? await loadWorkspaceProblemsText(manifest.workspaceRoot, 30)
+                : '';
+            const failedTests =
+              lastFailedTestHints.length > 0
+                ? `\n失败用例提示: ${lastFailedTestHints.join(' | ')}\n优先修复这些用例，然后优先重跑：\`${verifyConfig.testCommand}\`。`
+                : '';
+            lastBuildOrTestFailed = false;
+            lastSemanticFailed = false;
+            return {
+              shouldContinue: true,
+              prompt: buildGoalContinuationPrompt(
+                activeGoal,
+                `上一步编译/测试或语义检查未通过（自愈 ${selfHealCount}/${selfHealBudget}，与 verify 催促计数独立）：\n\`\`\`\n${
+                  lastFailureOutputSnippet ||
+                  lastSemanticDiagSnippet ||
+                  '命令返回非零退出码或测试输出包含 FAILED'
+                }\n\`\`\`${failedTests}${
+                  problemsExtra ? `\nProblems:\n${problemsExtra}\n` : ''
+                }\n${todoBlock}请立即 edit_file/apply_patch 修复，再 run_command 聚焦重测/验证直到通过。可用 manage_todo 更新任务状态。`
+              ),
+            };
+          }
+
+          // Case 3c: Incomplete session todos after verify passed — nudge to finish checklist
+          if (
+            !needsHeal &&
+            !hasUnverifiedCompiledEdit &&
+            !hasUnverifiedTestAfterEdit &&
+            sessionTodos?.hasIncomplete &&
+            verifyNudgeCount < verifyNudgeBudget &&
+            activeGoal.verifiedByCommand
+          ) {
+            verifyNudgeCount += 1;
+            autoContinuationCount += 1;
+            return {
+              shouldContinue: true,
+              prompt: buildGoalContinuationPrompt(
+                activeGoal,
+                `验证已通过，但仍有未完成 session todos：\n${sessionTodos.formatForPrompt()}\n请继续完成剩余项，或用 manage_todo 将已完成的标记 complete 后再总结。`
+              ),
+            };
+          }
+
+          // Case 3b: Circuit breaker — self-heal budget exhausted → roll back
+          if (needsHeal && selfHealCount >= selfHealBudget && !circuitBreakerNotified) {
+            circuitBreakerNotified = true;
+            circuitBroken = true;
+            autoContinuationCount += 1;
+            lastBuildOrTestFailed = false;
+            lastSemanticFailed = false;
+            let rollbackMsg = 'Circuit breaker engaged.';
+            if (typeof rollbackSessionMutations === 'function') {
+              const rb = await rollbackSessionMutations({
+                workspaceRoot: manifest.workspaceRoot,
+                originals: sessionOriginalContents,
+                createdFiles: Array.from(sessionCreatedFiles),
+              });
+              rollbackMsg = `${rb.message} Restored: ${rb.rolledBackFiles.join(', ') || '(none)'}.`;
+              sessionWrittenFiles.length = 0;
+              hasUnverifiedCompiledEdit = false;
+              hasUnverifiedTestAfterEdit = false;
+              this.emit({
+                type: 'circuit_breaker_triggered',
+                sessionId,
+                payload: {
+                  message: rollbackMsg,
+                  rolledBackFiles: rb.rolledBackFiles,
+                  failedFiles: rb.failedFiles,
+                  selfHealCount,
+                },
+              });
+            }
+            return {
+              shouldContinue: true,
+              prompt:
+                `[CIRCUIT_BREAKER] ${rollbackMsg}\n` +
+                `Do NOT call edit_file / write_file / editor again. Concise failure report only:\n` +
+                `1) Root cause hypothesis\n2) Why verification still failed after ${selfHealCount} self-heal attempts\n` +
+                `3) Suggested next manual step for the user\n` +
+                `Last failure snippet:\n\`\`\`\n${
+                  lastFailureOutputSnippet || lastSemanticDiagSnippet || '(empty)'
+                }\n\`\`\``,
+            };
+          }
+
+          // Case 4: Plan/defer without edits — uses verify-nudge style single push
           if (
             sessionWrittenFiles.length === 0 &&
             !activeGoal.verifiedByCommand &&
-            autoContinuationCount === 0 &&
+            verifyNudgeCount === 0 &&
             (asksUserOrDefersExecutionPattern.test(assistantText) ||
               proposesCodeChangesInTextPattern.test(assistantText))
           ) {
+            verifyNudgeCount += 1;
             autoContinuationCount += 1;
             return {
               shouldContinue: true,
@@ -2851,6 +4499,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       runResult = await clineAgent.run(effectivePrompt);
     } finally {
       signal.removeEventListener('abort', onAbort);
+      await mcpHost?.dispose?.().catch(() => undefined);
     }
 
     if (runResult.status === 'failed' && runResult.error) {
@@ -2965,6 +4614,71 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     }
   }
 
+  async updateDiffProposed(
+    sessionId: string,
+    diffId: string,
+    proposedContent: string,
+    options?: { writeToDisk?: boolean; finalize?: 'accept' | 'reject' | 'keep' }
+  ): Promise<DiffChangeRecord | null> {
+    let ownerSessionId = sessionId;
+    let diffs = await this.readDiffs(ownerSessionId);
+    let target = diffs.find((d) => d.diffId === diffId);
+    if (!target) {
+      const allSessions = await this.list();
+      for (const s of allSessions) {
+        const candidateDiffs = await this.readDiffs(s.sessionId);
+        const found = candidateDiffs.find((d) => d.diffId === diffId);
+        if (found) {
+          ownerSessionId = s.sessionId;
+          diffs = candidateDiffs;
+          target = found;
+          break;
+        }
+      }
+    }
+    if (!target || target.status !== 'pending') return null;
+
+    target.proposedContent = String(proposedContent ?? '');
+    target.unifiedDiff = createUnifiedDiff(
+      target.filePath,
+      target.originalContent || '',
+      target.proposedContent
+    );
+    target.updatedAt = new Date().toISOString();
+
+    const finalize = options?.finalize || 'keep';
+    const writeToDisk = options?.writeToDisk !== false;
+    const manifest = await this.get(ownerSessionId);
+
+    if (finalize === 'accept') {
+      return this.updateDiffStatus(ownerSessionId, diffId, 'accepted');
+    }
+    if (finalize === 'reject') {
+      return this.updateDiffStatus(ownerSessionId, diffId, 'rejected');
+    }
+
+    if (writeToDisk && manifest && target.appliedToDisk !== false) {
+      await this.capabilityRegistry.invoke(
+        'write-file',
+        { filePath: target.filePath, content: target.proposedContent },
+        {
+          sessionId: ownerSessionId,
+          workspaceRoot: manifest.workspaceRoot,
+          executionMode: 'auto',
+        }
+      );
+      target.appliedToDisk = true;
+    }
+
+    await fs.writeFile(this.getDiffsPath(ownerSessionId), JSON.stringify(diffs, null, 2), 'utf-8');
+    this.emit({
+      type: 'diff_updated',
+      sessionId: ownerSessionId,
+      payload: { ...target },
+    });
+    return target;
+  }
+
   async updateDiffStatus(
     sessionId: string,
     diffId: string,
@@ -2995,11 +4709,12 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     target.status = status;
     target.feedback = feedback;
     target.updatedAt = new Date().toISOString();
-    await fs.writeFile(this.getDiffsPath(ownerSessionId), JSON.stringify(diffs, null, 2), 'utf-8');
 
     const manifest = await this.get(ownerSessionId);
     if (manifest) {
       if (status === 'accepted') {
+        // Always materialize proposed content (covers review-before-write Manual diffs
+        // and re-applies after a prior Reject in Auto mode).
         await this.capabilityRegistry.invoke(
           'write-file',
           {
@@ -3012,36 +4727,171 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
             executionMode: 'auto',
           }
         );
+        target.appliedToDisk = true;
       } else if (status === 'rejected') {
-        if (target.operation === 'modify') {
-          await this.capabilityRegistry.invoke(
-            'write-file',
-            {
-              filePath: target.filePath,
-              content: target.originalContent,
-            },
-            {
-              sessionId: ownerSessionId,
-              workspaceRoot: manifest.workspaceRoot,
-              executionMode: 'auto',
+        // Roll back only when content was already on disk.
+        // appliedToDisk === false → Manual review-before-write (nothing to undo).
+        // appliedToDisk === undefined → legacy records (assume already written).
+        if (target.appliedToDisk !== false) {
+          if (target.operation === 'modify') {
+            await this.capabilityRegistry.invoke(
+              'write-file',
+              {
+                filePath: target.filePath,
+                content: target.originalContent,
+              },
+              {
+                sessionId: ownerSessionId,
+                workspaceRoot: manifest.workspaceRoot,
+                executionMode: 'auto',
+              }
+            );
+          } else if (target.operation === 'create') {
+            const absCreated = path.resolve(manifest.workspaceRoot, target.filePath);
+            if (absCreated.startsWith(path.resolve(manifest.workspaceRoot))) {
+              await fs.rm(absCreated, { force: true }).catch(() => undefined);
             }
-          );
-        } else if (target.operation === 'create') {
-          const absCreated = path.resolve(manifest.workspaceRoot, target.filePath);
-          if (absCreated.startsWith(path.resolve(manifest.workspaceRoot))) {
-            await fs.rm(absCreated, { force: true }).catch(() => undefined);
           }
+          target.appliedToDisk = false;
         }
       }
     }
 
+    await fs.writeFile(this.getDiffsPath(ownerSessionId), JSON.stringify(diffs, null, 2), 'utf-8');
+
     this.emit({
-      type: 'diff_proposed',
+      type: status === 'pending' ? 'diff_proposed' : 'diff_updated',
       sessionId: ownerSessionId,
       payload: { ...target },
     });
 
     return target;
+  }
+
+  async reviewAllPendingDiffs(
+    sessionId: string,
+    action: 'accept' | 'reject'
+  ): Promise<DiffChangeRecord[]> {
+    const diffs = await this.readDiffs(sessionId);
+    const pending = diffs.filter((d) => d.status === 'pending');
+    const updated: DiffChangeRecord[] = [];
+    for (const d of pending) {
+      const next = await this.updateDiffStatus(
+        sessionId,
+        d.diffId,
+        action === 'accept' ? 'accepted' : 'rejected'
+      );
+      if (next) updated.push(next);
+    }
+    return updated;
+  }
+
+  async createCheckpoint(sessionId: string, label?: string): Promise<SessionCheckpoint | null> {
+    const manifest = await this.get(sessionId);
+    if (!manifest) return null;
+    const diffs = await this.readDiffs(sessionId);
+    const messages = await this.readMessages(sessionId);
+    const paths = Array.from(
+      new Set([
+        ...diffs.map((d) => d.filePath),
+        ...diffs
+          .filter((d) => d.status === 'pending' || d.status === 'accepted')
+          .map((d) => d.filePath),
+      ])
+    );
+    const files = await captureWorkspaceFiles(manifest.workspaceRoot, paths);
+    // Prefer originalContent from pending/accepted diffs as the pre-edit baseline when available
+    for (const d of diffs) {
+      if (d.status !== 'pending' && d.status !== 'accepted') continue;
+      const idx = files.findIndex((f) => f.filePath === d.filePath);
+      if (idx >= 0 && d.originalContent != null) {
+        files[idx] = {
+          filePath: d.filePath,
+          content: d.originalContent,
+          existed: d.operation !== 'create',
+        };
+      }
+    }
+    const checkpoint: SessionCheckpoint = {
+      checkpointId: `ckpt_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      sessionId,
+      label: label || `Checkpoint @ ${new Date().toLocaleString()}`,
+      createdAt: new Date().toISOString(),
+      messageSequence: messages.length,
+      files,
+      pendingDiffIds: diffs.filter((d) => d.status === 'pending').map((d) => d.diffId),
+    };
+    await saveSessionCheckpoint(this.getSessionDir(sessionId), checkpoint);
+    // Stage U: checkpoint → short cross-session memory note
+    try {
+      const { appendAgentMemory } = await import('../core/index.js');
+      await appendAgentMemory(manifest.workspaceRoot, {
+        sessionId,
+        source: 'checkpoint',
+        title: checkpoint.label.slice(0, 80),
+        summary: `Checkpoint ${checkpoint.checkpointId}: ${checkpoint.files
+          .map((f) => f.filePath)
+          .slice(0, 12)
+          .join(', ')}${checkpoint.files.length > 12 ? '…' : ''} (${checkpoint.files.length} files).`,
+      });
+    } catch {
+      // non-fatal
+    }
+    this.emit({
+      type: 'checkpoint_created',
+      sessionId,
+      payload: {
+        checkpointId: checkpoint.checkpointId,
+        label: checkpoint.label,
+        fileCount: checkpoint.files.length,
+        pendingDiffCount: checkpoint.pendingDiffIds?.length ?? 0,
+      },
+    });
+    return checkpoint;
+  }
+
+  async listCheckpoints(sessionId: string): Promise<SessionCheckpoint[]> {
+    return listSessionCheckpoints(this.getSessionDir(sessionId));
+  }
+
+  async restoreCheckpoint(
+    sessionId: string,
+    checkpointId: string
+  ): Promise<{ ok: boolean; restored: number; deleted: number; checkpointId: string }> {
+    const manifest = await this.get(sessionId);
+    if (!manifest) {
+      return { ok: false, restored: 0, deleted: 0, checkpointId };
+    }
+    const checkpoint = await readSessionCheckpoint(this.getSessionDir(sessionId), checkpointId);
+    if (!checkpoint) {
+      return { ok: false, restored: 0, deleted: 0, checkpointId };
+    }
+    const result = await restoreWorkspaceFiles(manifest.workspaceRoot, checkpoint.files);
+    // Mark pending diffs linked to this checkpoint as rejected without rewriting originals again
+    const diffs = await this.readDiffs(sessionId);
+    let dirty = false;
+    for (const d of diffs) {
+      if (d.status === 'pending') {
+        d.status = 'rejected';
+        d.appliedToDisk = false;
+        d.updatedAt = new Date().toISOString();
+        d.feedback = `Restored checkpoint ${checkpointId}`;
+        dirty = true;
+      }
+    }
+    if (dirty) {
+      await fs.writeFile(this.getDiffsPath(sessionId), JSON.stringify(diffs, null, 2), 'utf-8');
+    }
+    this.emit({
+      type: 'session_state',
+      sessionId,
+      payload: {
+        status: 'idle',
+        restoredCheckpointId: checkpointId,
+        ...result,
+      },
+    });
+    return { ok: true, ...result, checkpointId };
   }
 
   async abort(sessionId: string, reason = 'Aborted by user'): Promise<boolean> {
@@ -3115,7 +4965,7 @@ export class RuntimeFactory {
         clineCoreMethods = Array.from(new Set([...staticKeys, ...protoKeys]));
       }
       notes.push(
-        'In-tree white-box Cline Core (src/core) loaded cleanly. Active modules: Agent/AgentRuntime, getClineDefaultSystemPrompt, generateWorkspaceInfo, enrichPromptWithMentions, createBuiltinTools (read_files, editor, search_codebase, run_commands), createToolPoliciesWithPreset, createTool.'
+        'In-tree white-box Cline Core (src/core) loaded cleanly. Active modules: Agent/AgentRuntime, getClineDefaultSystemPrompt, generateWorkspaceInfo, enrichPromptWithMentions, createBuiltinTools (read_files, editor, search_codebase, run_commands), WorkspaceFileIndex, createToolPoliciesWithPreset, createTool.'
       );
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

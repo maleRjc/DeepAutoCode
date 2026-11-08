@@ -1,4 +1,9 @@
 import type { AgentTool, ToolPolicyMap } from './ToolSuite.js';
+import {
+  shouldCompactToolOutput,
+  summarizeToolOutput,
+} from './ToolResultSummarizer.js';
+import { resolveCompactionPlan } from './ContextCompaction.js';
 
 export interface AgentMessagePartText {
   type: 'text';
@@ -71,6 +76,11 @@ export interface AgentOptions {
   tools: AgentTool<any, any>[];
   initialMessages?: AgentMessage[];
   maxIterations?: number;
+  /**
+   * Optional live token budget for compaction. When provided, older tool
+   * outputs are summarized more aggressively as fillRatio rises.
+   */
+  getContextBudget?: () => { tokensUsed: number; tokenBudget: number | null };
   hooks?: {
     onEvent?: (event: { type: string; text?: string; [key: string]: unknown }) => Promise<void> | void;
     onBeforeFinish?: (context: {
@@ -98,9 +108,10 @@ const READ_ONLY_PARALLEL_TOOLS = new Set([
   'browser_action',
   'list_files',
   'open_file_in_ide',
+  'manage_todo',
 ]);
 
-const MUTATING_TOOLS = new Set(['edit_file', 'write_file', 'editor']);
+const MUTATING_TOOLS = new Set(['edit_file', 'write_file', 'apply_patch', 'editor']);
 
 function isPureReadOnlyShellCommand(cmd: string): boolean {
   const trimmed = cmd.trim();
@@ -130,7 +141,7 @@ function canonicalizeToolCallKey(toolName: string, input: Record<string, unknown
  * Features:
  * - Parallel execution of read-only tool batches (`Promise.all`) for 3-5x faster evidence gathering
  * - Deterministic multi-turn tool calling state machine
- * - Automatic context-window compaction for older read-only tool outputs (>100KB)
+ * - Automatic context-window compaction for older tool outputs (structured summary, not blind slice)
  * - Clean abort handling & streaming event hooks
  */
 export class Agent {
@@ -149,31 +160,62 @@ export class Agent {
     }
   }
 
-  private compactOlderToolOutputsIfNeeded(messages: AgentMessage[]): void {
+  /**
+   * When cumulative tool output is large, replace older results with
+   * information-preserving summaries (paths / errors / exit codes / hits).
+   * Exposed for unit tests.
+   */
+  public compactOlderToolOutputsIfNeeded(messages: AgentMessage[]): void {
     let totalChars = 0;
     for (const msg of messages) {
       for (const part of msg.content) {
         if (part.type === 'tool-result') {
-          const str = typeof part.output === 'string' ? part.output : JSON.stringify(part.output ?? '');
+          const str =
+            typeof part.output === 'string' ? part.output : JSON.stringify(part.output ?? '');
           totalChars += str.length;
         }
       }
     }
-    if (totalChars < 36_000) {
+    const budget = this.options.getContextBudget?.() || {
+      tokensUsed: 0,
+      tokenBudget: null,
+    };
+    const plan = resolveCompactionPlan({
+      toolResultChars: totalChars,
+      tokenBudget: budget.tokenBudget,
+      tokensUsed: budget.tokensUsed,
+    });
+    if (!plan.shouldCompact) {
       return;
     }
-    // Compact tool results in messages except the most recent 4 messages so LLM prefill stays fast
-    const cutoff = Math.max(0, messages.length - 4);
+    const cutoff = Math.max(0, messages.length - plan.keepRecentMessages);
     for (let i = 0; i < cutoff; i++) {
       const msg = messages[i];
       if (msg.role !== 'tool') continue;
       for (const part of msg.content) {
-        if (part.type === 'tool-result') {
-          const str = typeof part.output === 'string' ? part.output : JSON.stringify(part.output ?? '');
-          if (str.length > 1600) {
-            part.output = `${str.slice(0, 1300)}\n...[earlier tool output compacted (${str.length} chars total) to accelerate LLM inference]...`;
-          }
+        if (part.type !== 'tool-result') continue;
+        if (!shouldCompactToolOutput(part.output, plan.minCharsToSummarize)) continue;
+        const existing =
+          typeof part.output === 'string'
+            ? part.output
+            : JSON.stringify(part.output ?? '');
+        // Allow re-compact of prior summaries when under critical pressure
+        if (
+          existing.startsWith('[compacted summary of ') &&
+          plan.reason !== 'critical-context-pressure'
+        ) {
+          continue;
         }
+        if (
+          existing.startsWith('[compacted summary of ') &&
+          existing.length <= plan.summaryMaxChars
+        ) {
+          continue;
+        }
+        const originalChars = existing.length;
+        part.output = summarizeToolOutput(part.toolName, part.output, originalChars, {
+          maxChars: plan.summaryMaxChars,
+        });
       }
     }
   }

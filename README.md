@@ -1,20 +1,22 @@
-# DeepAutoCode — 开源 AI IDE (v1.1)
+# DeepAutoCode — 开源 AI 自动编码 IDE (v1.1)
 
-基于 **Code - OSS** 与 **Cline SDK (`@cline/sdk@0.2.0`)** 构建的开源 AI 编程 IDE。
+**产品定位（P0-6）**：DeepAutoCode 是 **Agent-first 自动编码工作台**（Electron + React Workbench + `@deepautocode/agent`），不是完整 VS Code / Cursor 克隆。  
+优先打赢的场景是：**远端/本地仓库里自主改代码 → 可配置验证门禁 → Diff/审批/熔断可回滚**；语言服务、扩展生态、幽灵补全等 IDE 深度能力按需增强，不以「功能全集对齐 Cursor」为目标。
 
 ## 仓库结构
 
-- [`deepautocode/`](./deepautocode)：IDE 工作台、Electron 桌面端、React + Vite Webview UI、SSH Remote 远程开发管理器与内置扩展集
-- [`deepautocode-agent/`](./deepautocode-agent)：基于 `@cline/sdk` 的 Agent 运行时 (`RuntimeFactory`)、宿主能力桥接 (`CapabilityRegistry` / `AgentClientBridge`) 与多模型 Provider 适配层 (`DeepSeek` / `OpenAI-Compatible` / `Anthropic`)
-- [`doc/`](./doc)：项目架构与工程规划文档
+- [`deepautocode/`](./deepautocode)：IDE 工作台、Electron 桌面端、React + Vite Webview UI、SSH Remote、扩展矩阵
+- [`deepautocode-agent/`](./deepautocode-agent)：Agent 运行时、Capability/审批/会话桥、Provider 适配
+- [`doc/`](./doc)：架构与自举进化文档
 - [`scripts/`](./scripts)：初始化与辅助构建脚本
 
 ## 核心特性
 
-- **多模型 Provider 支持**：默认集成 `DeepSeek` (`deepseek-chat` / `deepseek-reasoner`)，支持一键切换 `OpenAI-Compatible`（Ollama / vLLM / 企业内网网关）与 `Anthropic`
-- **端到端自主编码与调试 (`Auto` / `Plan` / `Manual` 模式)**：支持代码库检索 (`search_codebase`)、分段文件读写 (`read_file` / `edit_file` / `write_file`)、自动编译与测试验证 (`run_command`) 及 Diff 审阅闭环
-- **Remote - SSH 远程开发**：支持连接远程 Linux 服务器、远程目录懒加载浏览、双向文件镜像同步与远端命令执行
-- **安全与权限基线**：Extension Host 边界隔离、Webview CSP Nonce 管控、工作区路径边界校验、`ApprovalBridge` 人工审批与凭据加密存储 (`EncryptedFileSecretStorage`)
+- **多模型 Provider**：默认 DeepSeek，可切换 OpenAI-Compatible / Anthropic
+- **Auto / Plan / Manual**：检索、读写、命令执行、Diff 审阅；Auto 首次写入前创建 `evolve/*` 沙箱分支；自愈失败触发熔断回滚
+- **可配置验证门禁**：工作区 `.deepautocode/verify.json`（或设置中心）指定 build/test；Agent 改后按门禁续跑
+- **Remote SSH**：镜像树 + 打开强制 pull + 写入 push；占位 stub 不再伪装成已同步内容
+- **安全基线**：路径边界、审批卡、CSP、加密凭据存储
 
 ## 快速开始
 

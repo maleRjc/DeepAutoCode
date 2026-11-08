@@ -302,6 +302,7 @@ export class AgentClientBridge {
           modelId: (payload.modelId as string | undefined) ?? model.modelId,
           apiKey,
           executionMode: (payload.executionMode as AgentExecutionMode | undefined) ?? 'auto',
+          useWorktree: Boolean(payload.useWorktree),
         });
       }
 
@@ -362,6 +363,45 @@ export class AgentClientBridge {
           action,
           feedback,
         });
+      }
+
+      case 'diff.reviewAll': {
+        const targetId = sessionId ?? (payload.sessionId as string);
+        const action = payload.action === 'reject' ? 'reject' : 'accept';
+        return this.sessionBridge.reviewAllPendingDiffs(targetId, action);
+      }
+
+      case 'diff.updateProposed': {
+        const targetId = sessionId ?? (payload.sessionId as string);
+        return this.sessionBridge.updateDiffProposed({
+          sessionId: targetId,
+          diffId: String(payload.diffId ?? ''),
+          proposedContent: String(payload.proposedContent ?? ''),
+          writeToDisk: payload.writeToDisk !== false,
+          finalize:
+            payload.finalize === 'accept' || payload.finalize === 'reject'
+              ? payload.finalize
+              : 'keep',
+        });
+      }
+
+      case 'session.checkpoint.create': {
+        const targetId = sessionId ?? (payload.sessionId as string);
+        return this.sessionBridge.createCheckpoint(
+          targetId,
+          typeof payload.label === 'string' ? payload.label : undefined
+        );
+      }
+
+      case 'session.checkpoint.list': {
+        const targetId = sessionId ?? (payload.sessionId as string);
+        return this.sessionBridge.listCheckpoints(targetId);
+      }
+
+      case 'session.checkpoint.restore': {
+        const targetId = sessionId ?? (payload.sessionId as string);
+        const checkpointId = String(payload.checkpointId ?? '');
+        return this.sessionBridge.restoreCheckpoint(targetId, checkpointId);
       }
 
       case 'provider.get': {

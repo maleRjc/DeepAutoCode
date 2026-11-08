@@ -134,6 +134,32 @@ export class FileStateCache {
    * in `currentContent` and returns a 25-line numbered window around it so the model can
    * immediately fix its `edit_file` call in the next turn without calling `read_file` first.
    */
+  /**
+   * Apply multiple non-overlapping exact replacements (old→new) on one file.
+   * Hunks are applied from last match offset to first so earlier offsets stay valid.
+   */
+  public static applyMultiHunkReplacements(
+    currentContent: string,
+    hunks: Array<{ oldText: string; newText: string }>,
+    replaceOne: (content: string, oldText: string, newText: string) => string
+  ): string {
+    if (!Array.isArray(hunks) || hunks.length === 0) {
+      throw new Error('MULTI_HUNK_EMPTY: At least one { oldText, newText } hunk is required.');
+    }
+    let content = currentContent;
+    // Apply sequentially; each replaceOne may use fuzzy/indent-tolerant matching
+    for (let i = 0; i < hunks.length; i++) {
+      const h = hunks[i];
+      const oldText = String(h?.oldText ?? '');
+      const newText = String(h?.newText ?? '');
+      if (!oldText) {
+        throw new Error(`MULTI_HUNK_INVALID: hunk[${i}] missing oldText.`);
+      }
+      content = replaceOne(content, oldText, newText);
+    }
+    return content;
+  }
+
   public diagnoseEditMismatch(
     filePath: string,
     currentContent: string,

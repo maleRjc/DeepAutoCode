@@ -2,6 +2,11 @@ import { exec } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import {
+  searchIndexedFiles,
+  WorkspaceFileIndex,
+  type WorkspaceFileIndexOptions,
+} from './WorkspaceFileIndex.js';
 
 const execAsync = promisify(exec);
 
@@ -35,12 +40,14 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
       search_codebase: 'allow',
       explore_codebase: 'allow',
       invoke_subagent: 'allow',
+      manage_todo: 'allow',
       write_artifact: 'allow',
       browser_action: 'allow',
       open_file_in_ide: 'allow',
       editor: 'allow',
       edit_file: 'allow',
       write_file: 'allow',
+      apply_patch: 'allow',
       run_commands: 'allow',
       run_command: 'allow',
       connect_remote_ssh: 'allow',
@@ -56,12 +63,14 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
       search_codebase: 'allow',
       explore_codebase: 'allow',
       invoke_subagent: 'allow',
+      manage_todo: 'allow',
       write_artifact: 'allow',
       browser_action: 'allow',
       open_file_in_ide: 'allow',
       editor: 'deny',
       edit_file: 'deny',
       write_file: 'deny',
+      apply_patch: 'deny',
       run_commands: 'deny',
       run_command: 'deny',
     };
@@ -74,76 +83,28 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
     search_codebase: 'allow',
     explore_codebase: 'allow',
     invoke_subagent: 'allow',
+    manage_todo: 'allow',
     write_artifact: 'allow',
     browser_action: 'allow',
     open_file_in_ide: 'allow',
     editor: 'ask',
     edit_file: 'ask',
     write_file: 'ask',
+    apply_patch: 'ask',
     run_commands: 'ask',
     run_command: 'ask',
   };
 }
 
-/**
- * Extracts a concise symbol/function/struct outline with 1-based line numbers
- * for C/C++/CUDA/HIP, TypeScript/JavaScript, Python, Go, and Rust files.
- */
-export function extractCodeOutline(content: string, maxEntries = 120): string[] {
-  const lines = content.split(/\r?\n/);
-  const outline: string[] = [];
-  const symbolPatterns = [
-    // C / C++ / CUDA / HIP structs, classes, enums, functions, macros
-    /^\s*(?:struct|class|enum|union|namespace)\s+[A-Za-z_]\w*\s*(?:[:{]|$)/,
-    /^\s*(?:static\s+|inline\s+|__forceinline__\s+|__device__\s+|__global__\s+|__host__\s+|extern\s+)*(?:[A-Za-z_][\w:<>*&\s]{1,48})\s+([A-Za-z_]\w*)\s*\([^;]*$/,
-    /^\s*#\s*define\s+([A-Za-z_]\w*)\s*\(/,
-    // TS / JS / Python / Go / Rust
-    /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|interface|type|enum)\s+[A-Za-z_]\w*/,
-    /^\s*(?:public|private|protected|static|async)\s+[A-Za-z_]\w*\s*\(/,
-    /^\s*(?:def|class|fn|pub\s+fn|func|pub\s+struct)\s+[A-Za-z_]\w*/,
-  ];
-
-  const controlKeywords = new Set([
-    'if',
-    'for',
-    'while',
-    'switch',
-    'catch',
-    'return',
-    'sizeof',
-    'alignof',
-    'typeof',
-    'WARN',
-    'INFO',
-    'TRACE',
-    'NCCLCHECK',
-    'CUDACHECK',
-    'HIPCHECK',
-  ]);
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {
-      continue;
-    }
-    for (const pat of symbolPatterns) {
-      const m = line.match(pat);
-      if (m) {
-        const fnCandidate = m[1];
-        if (fnCandidate && controlKeywords.has(fnCandidate)) {
-          break;
-        }
-        outline.push(`L${i + 1}: ${trimmed.slice(0, 120)}`);
-        break;
-      }
-    }
-    if (outline.length >= maxEntries) {
-      break;
-    }
-  }
-  return outline;
-}
+export {
+  extractCodeOutline,
+  extractCodeOutlineForPath,
+  extractCodeOutlineSymbols,
+  formatOutlineSymbols,
+  type OutlineSymbol,
+  type OutlineSymbolKind,
+  type ExtractOutlineOptions,
+} from './CodeOutline.js';
 
 export interface BuiltinToolExecutors {
   readFile?: (item: { path: string; start_line?: number; end_line?: number } | string) => Promise<string>;
@@ -169,72 +130,37 @@ export interface CreateBuiltinToolsOptions {
   enableEditor?: boolean;
   enableApplyPatch?: boolean;
   executors?: BuiltinToolExecutors;
+  /** Shared workspace path index; speeds repeated search_codebase calls. */
+  fileIndex?: WorkspaceFileIndex;
+  fileIndexOptions?: WorkspaceFileIndexOptions;
 }
 
 async function localSearchFallback(
   cwd: string,
   query: string,
-  contextLines = 3
+  contextLines = 3,
+  fileIndex?: WorkspaceFileIndex,
+  under?: string
 ): Promise<string> {
   if (!query || !query.trim()) {
     return 'Empty search query.';
   }
-  const results: string[] = [];
-  const maxMatches = 50;
-  const ignoreDirs = new Set(['node_modules', '.git', 'dist', 'build', '.deepautocode-data']);
-
-  async function walk(dir: string): Promise<void> {
-    if (results.length >= maxMatches) return;
-    let entries;
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (results.length >= maxMatches) break;
-      if (ignoreDirs.has(entry.name)) continue;
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await walk(fullPath);
-      } else if (entry.isFile()) {
-        try {
-          const stat = await fs.stat(fullPath);
-          if (stat.size > 768 * 1024) continue;
-          const content = await fs.readFile(fullPath, 'utf-8');
-          if (!content.includes(query)) continue;
-          const relPath = path.relative(cwd, fullPath).replace(/\\/g, '/');
-          const lines = content.split(/\r?\n/);
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].includes(query)) {
-              const startCtx = Math.max(0, i - contextLines);
-              const endCtx = Math.min(lines.length - 1, i + contextLines);
-              const snippet: string[] = [];
-              for (let k = startCtx; k <= endCtx; k++) {
-                const marker = k === i ? '>' : ' ';
-                snippet.push(`${marker} ${relPath}:${k + 1}: ${lines[k].slice(0, 200)}`);
-              }
-              results.push(snippet.join('\n'));
-              i = endCtx; // skip overlapping context lines
-              if (results.length >= maxMatches) break;
-            }
-          }
-        } catch {
-          // ignore binary or unreadable file
-        }
-      }
-    }
-  }
-
-  await walk(cwd);
-  return results.length > 0 ? results.join('\n--\n') : 'No matches found.';
+  const index = fileIndex ?? new WorkspaceFileIndex(cwd);
+  return searchIndexedFiles({
+    root: cwd,
+    index,
+    query,
+    under,
+    contextLines,
+  });
 }
 
 /**
  * In-tree White-Box Builtin Tools Suite (Antigravity-enhanced)
  */
 export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentTool<any, any>[] {
-  const { cwd, shell, enableEditor = true, executors = {} } = options;
+  const { cwd, shell, enableEditor = true, executors = {}, fileIndexOptions } = options;
+  const fileIndex = options.fileIndex ?? new WorkspaceFileIndex(cwd, fileIndexOptions);
   const tools: AgentTool<any, any>[] = [];
 
   // 1. read_files (batch or single file reading with line range support)
@@ -315,13 +241,13 @@ export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentToo
     createTool({
       name: 'search_codebase',
       description:
-        'Search for a keyword, identifier, function name, or struct field across workspace source files. Automatically returns surrounding context lines so you can inspect struct fields and function signatures immediately.',
+        'Search workspace source files. Modes: auto (hybrid), content (rg/text), symbol (outline), semantic (local TF-IDF / natural-language retrieval). Supports regex/glob/case flags.',
       inputSchema: {
         type: 'object',
         properties: {
           query: {
             type: 'string',
-            description: 'Exact text, function name, or struct identifier to search for',
+            description: 'Text, regex, function name, or natural-language description to search for',
           },
           path: {
             type: 'string',
@@ -330,6 +256,24 @@ export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentToo
           context_lines: {
             type: 'number',
             description: 'Number of context lines before and after each match (default 3)',
+          },
+          regex: {
+            type: 'boolean',
+            description: 'Treat query as regex (default false = fixed string)',
+          },
+          case_sensitive: {
+            type: 'boolean',
+            description: 'Case-sensitive search (default false)',
+          },
+          glob: {
+            type: 'string',
+            description: 'Optional file glob filter, e.g. "*.ts" or "*.{cc,h}"',
+          },
+          mode: {
+            type: 'string',
+            enum: ['auto', 'content', 'symbol', 'semantic'],
+            description:
+              'auto (default): hybrid; symbol: outline; content: text/rg; semantic: local TF-IDF ranking for NL queries',
           },
         },
         required: ['query'],
@@ -341,11 +285,29 @@ export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentToo
           typeof rawArgs?.context_lines === 'number'
             ? Math.max(0, Math.min(10, rawArgs.context_lines))
             : 3;
+        const regex = Boolean(rawArgs?.regex);
+        const caseSensitive = Boolean(rawArgs?.case_sensitive ?? rawArgs?.caseSensitive);
+        const glob = rawArgs?.glob ? String(rawArgs.glob).trim() : undefined;
+        const modeRaw = String(rawArgs?.mode || 'auto').toLowerCase();
+        const mode =
+          modeRaw === 'symbol' || modeRaw === 'content' || modeRaw === 'semantic'
+            ? (modeRaw as 'symbol' | 'content' | 'semantic')
+            : 'auto';
         if (executors.search) {
           return await executors.search(query, subDir, contextLines);
         }
-        const targetDir = subDir ? path.resolve(cwd, subDir) : cwd;
-        return await localSearchFallback(targetDir, query, contextLines);
+        const index = fileIndex ?? new WorkspaceFileIndex(cwd);
+        return searchIndexedFiles({
+          root: cwd,
+          index,
+          query,
+          under: subDir,
+          contextLines,
+          regex,
+          caseSensitive,
+          glob,
+          mode,
+        });
       },
     })
   );
@@ -399,10 +361,12 @@ export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentToo
             const current = await fs.readFile(targetPath, 'utf-8');
             const updated = current.replace(oldText, newText);
             await fs.writeFile(targetPath, updated, 'utf-8');
+            fileIndex.invalidate();
             return `Updated ${rawArgs.path}`;
           }
           await fs.mkdir(path.dirname(targetPath), { recursive: true });
           await fs.writeFile(targetPath, newText, 'utf-8');
+          fileIndex.invalidate();
           return `Written ${rawArgs.path}`;
         },
       })
