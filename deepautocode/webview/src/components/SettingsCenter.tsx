@@ -406,22 +406,15 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                               if (found) {
                                 setEndpointInput(found.apiEndpoint);
                                 setModelInput(found.defaultModelId);
-                                if (id === 'glm' && !apiKeyInput) {
-                                  setApiKeyInput('EMPTY');
-                                }
-                              } else if (id === 'glm') {
-                                setEndpointInput('http://10.0.68.183:8000');
-                                setModelInput('GLM-5.3-Flash');
-                                setApiKeyInput('EMPTY');
                               }
                             }}
                           >
                             <option value="deepseek">DeepSeek (Default)</option>
-                            <option value="glm">GLM (vLLM / SGLang · GLM-5.3-Flash)</option>
+                            <option value="glm">GLM / 智谱 (vLLM / SGLang / BigModel)</option>
                             <option value="openai-compatible">
-                              OpenAI-Compatible (Ollama / vLLM / Gateway)
+                              OpenAI-Compatible (vLLM / SGLang / Ollama / Gateway)
                             </option>
-                            <option value="anthropic">Anthropic Claude</option>
+                            <option value="anthropic">Anthropic Claude / Claude Code</option>
                           </select>
                         </div>
 
@@ -429,11 +422,12 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                           <div>
                             <div className="settings-label">{t('settings.models.endpoint')}</div>
                             <div className="settings-sublabel">
-                              {t('settings.models.endpoint.hint')}
+                              {t('settings.models.endpoint.hint')}（兼容 Base URL 如 http://10.0.68.183:8000 或完整 /v1 地址）
                             </div>
                           </div>
                           <input
                             className="settings-input"
+                            placeholder="http://10.0.68.183:8000 或 https://api.deepseek.com/v1"
                             value={endpointInput}
                             onChange={(e) => setEndpointInput(e.target.value)}
                           />
@@ -448,16 +442,28 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                           </div>
                           <input
                             className="settings-input"
+                            list="dac-provider-model-presets"
+                            placeholder="例如 GLM-5.3-Flash / deepseek-flash / qwen2.5-coder:14b"
                             value={modelInput}
                             onChange={(e) => setModelInput(e.target.value)}
                           />
+                          <datalist id="dac-provider-model-presets">
+                            <option value="GLM-5.3-Flash" />
+                            <option value="GLM-4-Plus" />
+                            <option value="GLM-4-Flash" />
+                            <option value="GLM-Z1-Flash" />
+                            <option value="deepseek-flash" />
+                            <option value="deepseek-v4-pro" />
+                            <option value="qwen2.5-coder:14b" />
+                            <option value="claude-3-7-sonnet-latest" />
+                          </datalist>
                         </div>
 
                         <div className="settings-row">
                           <div>
                             <div className="settings-label">{t('settings.models.apiKey')}</div>
                             <div className="settings-sublabel">
-                              {t('settings.models.apiKey.hint')}
+                              {t('settings.models.apiKey.hint')}（本地 vLLM / SGLang 可留空或填 EMPTY）
                             </div>
                           </div>
                           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -467,7 +473,7 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                               placeholder={
                                 providerData?.active?.hasApiKeyConfigured
                                   ? t('settings.models.apiKey.configured')
-                                  : 'sk-...'
+                                  : '本地部署留空自动使用 EMPTY，云端填 sk-...'
                               }
                               value={apiKeyInput}
                               onChange={(e) => setApiKeyInput(e.target.value)}
@@ -489,17 +495,66 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                           <button
                             className="btn primary"
                             onClick={async () => {
+                              const nextEndpoint = endpointInput.trim();
+                              const nextModel = modelInput.trim();
+                              const isLocalEndpoint =
+                                /^(?:https?:\/\/)?(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.0\.0\.1|localhost)/i.test(
+                                  nextEndpoint
+                                );
+                              const effectiveKey =
+                                apiKeyInput.trim() ||
+                                (selectedProviderId === 'glm' || isLocalEndpoint
+                                  ? 'EMPTY'
+                                  : undefined);
                               const res = await bridge.request('provider.update', {
                                 providerId: selectedProviderId,
-                                apiEndpoint: endpointInput,
-                                modelId: modelInput,
-                                apiKey:
-                                  apiKeyInput ||
-                                  (selectedProviderId === 'glm' ? 'EMPTY' : undefined),
+                                apiEndpoint: nextEndpoint,
+                                modelId: nextModel,
+                                apiKey: effectiveKey,
                               });
-                              setProviderData({ ...providerData, active: res.active });
+                              // Also keep ~/.claude/settings.json universally compatible with current settings
+                              const claudeResp = await fetch('/api/claude-settings', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                  providerId: selectedProviderId,
+                                  authToken: effectiveKey || 'EMPTY',
+                                  baseUrl: nextEndpoint,
+                                  defaultModel: nextModel,
+                                  opusModel: nextModel,
+                                  sonnetModel: nextModel,
+                                  haikuModel: nextModel,
+                                }),
+                              })
+                                .then((r) => r.json())
+                                .catch(() => null);
+                              if (sshStatus?.connected && claudeResp?.config) {
+                                const jsonText = JSON.stringify(claudeResp.config, null, 2);
+                                const b64 = btoa(unescape(encodeURIComponent(jsonText)));
+                                await bridge
+                                  .request(
+                                    'capability.invoke',
+                                    {
+                                      capability: 'run-build',
+                                      executionMode: 'auto',
+                                      params: {
+                                        command: `mkdir -p ~/.claude && echo '${b64}' | base64 -d > ~/.claude/settings.json`,
+                                      },
+                                    },
+                                    activeSessionId || undefined
+                                  )
+                                  .catch(() => null);
+                              }
+                              const refreshed = await bridge
+                                .request<any>('provider.get')
+                                .catch(() => null);
+                              setProviderData(
+                                refreshed || { ...providerData, active: res.active }
+                              );
                               setApiKeyInput('');
-                              setStatusNotice(`Saved Provider "${selectedProviderId}"`);
+                              setStatusNotice(
+                                `已保存通用模型配置 (${selectedProviderId} / ${nextModel}) 并同步兼容 ~/.claude/settings.json`
+                              );
                             }}
                           >
                             {t('settings.models.save')}
@@ -516,122 +571,52 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                           <button
                             className="btn"
                             onClick={async () => {
+                              const resp = await fetch('/api/claude-settings')
+                                .then((r) => r.json())
+                                .catch(() => null);
+                              const env = resp?.config?.env || {};
                               const baseUrl =
-                                selectedProviderId === 'glm' && endpointInput.trim()
-                                  ? endpointInput.trim()
-                                  : 'http://10.0.68.183:8000';
-                              const defaultModel =
-                                selectedProviderId === 'glm' && modelInput.trim()
-                                  ? modelInput.trim()
-                                  : 'GLM-5.3-Flash';
-                              const authToken = apiKeyInput.trim() || 'EMPTY';
-                              setSelectedProviderId('glm');
-                              setEndpointInput(baseUrl);
-                              setModelInput(defaultModel);
-                              const resp = await fetch('/api/claude-settings', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                  authToken,
-                                  baseUrl,
-                                  defaultModel,
-                                  opusModel: defaultModel,
-                                  sonnetModel: defaultModel,
-                                  haikuModel: defaultModel,
-                                }),
-                              }).then((r) => r.json());
-                              if (resp?.ok) {
-                                if (resp.active) {
-                                  setProviderData({ ...providerData, active: resp.active });
-                                }
-                                // If SSH is connected, also sync ~/.claude/settings.json on remote host
-                                if (sshStatus?.connected) {
-                                  const jsonText = JSON.stringify(resp.config, null, 2);
-                                  const b64 = btoa(unescape(encodeURIComponent(jsonText)));
-                                  await bridge
-                                    .request(
-                                      'capability.invoke',
-                                      {
-                                        capability: 'run-build',
-                                        executionMode: 'auto',
-                                        params: {
-                                          command: `mkdir -p ~/.claude && echo '${b64}' | base64 -d > ~/.claude/settings.json`,
-                                        },
-                                      },
-                                      activeSessionId || undefined
-                                    )
-                                    .catch(() => null);
-                                }
-                                setStatusNotice(
-                                  `已配置 GLM (${defaultModel} @ ${baseUrl}) 并同步写入 ~/.claude/settings.json`
-                                );
-                              } else {
-                                setStatusNotice(`GLM 配置写入失败: ${resp?.error || 'unknown'}`);
-                              }
+                                String(env.ANTHROPIC_BASE_URL || endpointInput || '').trim();
+                              const defaultModel = String(
+                                env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
+                                  env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
+                                  env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
+                                  modelInput ||
+                                  ''
+                              ).trim();
+                              const authToken = String(
+                                env.ANTHROPIC_AUTH_TOKEN || 'EMPTY'
+                              ).trim();
+                              const targetProviderId = /^glm/i.test(defaultModel)
+                                ? 'glm'
+                                : /^deepseek/i.test(defaultModel)
+                                  ? 'deepseek'
+                                  : /^claude/i.test(defaultModel)
+                                    ? 'anthropic'
+                                    : selectedProviderId;
+                              setSelectedProviderId(targetProviderId);
+                              if (baseUrl) setEndpointInput(baseUrl);
+                              if (defaultModel) setModelInput(defaultModel);
+                              const saved = await bridge.request('provider.update', {
+                                providerId: targetProviderId,
+                                apiEndpoint: baseUrl || endpointInput,
+                                modelId: defaultModel || modelInput,
+                                apiKey: authToken,
+                              });
+                              const refreshed = await bridge
+                                .request<any>('provider.get')
+                                .catch(() => null);
+                              setProviderData(
+                                refreshed || { ...providerData, active: saved.active }
+                              );
+                              setStatusNotice(
+                                `已从 ~/.claude/settings.json 导入配置 (${targetProviderId} / ${defaultModel} @ ${baseUrl})`
+                              );
                             }}
                           >
-                            ⚡ 一键应用 GLM-5.3-Flash 并写入 ~/.claude/settings.json
+                            📥 从 ~/.claude/settings.json 导入配置
                           </button>
                         </div>
-
-                        {selectedProviderId === 'glm' && (
-                          <div
-                            style={{
-                              marginTop: 14,
-                              padding: '10px 12px',
-                              borderRadius: 6,
-                              background: 'var(--bg-elevated)',
-                              border: '1px solid var(--border-subtle)',
-                              fontSize: 11.5,
-                            }}
-                          >
-                            <div style={{ fontWeight: 600, marginBottom: 6 }}>
-                              📋 GLM (vLLM / SGLang) &amp; <code>~/.claude/settings.json</code> 配置说明
-                            </div>
-                            <div style={{ color: 'var(--text-secondary)', marginBottom: 8 }}>
-                              本地 vLLM / SGLang 部署默认使用 <code>ANTHROPIC_AUTH_TOKEN=&quot;EMPTY&quot;</code>、<code>ANTHROPIC_BASE_URL=&quot;{endpointInput || 'http://10.0.68.183:8000'}&quot;</code>、默认模型 <code>{modelInput || 'GLM-5.3-Flash'}</code>。点击上方「⚡ 一键应用 GLM-5.3-Flash 并写入 ~/.claude/settings.json」可自动激活并生成如下配置（若已连接远程 SSH，还会同步写入远程服务器 <code>~/.claude/settings.json</code>）：
-                            </div>
-                            <pre
-                              style={{
-                                margin: 0,
-                                padding: 8,
-                                borderRadius: 4,
-                                background: 'var(--bg-base)',
-                                fontSize: 11,
-                                overflowX: 'auto',
-                              }}
-                            >
-                              {JSON.stringify(
-                                {
-                                  env: {
-                                    ANTHROPIC_AUTH_TOKEN: apiKeyInput.trim() || 'EMPTY',
-                                    ANTHROPIC_BASE_URL:
-                                      (endpointInput || 'http://10.0.68.183:8000').replace(
-                                        /\/v1\/?$/,
-                                        ''
-                                      ),
-                                    ANTHROPIC_DEFAULT_OPUS_MODEL: modelInput || 'GLM-5.3-Flash',
-                                    ANTHROPIC_DEFAULT_SONNET_MODEL: modelInput || 'GLM-5.3-Flash',
-                                    ANTHROPIC_DEFAULT_HAIKU_MODEL: modelInput || 'GLM-5.3-Flash',
-                                    DISABLE_AUTOUPDATER: '1',
-                                    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-                                    CLAUDE_CODE_SKIP_FIRST_RUN: '1',
-                                    CLAUDE_CODE_TELEMETRY: '0',
-                                    DISABLE_TELEMETRY: '1',
-                                    CLAUDE_CODE_WEB_FETCH_SKIP_SAFETY_CHECK: '1',
-                                  },
-                                  autoUpdate: { enabled: false },
-                                  hasCompletedOnboarding: true,
-                                  skipOnboarding: true,
-                                  telemetry: { enabled: false },
-                                  tui: 'fullscreen',
-                                },
-                                null,
-                                2
-                              )}
-                            </pre>
-                          </div>
-                        )}
 
                         {smokeResult && (
                           <div

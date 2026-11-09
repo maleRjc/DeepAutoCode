@@ -2942,32 +2942,61 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                       onChange={(e) => {
                         const nextModel = e.target.value;
                         setModelInput(nextModel);
-                        if (/^glm/i.test(nextModel)) {
-                          setSelectedProviderId('glm');
-                          void bridge
-                            .request('provider.update', {
-                              providerId: 'glm',
-                              apiEndpoint:
-                                selectedProviderId === 'glm' && endpointInput
-                                  ? endpointInput
-                                  : 'http://10.0.68.183:8000',
-                              modelId: nextModel,
-                              apiKey: 'EMPTY',
-                            })
-                            .then((res: any) => {
-                              if (res?.active) {
-                                setProviderData((prev: any) => ({ ...prev, active: res.active }));
-                              }
-                            })
-                            .catch(() => null);
+                        const matchingProv = (providerData?.providers || []).find(
+                          (p: any) =>
+                            p.defaultModelId === nextModel ||
+                            (Array.isArray(p.models) &&
+                              p.models.some((m: any) => m.modelId === nextModel))
+                        );
+                        const targetProviderId =
+                          matchingProv?.providerId ||
+                          (/^glm/i.test(nextModel)
+                            ? 'glm'
+                            : /^deepseek/i.test(nextModel)
+                              ? 'deepseek'
+                              : /^claude/i.test(nextModel)
+                                ? 'anthropic'
+                                : selectedProviderId);
+                        const targetEndpoint =
+                          matchingProv?.apiEndpoint ||
+                          (targetProviderId === selectedProviderId ? endpointInput : undefined);
+                        setSelectedProviderId(targetProviderId);
+                        if (targetEndpoint) {
+                          setEndpointInput(targetEndpoint);
                         }
+                        void bridge
+                          .request('provider.update', {
+                            providerId: targetProviderId,
+                            apiEndpoint: targetEndpoint,
+                            modelId: nextModel,
+                          })
+                          .then((res: any) => {
+                            if (res?.active) {
+                              setProviderData((prev: any) => ({ ...prev, active: res.active }));
+                            }
+                          })
+                          .catch(() => null);
                       }}
-                      title="AI Model Routing: Auto / Force Fast / Force Reasoner / GLM"
+                      title="AI Model Routing"
                     >
+                      {modelInput &&
+                        ![
+                          'deepseek-auto',
+                          'deepseek-flash',
+                          'deepseek-v4-pro',
+                          'GLM-5.3-Flash',
+                          'GLM-4-Plus',
+                          'deepseek-chat',
+                          'deepseek-reasoner',
+                          'qwen2.5-coder:14b',
+                          'claude-3-7-sonnet-latest',
+                        ].includes(modelInput) && (
+                          <option value={modelInput}>{modelInput} (Custom)</option>
+                        )}
                       <option value="deepseek-auto">⚡ Auto Router (Flash/Pro)</option>
                       <option value="deepseek-flash">Force Flash</option>
                       <option value="deepseek-v4-pro">Force V4-Pro</option>
-                      <option value="GLM-5.3-Flash">GLM-5.3-Flash (vLLM/SGLang)</option>
+                      <option value="GLM-5.3-Flash">GLM-5.3-Flash</option>
                       <option value="GLM-4-Plus">GLM-4-Plus</option>
                       <option value="deepseek-chat">Legacy → Flash (chat)</option>
                       <option value="deepseek-reasoner">Legacy → Pro (reasoner)</option>

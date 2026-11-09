@@ -2773,11 +2773,17 @@ export function useWorkbenchController() {
     setStatusNotice(`Testing AI API Key connectivity for ${selectedProviderId}...`);
     try {
       // Always persist the selected provider, endpoint, model, and optional key before running the smoke test
+      const isLocalEndpoint =
+        /^(?:https?:\/\/)?(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.0\.0\.1|localhost)/i.test(
+          endpointInput.trim()
+        );
       const saved = await bridge.request('provider.update', {
         providerId: selectedProviderId,
         apiEndpoint: endpointInput,
         modelId: modelInput,
-        apiKey: apiKeyInput.trim() || (selectedProviderId === 'glm' ? 'EMPTY' : undefined),
+        apiKey:
+          apiKeyInput.trim() ||
+          (selectedProviderId === 'glm' || isLocalEndpoint ? 'EMPTY' : undefined),
       });
       setProviderData((prev: any) => ({ ...prev, active: saved.active }));
       if (apiKeyInput.trim()) {

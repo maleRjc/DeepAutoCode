@@ -195,6 +195,7 @@ import {
 import { SessionReadCache } from '../../core/AgentLoop.js';
 import type { PermissionRuleset } from '../../core/RulePermission.js';
 import {
+  isLocalOrPrivateEndpoint,
   postJsonViaSshRelay,
   resolveChatCompletionsUrl,
   shouldUseSshRelayForLanHost,
@@ -4252,6 +4253,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
 
       const isGlmModel =
         provider.providerId === 'glm' || /^glm/i.test(activeModelId);
+      const isLocalInference = isLocalOrPrivateEndpoint(provider.apiEndpoint);
       const glmEnableThinking =
         isGlmModel && (request.phase === 'plan' || reasoningEffort === 'max');
 
@@ -4274,7 +4276,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             : {}),
         },
         signal: request.signal ?? signal,
-        timeoutMs: isReasonerModel || isGlmModel ? 180000 : 90000,
+        timeoutMs: isReasonerModel || isGlmModel || isLocalInference ? 180000 : 90000,
       });
 
       if (!response.ok) {
@@ -4345,7 +4347,10 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             : typeof msg.reasoning === 'string' && msg.reasoning.trim().length > 0
               ? msg.reasoning
               : '';
-        const cleanedMsgContent = rawTextContent.replace(/\[系统审计记录[\s\S]*$/m, '').trim();
+        const cleanedMsgContent = rawTextContent
+          .replace(/\[系统审计记录[\s\S]*$/m, '')
+          .replace(/^[A-Za-z0-9\s.,:\\/()'"_-]{10,400}?(?=(?:✅|#{1,3}\s+[^\n]*[\u4e00-\u9fa5]))/, '')
+          .trim();
         const finalContent =
           cleanedMsgContent.length > 0
             ? cleanedMsgContent

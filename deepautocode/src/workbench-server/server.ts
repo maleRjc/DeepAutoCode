@@ -686,15 +686,27 @@ export async function createWorkbenchServer(options?: {
       for await (const chunk of req) chunks.push(Buffer.from(chunk));
       try {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const activeSnap = bridge.providerManager.getActiveProvider();
         const authToken = String(body.authToken ?? 'EMPTY').trim() || 'EMPTY';
         const baseUrl =
-          String(body.baseUrl ?? 'http://10.0.68.183:8000')
+          String(body.baseUrl ?? activeSnap.provider.apiEndpoint ?? 'http://10.0.68.183:8000')
             .trim()
             .replace(/\/+$/, '') || 'http://10.0.68.183:8000';
-        const defaultModel = String(body.defaultModel ?? 'GLM-5.3-Flash').trim() || 'GLM-5.3-Flash';
+        const defaultModel =
+          String(body.defaultModel ?? activeSnap.model.modelId ?? 'GLM-5.3-Flash').trim() ||
+          'GLM-5.3-Flash';
         const opusModel = String(body.opusModel ?? defaultModel).trim() || defaultModel;
         const sonnetModel = String(body.sonnetModel ?? defaultModel).trim() || defaultModel;
         const haikuModel = String(body.haikuModel ?? defaultModel).trim() || defaultModel;
+        const targetProviderId =
+          String(body.providerId ?? '').trim() ||
+          (/^glm/i.test(opusModel)
+            ? 'glm'
+            : /^deepseek/i.test(opusModel)
+              ? 'deepseek'
+              : /^claude/i.test(opusModel)
+                ? 'anthropic'
+                : activeSnap.provider.providerId || 'openai-compatible');
 
         const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
         let existing: Record<string, any> = {};
@@ -734,9 +746,9 @@ export async function createWorkbenchServer(options?: {
         await fs.mkdir(path.dirname(claudeSettingsPath), { recursive: true });
         await fs.writeFile(claudeSettingsPath, JSON.stringify(nextConfig, null, 2) + '\n', 'utf-8');
 
-        // Also update the active GLM provider in DeepAutoCode ProviderManager
+        // Also update the selected provider in DeepAutoCode ProviderManager
         await bridge.providerManager.configureProvider({
-          providerId: 'glm',
+          providerId: targetProviderId,
           apiEndpoint: baseUrl,
           modelId: opusModel,
           apiKey: authToken,

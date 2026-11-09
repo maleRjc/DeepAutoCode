@@ -404,14 +404,19 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
       await fs.writeFile(this.getDiffsPath(input.sessionId), JSON.stringify([], null, 2), 'utf-8');
     }
 
+    await this.providerManager.getActiveProviderWithKeyStatus().catch(() => null);
     if (input.executionMode && input.executionMode !== manifest.executionMode) {
       manifest.executionMode = input.executionMode;
     }
-    if (input.modelId && input.modelId.trim() && input.modelId.trim() !== manifest.modelId) {
+    if (input.modelId && input.modelId.trim()) {
       manifest.modelId = input.modelId.trim();
-      if (/^glm/i.test(manifest.modelId)) manifest.providerId = 'glm';
-      else if (/^deepseek/i.test(manifest.modelId)) manifest.providerId = 'deepseek';
-      else if (/^claude/i.test(manifest.modelId)) manifest.providerId = 'anthropic';
+    }
+    if (typeof this.providerManager.resolveProviderForModel === 'function') {
+      const resolvedProv = this.providerManager.resolveProviderForModel(
+        manifest.modelId,
+        manifest.providerId
+      );
+      manifest.providerId = resolvedProv.providerId;
     }
     if (input.workspaceRoot && path.resolve(input.workspaceRoot) !== manifest.workspaceRoot) {
       manifest.workspaceRoot = path.resolve(input.workspaceRoot);

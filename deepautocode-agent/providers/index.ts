@@ -336,9 +336,54 @@ export const ProviderConfigSchema = z.object({
 
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
+export function isLocalOrPrivateEndpoint(apiEndpoint: string): boolean {
+  try {
+    const u = new URL(String(apiEndpoint || '').trim());
+    return (
+      u.hostname === '127.0.0.1' ||
+      u.hostname === 'localhost' ||
+      u.hostname === '::1' ||
+      isPrivateLanHostname(u.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function readClaudeSettingsJsonSync(): {
+  baseUrl?: string;
+  authToken?: string;
+  defaultModel?: string;
+} | null {
+  try {
+    const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+    const raw = fsSync.readFileSync(claudeSettingsPath, 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, any>;
+    const env = parsed?.env && typeof parsed.env === 'object' ? parsed.env : {};
+    const baseUrl =
+      typeof env.ANTHROPIC_BASE_URL === 'string' && env.ANTHROPIC_BASE_URL.trim()
+        ? env.ANTHROPIC_BASE_URL.trim()
+        : undefined;
+    const authToken =
+      typeof env.ANTHROPIC_AUTH_TOKEN === 'string' && env.ANTHROPIC_AUTH_TOKEN.trim()
+        ? env.ANTHROPIC_AUTH_TOKEN.trim()
+        : undefined;
+    const defaultModel =
+      (typeof env.ANTHROPIC_DEFAULT_OPUS_MODEL === 'string' && env.ANTHROPIC_DEFAULT_OPUS_MODEL.trim()) ||
+      (typeof env.ANTHROPIC_DEFAULT_SONNET_MODEL === 'string' && env.ANTHROPIC_DEFAULT_SONNET_MODEL.trim()) ||
+      (typeof env.ANTHROPIC_DEFAULT_HAIKU_MODEL === 'string' && env.ANTHROPIC_DEFAULT_HAIKU_MODEL.trim()) ||
+      undefined;
+    if (!baseUrl && !defaultModel && !authToken) return null;
+    return { baseUrl, authToken, defaultModel };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Normalize base URLs (e.g. `http://10.0.68.183:8000` from vLLM/SGLang `ANTHROPIC_BASE_URL`
- * or `https://api.deepseek.com/v1`) into a valid `/v1/chat/completions` endpoint.
+ * Normalize base URLs (e.g. `http://10.0.68.183:8000` from vLLM/SGLang `ANTHROPIC_BASE_URL`,
+ * `https://open.bigmodel.cn/api/paas/v4`, or `https://api.deepseek.com/v1`) into a valid
+ * `/chat/completions` endpoint across all providers.
  */
 export function resolveChatCompletionsUrl(apiEndpoint: string): string {
   const trimmed = String(apiEndpoint || '').trim().replace(/\/+$/, '');
@@ -728,16 +773,114 @@ export function diagnoseProviderError(error: unknown, provider: ProviderConfig, 
   };
 }
 
+const PROVIDER_STATE_SECRET_KEY = 'deepautocode.provider.__state__';
+
 export class ProviderManager {
   private providers = new Map<string, ProviderConfig>();
   private activeProviderId = 'deepseek';
   private activeModelId = 'deepseek-flash';
   private readonly secrets: SecretStorageAdapter;
+  private stateLoaded = false;
 
   constructor(secrets: SecretStorageAdapter = new InMemorySecretStorage()) {
     this.secrets = secrets;
     for (const [id, cfg] of Object.entries(DEFAULT_PROVIDERS)) {
       this.providers.set(id, structuredClone(cfg));
+    }
+  }
+
+  private async ensureStateLoaded(): Promise<void> {
+    if (this.stateLoaded) return;
+    this.stateLoaded = true;
+    try {
+      const raw = await this.secrets.getSecret(PROVIDER_STATE_SECRET_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as {
+          activeProviderId?: string;
+          activeModelId?: string;
+          providers?: Record<
+            string,
+            { apiEndpoint?: string; defaultModelId?: string; models?: ModelMetadata[] }
+          >;
+        };
+        if (parsed.providers && typeof parsed.providers === 'object') {
+          for (const [id, patch] of Object.entries(parsed.providers)) {
+            const base = this.providers.get(id) ?? {
+              ...DEFAULT_PROVIDERS['openai-compatible'],
+              providerId: id,
+              displayName: id,
+              secretKeyRef: `deepautocode.provider.${id}.apiKey`,
+            };
+            const merged = ProviderConfigSchema.safeParse({
+              ...base,
+              apiEndpoint: patch.apiEndpoint || base.apiEndpoint,
+              defaultModelId: patch.defaultModelId || base.defaultModelId,
+              models: Array.isArray(patch.models) && patch.models.length > 0 ? patch.models : base.models,
+            });
+            if (merged.success) {
+              this.providers.set(id, merged.data);
+            }
+          }
+        }
+        if (parsed.activeProviderId && this.providers.has(parsed.activeProviderId)) {
+          this.activeProviderId = parsed.activeProviderId;
+        }
+        if (parsed.activeModelId) {
+          this.activeModelId = parsed.activeModelId;
+        }
+        return;
+      }
+
+      // If running with persistent EncryptedFileSecretStorage and no state was saved yet,
+      // check if ~/.claude/settings.json has ANTHROPIC_BASE_URL / ANTHROPIC_DEFAULT_OPUS_MODEL configured
+      if (this.secrets instanceof EncryptedFileSecretStorage) {
+        const dsKey = await this.secrets.getSecret(DEFAULT_PROVIDERS.deepseek.secretKeyRef);
+        const claudeCfg = readClaudeSettingsJsonSync();
+        if (!dsKey && claudeCfg && (claudeCfg.baseUrl || claudeCfg.defaultModel)) {
+          const modelId = claudeCfg.defaultModel || 'GLM-5.3-Flash';
+          const targetProviderId = /^glm/i.test(modelId)
+            ? 'glm'
+            : /^deepseek/i.test(modelId)
+              ? 'deepseek'
+              : /^claude/i.test(modelId)
+                ? 'anthropic'
+                : 'openai-compatible';
+          await this.configureProvider({
+            providerId: targetProviderId,
+            apiEndpoint: claudeCfg.baseUrl,
+            modelId,
+            apiKey: claudeCfg.authToken || 'EMPTY',
+          });
+        }
+      }
+    } catch {
+      // ignore state restore errors
+    }
+  }
+
+  private async persistState(): Promise<void> {
+    try {
+      const providersSnapshot: Record<
+        string,
+        { apiEndpoint: string; defaultModelId: string; models: ModelMetadata[] }
+      > = {};
+      for (const [id, cfg] of this.providers.entries()) {
+        providersSnapshot[id] = {
+          apiEndpoint: cfg.apiEndpoint,
+          defaultModelId: cfg.defaultModelId,
+          models: cfg.models,
+        };
+      }
+      await this.secrets.setSecret(
+        PROVIDER_STATE_SECRET_KEY,
+        JSON.stringify({
+          activeProviderId: this.activeProviderId,
+          activeModelId: this.activeModelId,
+          providers: providersSnapshot,
+        })
+      );
+    } catch {
+      // ignore persistence errors
     }
   }
 
@@ -760,21 +903,97 @@ export class ProviderManager {
     return this.providers.get(providerId) ?? this.providers.get(this.activeProviderId) ?? DEFAULT_PROVIDERS.deepseek;
   }
 
+  /**
+   * Universal provider resolver: allows any model (e.g. GLM-5.3-Flash, custom vLLM model, etc.)
+   * to run under whichever provider the user configured in Settings (`glm`, `openai-compatible`,
+   * `anthropic`, or `deepseek`).
+   */
+  resolveProviderForModel(modelId?: string, preferredProviderId?: string): ProviderConfig {
+    const active = this.providers.get(this.activeProviderId) ?? DEFAULT_PROVIDERS.deepseek;
+    const trimmedModel = (modelId || '').trim();
+    if (!trimmedModel) {
+      return (preferredProviderId && this.providers.get(preferredProviderId)) || active;
+    }
+    // 1. If the active provider explicitly has this model as its defaultModelId or in its models list, prefer active!
+    if (
+      active.defaultModelId === trimmedModel ||
+      active.models.some((m) => m.modelId === trimmedModel)
+    ) {
+      return active;
+    }
+    // 2. If preferredProviderId explicitly has this model, use preferredProviderId
+    if (preferredProviderId) {
+      const pref = this.providers.get(preferredProviderId);
+      if (
+        pref &&
+        (pref.defaultModelId === trimmedModel ||
+          pref.models.some((m) => m.modelId === trimmedModel))
+      ) {
+        return pref;
+      }
+    }
+    // 3. Search any configured provider that owns this model
+    for (const cfg of this.providers.values()) {
+      if (
+        cfg.defaultModelId === trimmedModel ||
+        cfg.models.some((m) => m.modelId === trimmedModel)
+      ) {
+        return cfg;
+      }
+    }
+    // 4. Fallback by model prefix or active provider
+    if (/^glm/i.test(trimmedModel)) return this.providers.get('glm') ?? active;
+    if (/^deepseek/i.test(trimmedModel)) return this.providers.get('deepseek') ?? active;
+    if (/^claude/i.test(trimmedModel)) return this.providers.get('anthropic') ?? active;
+    return active;
+  }
+
+  private resolveFallbackKeyForProvider(provider: ProviderConfig): string | undefined {
+    const id = provider.providerId;
+    if (id === 'deepseek') {
+      if (process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY;
+    } else if (id === 'glm') {
+      return (
+        process.env.GLM_API_KEY ||
+        process.env.ZHIPU_API_KEY ||
+        process.env.ANTHROPIC_AUTH_TOKEN ||
+        readClaudeSettingsJsonSync()?.authToken ||
+        'EMPTY'
+      );
+    } else if (id === 'anthropic') {
+      if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) {
+        return process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
+      }
+    } else if (process.env.OPENAI_API_KEY) {
+      return process.env.OPENAI_API_KEY;
+    }
+
+    // Universal compatibility: if any provider is pointed at a local/private LAN endpoint
+    // (e.g. vLLM / SGLang on http://10.0.68.183:8000) or uses a GLM model in persistent mode,
+    // allow keyless / EMPTY token automatically.
+    if (
+      /^glm/i.test(provider.defaultModelId) ||
+      (this.secrets instanceof EncryptedFileSecretStorage &&
+        isLocalOrPrivateEndpoint(provider.apiEndpoint))
+    ) {
+      return (
+        process.env.ANTHROPIC_AUTH_TOKEN ||
+        readClaudeSettingsJsonSync()?.authToken ||
+        'EMPTY'
+      );
+    }
+    return undefined;
+  }
+
   async getActiveProviderWithKeyStatus(): Promise<{
     provider: ProviderConfig;
     model: ModelMetadata;
     hasApiKeyConfigured: boolean;
   }> {
+    await this.ensureStateLoaded();
     const { provider, model } = this.getActiveProvider();
     const secret = await this.secrets.getSecret(provider.secretKeyRef);
-    const envFallback =
-      provider.providerId === 'deepseek'
-        ? process.env.DEEPSEEK_API_KEY
-        : provider.providerId === 'glm'
-          ? process.env.GLM_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || 'EMPTY'
-          : provider.providerId === 'anthropic'
-            ? process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
-            : process.env.OPENAI_API_KEY;
+    const envFallback = this.resolveFallbackKeyForProvider(provider);
     return {
       provider,
       model,
@@ -783,15 +1002,13 @@ export class ProviderManager {
   }
 
   async resolveApiKey(providerId?: string): Promise<string | undefined> {
+    await this.ensureStateLoaded();
     const id = providerId ?? this.activeProviderId;
     const provider = this.providers.get(id);
     if (!provider) return undefined;
     const stored = await this.secrets.getSecret(provider.secretKeyRef);
     if (stored && stored.trim().length > 0) return stored.trim();
-    if (id === 'deepseek') return process.env.DEEPSEEK_API_KEY;
-    if (id === 'glm') return process.env.GLM_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || 'EMPTY';
-    if (id === 'anthropic') return process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
-    return process.env.OPENAI_API_KEY;
+    return this.resolveFallbackKeyForProvider(provider);
   }
 
   async configureProvider(input: {
@@ -801,6 +1018,7 @@ export class ProviderManager {
     apiKey?: string;
     customModel?: ModelMetadata;
   }): Promise<ProviderConfig> {
+    await this.ensureStateLoaded();
     const existing = this.providers.get(input.providerId) ?? {
       ...DEFAULT_PROVIDERS['openai-compatible'],
       providerId: input.providerId,
@@ -808,11 +1026,18 @@ export class ProviderManager {
       secretKeyRef: `deepautocode.provider.${input.providerId}.apiKey`,
     };
 
+    const nextEndpoint = input.apiEndpoint?.trim() || existing.apiEndpoint;
+    const nextModelId = input.modelId?.trim() || existing.defaultModelId;
+
     const updated: ProviderConfig = {
       ...existing,
-      apiEndpoint: input.apiEndpoint ?? existing.apiEndpoint,
-      defaultModelId: input.modelId ?? existing.defaultModelId,
+      apiEndpoint: nextEndpoint,
+      defaultModelId: nextModelId,
       models: [...existing.models],
+      timeoutMs:
+        isLocalOrPrivateEndpoint(nextEndpoint) || /^glm/i.test(nextModelId)
+          ? Math.max(existing.timeoutMs ?? 60000, 180000)
+          : existing.timeoutMs ?? 60000,
     };
 
     if (input.customModel) {
@@ -822,32 +1047,35 @@ export class ProviderManager {
       } else {
         updated.models.push(input.customModel);
       }
-    } else if (input.modelId && !updated.models.some((m) => m.modelId === input.modelId)) {
+    } else if (nextModelId && !updated.models.some((m) => m.modelId === nextModelId)) {
       updated.models.push({
-        modelId: input.modelId,
-        displayName: input.modelId,
-        contextWindow: 64000,
-        maxOutputTokens: 8192,
+        modelId: nextModelId,
+        displayName: nextModelId,
+        contextWindow: 128000,
+        maxOutputTokens: 16384,
         supportsToolCalls: true,
         supportsStreaming: true,
         supportsVision: false,
-        supportsReasoning: false,
+        supportsReasoning: /^glm|reasoner|r1|qwq/i.test(nextModelId),
       });
     }
 
     const parsed = ProviderConfigSchema.parse(updated);
     this.providers.set(parsed.providerId, parsed);
     this.activeProviderId = parsed.providerId;
-    this.activeModelId = input.modelId ?? parsed.defaultModelId;
+    this.activeModelId = nextModelId;
 
     if (input.apiKey !== undefined) {
       if (input.apiKey.trim().length > 0) {
         await this.secrets.setSecret(parsed.secretKeyRef, input.apiKey.trim());
+      } else if (isLocalOrPrivateEndpoint(parsed.apiEndpoint) || parsed.providerId === 'glm') {
+        await this.secrets.setSecret(parsed.secretKeyRef, 'EMPTY');
       } else {
         await this.secrets.deleteSecret(parsed.secretKeyRef);
       }
     }
 
+    await this.persistState();
     return parsed;
   }
 
