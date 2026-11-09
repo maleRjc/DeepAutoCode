@@ -145,29 +145,29 @@ describe('DeepSeek FIM client', () => {
     expect(result.text).toContain('if a < 2');
   });
 
-  it('provides built-in GLM (vLLM / SGLang) provider with EMPTY token fallback and ~/.claude/settings.json builder', async () => {
+  it('provides built-in official GLM provider and supports custom local vLLM/SGLang endpoints', async () => {
     expect(DEFAULT_PROVIDERS.glm).toBeDefined();
-    expect(DEFAULT_PROVIDERS.glm.apiEndpoint).toBe('http://10.0.68.183:8000');
-    expect(DEFAULT_PROVIDERS.glm.defaultModelId).toBe('GLM-5.3-Flash');
-    expect(resolveChatCompletionsUrl('http://10.0.68.183:8000')).toBe(
-      'http://10.0.68.183:8000/v1/chat/completions'
+    expect(DEFAULT_PROVIDERS.glm.apiEndpoint).toBe('https://open.bigmodel.cn/api/paas/v4');
+    expect(DEFAULT_PROVIDERS.glm.defaultModelId).toBe('glm-4-plus');
+    expect(resolveChatCompletionsUrl('https://open.bigmodel.cn/api/paas/v4')).toBe(
+      'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+    );
+    expect(resolveChatCompletionsUrl('http://127.0.0.1:8000')).toBe(
+      'http://127.0.0.1:8000/v1/chat/completions'
     );
 
-    const pm = new ProviderManager();
-    const key = await pm.resolveApiKey('glm');
-    expect(key).toBe('EMPTY');
-
-    const claudeSettings = buildClaudeSettingsJsonForGlm() as any;
+    const claudeSettings = buildClaudeSettingsJsonForGlm({
+      baseUrl: 'http://127.0.0.1:8000',
+      defaultModel: 'Custom-GLM-Flash',
+    }) as any;
     expect(claudeSettings.env.ANTHROPIC_AUTH_TOKEN).toBe('EMPTY');
-    expect(claudeSettings.env.ANTHROPIC_BASE_URL).toBe('http://10.0.68.183:8000');
-    expect(claudeSettings.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('GLM-5.3-Flash');
-    expect(claudeSettings.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('GLM-5.3-Flash');
-    expect(claudeSettings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('GLM-5.3-Flash');
+    expect(claudeSettings.env.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:8000');
+    expect(claudeSettings.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('Custom-GLM-Flash');
     expect(claudeSettings.tui).toBe('fullscreen');
   });
 
   it('supports universal provider settings compatibility across any provider slot and persists state', async () => {
-    expect(isLocalOrPrivateEndpoint('http://10.0.68.183:8000')).toBe(true);
+    expect(isLocalOrPrivateEndpoint('http://10.0.0.1:8000')).toBe(true);
     expect(isLocalOrPrivateEndpoint('http://127.0.0.1:11434/v1')).toBe(true);
     expect(isLocalOrPrivateEndpoint('https://api.deepseek.com/v1')).toBe(false);
     expect(resolveChatCompletionsUrl('https://open.bigmodel.cn/api/paas/v4')).toBe(
@@ -178,22 +178,22 @@ describe('DeepSeek FIM client', () => {
     const pm1 = new ProviderManager(sharedSecrets);
     await pm1.configureProvider({
       providerId: 'openai-compatible',
-      apiEndpoint: 'http://10.0.68.183:8000',
-      modelId: 'GLM-5.3-Flash',
+      apiEndpoint: 'http://10.0.0.1:8000',
+      modelId: 'Custom-Local-Model',
       apiKey: '',
     });
 
     // Empty apiKey on a private LAN endpoint automatically resolves to EMPTY
     expect(await pm1.resolveApiKey('openai-compatible')).toBe('EMPTY');
-    // Universal resolver prefers the active provider that the user configured for GLM-5.3-Flash
-    expect(pm1.resolveProviderForModel('GLM-5.3-Flash').providerId).toBe('openai-compatible');
+    // Universal resolver prefers the active provider that the user configured
+    expect(pm1.resolveProviderForModel('Custom-Local-Model').providerId).toBe('openai-compatible');
 
     // A new ProviderManager instance sharing the same secret storage restores activeProviderId, modelId, and endpoint
     const pm2 = new ProviderManager(sharedSecrets);
     const restored = await pm2.getActiveProviderWithKeyStatus();
     expect(restored.provider.providerId).toBe('openai-compatible');
-    expect(restored.provider.apiEndpoint).toBe('http://10.0.68.183:8000');
-    expect(restored.model.modelId).toBe('GLM-5.3-Flash');
+    expect(restored.provider.apiEndpoint).toBe('http://10.0.0.1:8000');
+    expect(restored.model.modelId).toBe('Custom-Local-Model');
     expect(restored.hasApiKeyConfigured).toBe(true);
   });
 });

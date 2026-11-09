@@ -631,13 +631,14 @@ export async function createWorkbenchServer(options?: {
 
     if (req.method === 'GET' && url.pathname === '/api/claude-settings') {
       const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+      const activeSnap = bridge.providerManager.getActiveProvider();
       const defaultPayload = {
         env: {
           ANTHROPIC_AUTH_TOKEN: 'EMPTY',
-          ANTHROPIC_BASE_URL: 'http://10.0.68.183:8000',
-          ANTHROPIC_DEFAULT_OPUS_MODEL: 'GLM-5.3-Flash',
-          ANTHROPIC_DEFAULT_SONNET_MODEL: 'GLM-5.3-Flash',
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'GLM-5.3-Flash',
+          ANTHROPIC_BASE_URL: activeSnap.provider.apiEndpoint,
+          ANTHROPIC_DEFAULT_OPUS_MODEL: activeSnap.model.modelId,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: activeSnap.model.modelId,
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: activeSnap.model.modelId,
           DISABLE_AUTOUPDATER: '1',
           CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
           CLAUDE_CODE_SKIP_FIRST_RUN: '1',
@@ -689,12 +690,12 @@ export async function createWorkbenchServer(options?: {
         const activeSnap = bridge.providerManager.getActiveProvider();
         const authToken = String(body.authToken ?? 'EMPTY').trim() || 'EMPTY';
         const baseUrl =
-          String(body.baseUrl ?? activeSnap.provider.apiEndpoint ?? 'http://10.0.68.183:8000')
+          String(body.baseUrl ?? activeSnap.provider.apiEndpoint ?? 'https://open.bigmodel.cn/api/paas/v4')
             .trim()
-            .replace(/\/+$/, '') || 'http://10.0.68.183:8000';
+            .replace(/\/+$/, '') || 'https://open.bigmodel.cn/api/paas/v4';
         const defaultModel =
-          String(body.defaultModel ?? activeSnap.model.modelId ?? 'GLM-5.3-Flash').trim() ||
-          'GLM-5.3-Flash';
+          String(body.defaultModel ?? activeSnap.model.modelId ?? 'glm-4-plus').trim() ||
+          'glm-4-plus';
         const opusModel = String(body.opusModel ?? defaultModel).trim() || defaultModel;
         const sonnetModel = String(body.sonnetModel ?? defaultModel).trim() || defaultModel;
         const haikuModel = String(body.haikuModel ?? defaultModel).trim() || defaultModel;

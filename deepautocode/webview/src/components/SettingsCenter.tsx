@@ -410,11 +410,11 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                             }}
                           >
                             <option value="deepseek">DeepSeek (Default)</option>
-                            <option value="glm">GLM / 智谱 (vLLM / SGLang / BigModel)</option>
+                            <option value="glm">GLM (Zhipu BigModel Official)</option>
                             <option value="openai-compatible">
-                              OpenAI-Compatible (vLLM / SGLang / Ollama / Gateway)
+                              Custom / OpenAI-Compatible (vLLM / SGLang / Ollama / Gateway)
                             </option>
-                            <option value="anthropic">Anthropic Claude / Claude Code</option>
+                            <option value="anthropic">Anthropic Claude</option>
                           </select>
                         </div>
 
@@ -422,12 +422,12 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                           <div>
                             <div className="settings-label">{t('settings.models.endpoint')}</div>
                             <div className="settings-sublabel">
-                              {t('settings.models.endpoint.hint')}（兼容 Base URL 如 http://10.0.68.183:8000 或完整 /v1 地址）
+                              {t('settings.models.endpoint.hint')}
                             </div>
                           </div>
                           <input
                             className="settings-input"
-                            placeholder="http://10.0.68.183:8000 或 https://api.deepseek.com/v1"
+                            placeholder="https://api.deepseek.com/v1 或自定义本地服务地址"
                             value={endpointInput}
                             onChange={(e) => setEndpointInput(e.target.value)}
                           />
@@ -443,17 +443,17 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                           <input
                             className="settings-input"
                             list="dac-provider-model-presets"
-                            placeholder="例如 GLM-5.3-Flash / deepseek-flash / qwen2.5-coder:14b"
+                            placeholder="例如 deepseek-flash / glm-4-plus 或自定义模型名称"
                             value={modelInput}
                             onChange={(e) => setModelInput(e.target.value)}
                           />
                           <datalist id="dac-provider-model-presets">
-                            <option value="GLM-5.3-Flash" />
-                            <option value="GLM-4-Plus" />
-                            <option value="GLM-4-Flash" />
-                            <option value="GLM-Z1-Flash" />
                             <option value="deepseek-flash" />
                             <option value="deepseek-v4-pro" />
+                            <option value="glm-4-plus" />
+                            <option value="glm-4-flash" />
+                            <option value="glm-z1-flash" />
+                            <option value="glm-4-air" />
                             <option value="qwen2.5-coder:14b" />
                             <option value="claude-3-7-sonnet-latest" />
                           </datalist>

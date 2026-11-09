@@ -2984,8 +2984,9 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                           'deepseek-auto',
                           'deepseek-flash',
                           'deepseek-v4-pro',
-                          'GLM-5.3-Flash',
-                          'GLM-4-Plus',
+                          'glm-4-plus',
+                          'glm-4-flash',
+                          'glm-z1-flash',
                           'deepseek-chat',
                           'deepseek-reasoner',
                           'qwen2.5-coder:14b',
@@ -2996,11 +2997,12 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                       <option value="deepseek-auto">⚡ Auto Router (Flash/Pro)</option>
                       <option value="deepseek-flash">Force Flash</option>
                       <option value="deepseek-v4-pro">Force V4-Pro</option>
-                      <option value="GLM-5.3-Flash">GLM-5.3-Flash</option>
-                      <option value="GLM-4-Plus">GLM-4-Plus</option>
+                      <option value="glm-4-plus">GLM-4-Plus (Official)</option>
+                      <option value="glm-4-flash">GLM-4-Flash (Official)</option>
+                      <option value="glm-z1-flash">GLM-Z1-Flash (Official)</option>
                       <option value="deepseek-chat">Legacy → Flash (chat)</option>
                       <option value="deepseek-reasoner">Legacy → Pro (reasoner)</option>
-                      <option value="qwen2.5-coder:14b">qwen2.5-coder</option>
+                      <option value="qwen2.5-coder:14b">qwen2.5-coder (Custom)</option>
                       <option value="claude-3-7-sonnet-latest">claude-3.7-sonnet</option>
                     </select>
                     {lastModelTier?.effectiveModelId && (

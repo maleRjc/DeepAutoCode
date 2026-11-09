@@ -381,13 +381,13 @@ export function readClaudeSettingsJsonSync(): {
 }
 
 /**
- * Normalize base URLs (e.g. `http://10.0.68.183:8000` from vLLM/SGLang `ANTHROPIC_BASE_URL`,
+ * Normalize base URLs (e.g. `http://127.0.0.1:8000` from local vLLM/SGLang,
  * `https://open.bigmodel.cn/api/paas/v4`, or `https://api.deepseek.com/v1`) into a valid
  * `/chat/completions` endpoint across all providers.
  */
 export function resolveChatCompletionsUrl(apiEndpoint: string): string {
   const trimmed = String(apiEndpoint || '').trim().replace(/\/+$/, '');
-  if (!trimmed) return 'http://10.0.68.183:8000/v1/chat/completions';
+  if (!trimmed) return 'https://api.deepseek.com/v1/chat/completions';
   if (/\/chat\/completions$/i.test(trimmed)) {
     return trimmed;
   }
@@ -398,7 +398,7 @@ export function resolveChatCompletionsUrl(apiEndpoint: string): string {
 }
 
 /**
- * Build `~/.claude/settings.json` payload for local vLLM / SGLang GLM deployments.
+ * Build `~/.claude/settings.json` payload for GLM or custom OpenAI/Anthropic-compatible endpoints.
  */
 export function buildClaudeSettingsJsonForGlm(params?: {
   authToken?: string;
@@ -408,8 +408,10 @@ export function buildClaudeSettingsJsonForGlm(params?: {
   sonnetModel?: string;
   haikuModel?: string;
 }): Record<string, unknown> {
-  const model = (params?.defaultModel || 'GLM-5.3-Flash').trim() || 'GLM-5.3-Flash';
-  const baseUrl = (params?.baseUrl || 'http://10.0.68.183:8000').trim().replace(/\/v1\/?$/, '') || 'http://10.0.68.183:8000';
+  const model = (params?.defaultModel || 'glm-4-plus').trim() || 'glm-4-plus';
+  const baseUrl =
+    (params?.baseUrl || 'https://open.bigmodel.cn/api/paas/v4').trim().replace(/\/v1\/?$/, '') ||
+    'https://open.bigmodel.cn/api/paas/v4';
   const authToken = (params?.authToken || 'EMPTY').trim() || 'EMPTY';
   return {
     env: {
@@ -495,26 +497,16 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
   },
   glm: {
     providerId: 'glm',
-    displayName: 'GLM (vLLM / SGLang · GLM-5.3-Flash)',
+    displayName: 'GLM (Zhipu BigModel Official)',
     protocol: 'glm',
-    apiEndpoint: 'http://10.0.68.183:8000',
-    defaultModelId: 'GLM-5.3-Flash',
+    apiEndpoint: 'https://open.bigmodel.cn/api/paas/v4',
+    defaultModelId: 'glm-4-plus',
     secretKeyRef: 'deepautocode.provider.glm.apiKey',
-    timeoutMs: 180000,
+    timeoutMs: 120000,
     models: [
       {
-        modelId: 'GLM-5.3-Flash',
-        displayName: 'GLM-5.3-Flash (vLLM / SGLang Default)',
-        contextWindow: 128_000,
-        maxOutputTokens: 16_384,
-        supportsToolCalls: true,
-        supportsStreaming: true,
-        supportsVision: false,
-        supportsReasoning: true,
-      },
-      {
-        modelId: 'GLM-4-Plus',
-        displayName: 'GLM-4-Plus',
+        modelId: 'glm-4-plus',
+        displayName: 'GLM-4-Plus (Official Default)',
         contextWindow: 128_000,
         maxOutputTokens: 8_192,
         supportsToolCalls: true,
@@ -523,7 +515,7 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
         supportsReasoning: false,
       },
       {
-        modelId: 'GLM-4-Flash',
+        modelId: 'glm-4-flash',
         displayName: 'GLM-4-Flash',
         contextWindow: 128_000,
         maxOutputTokens: 8_192,
@@ -533,7 +525,7 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
         supportsReasoning: false,
       },
       {
-        modelId: 'GLM-Z1-Flash',
+        modelId: 'glm-z1-flash',
         displayName: 'GLM-Z1-Flash (Reasoning)',
         contextWindow: 128_000,
         maxOutputTokens: 16_384,
@@ -541,6 +533,16 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
         supportsStreaming: true,
         supportsVision: false,
         supportsReasoning: true,
+      },
+      {
+        modelId: 'glm-4-air',
+        displayName: 'GLM-4-Air',
+        contextWindow: 128_000,
+        maxOutputTokens: 8_192,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: false,
+        supportsReasoning: false,
       },
     ],
   },
@@ -837,14 +839,18 @@ export class ProviderManager {
         const dsKey = await this.secrets.getSecret(DEFAULT_PROVIDERS.deepseek.secretKeyRef);
         const claudeCfg = readClaudeSettingsJsonSync();
         if (!dsKey && claudeCfg && (claudeCfg.baseUrl || claudeCfg.defaultModel)) {
-          const modelId = claudeCfg.defaultModel || 'GLM-5.3-Flash';
-          const targetProviderId = /^glm/i.test(modelId)
-            ? 'glm'
-            : /^deepseek/i.test(modelId)
-              ? 'deepseek'
-              : /^claude/i.test(modelId)
-                ? 'anthropic'
-                : 'openai-compatible';
+          const modelId = claudeCfg.defaultModel || 'glm-4-plus';
+          const isCustomEndpoint =
+            claudeCfg.baseUrl && isLocalOrPrivateEndpoint(claudeCfg.baseUrl);
+          const targetProviderId = isCustomEndpoint
+            ? 'openai-compatible'
+            : /^glm/i.test(modelId)
+              ? 'glm'
+              : /^deepseek/i.test(modelId)
+                ? 'deepseek'
+                : /^claude/i.test(modelId)
+                  ? 'anthropic'
+                  : 'openai-compatible';
           await this.configureProvider({
             providerId: targetProviderId,
             apiEndpoint: claudeCfg.baseUrl,
@@ -904,7 +910,7 @@ export class ProviderManager {
   }
 
   /**
-   * Universal provider resolver: allows any model (e.g. GLM-5.3-Flash, custom vLLM model, etc.)
+   * Universal provider resolver: allows any model (e.g. official or custom local vLLM model)
    * to run under whichever provider the user configured in Settings (`glm`, `openai-compatible`,
    * `anthropic`, or `deepseek`).
    */
@@ -969,12 +975,10 @@ export class ProviderManager {
     }
 
     // Universal compatibility: if any provider is pointed at a local/private LAN endpoint
-    // (e.g. vLLM / SGLang on http://10.0.68.183:8000) or uses a GLM model in persistent mode,
-    // allow keyless / EMPTY token automatically.
+    // (e.g. local vLLM / SGLang / Ollama) in persistent mode, allow keyless / EMPTY token automatically.
     if (
-      /^glm/i.test(provider.defaultModelId) ||
-      (this.secrets instanceof EncryptedFileSecretStorage &&
-        isLocalOrPrivateEndpoint(provider.apiEndpoint))
+      this.secrets instanceof EncryptedFileSecretStorage &&
+      isLocalOrPrivateEndpoint(provider.apiEndpoint)
     ) {
       return (
         process.env.ANTHROPIC_AUTH_TOKEN ||
