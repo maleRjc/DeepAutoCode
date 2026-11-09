@@ -12,8 +12,10 @@ import { resolveTieredModelForTurn } from '../src/core/GoalSteering.js';
 import { completeDeepSeekFim } from '../src/core/DeepSeekFim.js';
 import {
   DEFAULT_PROVIDERS,
+  InMemorySecretStorage,
   ProviderManager,
   buildClaudeSettingsJsonForGlm,
+  isLocalOrPrivateEndpoint,
   resolveChatCompletionsUrl,
 } from '../providers/index.js';
 
@@ -162,5 +164,36 @@ describe('DeepSeek FIM client', () => {
     expect(claudeSettings.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('GLM-5.3-Flash');
     expect(claudeSettings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('GLM-5.3-Flash');
     expect(claudeSettings.tui).toBe('fullscreen');
+  });
+
+  it('supports universal provider settings compatibility across any provider slot and persists state', async () => {
+    expect(isLocalOrPrivateEndpoint('http://10.0.68.183:8000')).toBe(true);
+    expect(isLocalOrPrivateEndpoint('http://127.0.0.1:11434/v1')).toBe(true);
+    expect(isLocalOrPrivateEndpoint('https://api.deepseek.com/v1')).toBe(false);
+    expect(resolveChatCompletionsUrl('https://open.bigmodel.cn/api/paas/v4')).toBe(
+      'https://open.bigmodel.cn/api/paas/v4/chat/completions'
+    );
+
+    const sharedSecrets = new InMemorySecretStorage();
+    const pm1 = new ProviderManager(sharedSecrets);
+    await pm1.configureProvider({
+      providerId: 'openai-compatible',
+      apiEndpoint: 'http://10.0.68.183:8000',
+      modelId: 'GLM-5.3-Flash',
+      apiKey: '',
+    });
+
+    // Empty apiKey on a private LAN endpoint automatically resolves to EMPTY
+    expect(await pm1.resolveApiKey('openai-compatible')).toBe('EMPTY');
+    // Universal resolver prefers the active provider that the user configured for GLM-5.3-Flash
+    expect(pm1.resolveProviderForModel('GLM-5.3-Flash').providerId).toBe('openai-compatible');
+
+    // A new ProviderManager instance sharing the same secret storage restores activeProviderId, modelId, and endpoint
+    const pm2 = new ProviderManager(sharedSecrets);
+    const restored = await pm2.getActiveProviderWithKeyStatus();
+    expect(restored.provider.providerId).toBe('openai-compatible');
+    expect(restored.provider.apiEndpoint).toBe('http://10.0.68.183:8000');
+    expect(restored.model.modelId).toBe('GLM-5.3-Flash');
+    expect(restored.hasApiKeyConfigured).toBe(true);
   });
 });
