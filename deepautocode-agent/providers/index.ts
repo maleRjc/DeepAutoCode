@@ -178,7 +178,8 @@ export function postJsonViaSshRelay(params: {
     }
     const safeUrl = String(params.url).replace(/'/g, '');
     const method = (params.method || 'POST').toUpperCase();
-    const maxTimeSec = Math.max(10, Math.ceil((params.timeoutMs ?? 60000) / 1000));
+    const effectiveTimeoutMs = params.timeoutMs ?? 180000;
+    const maxTimeSec = Math.max(30, Math.ceil(effectiveTimeoutMs / 1000));
     const remoteCmd = `curl -sS --max-time ${maxTimeSec} -w '\\n__DAC_HTTP_STATUS__:%{http_code}' -X ${method} ${headerArgs.join(' ')} --data-binary @- '${safeUrl}'`;
 
     const child = spawn(
@@ -191,8 +192,8 @@ export function postJsonViaSshRelay(params: {
     const errChunks: Buffer[] = [];
     const timer = setTimeout(() => {
       child.kill();
-      reject(new Error(`SSH relay timed out after ${params.timeoutMs ?? 60000}ms`));
-    }, (params.timeoutMs ?? 60000) + 5000);
+      reject(new Error(`SSH relay timed out after ${effectiveTimeoutMs}ms`));
+    }, effectiveTimeoutMs + 8000);
 
     child.stdout.on('data', (c) => outChunks.push(Buffer.from(c)));
     child.stderr.on('data', (c) => errChunks.push(Buffer.from(c)));
@@ -203,10 +204,20 @@ export function postJsonViaSshRelay(params: {
     child.on('close', (code) => {
       clearTimeout(timer);
       const rawOut = Buffer.concat(outChunks).toString('utf-8');
+      const errText = Buffer.concat(errChunks).toString('utf-8').trim();
       const statusMatch = rawOut.match(/\n__DAC_HTTP_STATUS__:(\d{3})\s*$/);
       if (statusMatch) {
         const status = Number(statusMatch[1]);
         const bodyText = rawOut.slice(0, statusMatch.index);
+        if (status === 0) {
+          reject(
+            new Error(
+              errText ||
+                `Request to ${safeUrl} timed out or closed before HTTP response (curl exit ${code})`
+            )
+          );
+          return;
+        }
         resolve({
           ok: status >= 200 && status < 300,
           status,
@@ -214,7 +225,6 @@ export function postJsonViaSshRelay(params: {
         });
         return;
       }
-      const errText = Buffer.concat(errChunks).toString('utf-8').trim();
       reject(new Error(errText || `SSH relay exited with code ${code}`));
     });
 
@@ -445,7 +455,7 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
     apiEndpoint: 'http://10.0.68.183:8000',
     defaultModelId: 'GLM-5.3-Flash',
     secretKeyRef: 'deepautocode.provider.glm.apiKey',
-    timeoutMs: 60000,
+    timeoutMs: 180000,
     models: [
       {
         modelId: 'GLM-5.3-Flash',

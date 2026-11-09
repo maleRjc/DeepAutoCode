@@ -4250,6 +4250,11 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         }))
         : [];
 
+      const isGlmModel =
+        provider.providerId === 'glm' || /^glm/i.test(activeModelId);
+      const glmEnableThinking =
+        isGlmModel && (request.phase === 'plan' || reasoningEffort === 'max');
+
       const response = await postJsonResilient({
         url: endpoint,
         headers: {
@@ -4264,9 +4269,12 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           max_tokens: 8192,
           ...(isReasonerModel ? {} : { temperature: 0.2 }),
           ...(dsControls ? deepSeekChatBodyExtras(dsControls) : {}),
+          ...(isGlmModel
+            ? { chat_template_kwargs: { enable_thinking: glmEnableThinking } }
+            : {}),
         },
         signal: request.signal ?? signal,
-        timeoutMs: isReasonerModel ? 120000 : 60000,
+        timeoutMs: isReasonerModel || isGlmModel ? 180000 : 90000,
       });
 
       if (!response.ok) {
