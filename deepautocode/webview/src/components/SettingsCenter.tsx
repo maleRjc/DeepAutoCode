@@ -553,7 +553,7 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                               );
                               setApiKeyInput('');
                               setStatusNotice(
-                                `已保存通用模型配置 (${selectedProviderId} / ${nextModel}) 并同步兼容 ~/.claude/settings.json`
+                                `已保存模型配置 (${selectedProviderId} / ${nextModel})`
                               );
                             }}
                           >
@@ -567,54 +567,6 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                             {isTestingKey
                               ? t('settings.models.verifying')
                               : t('settings.models.testFull')}
-                          </button>
-                          <button
-                            className="btn"
-                            onClick={async () => {
-                              const resp = await fetch('/api/claude-settings')
-                                .then((r) => r.json())
-                                .catch(() => null);
-                              const env = resp?.config?.env || {};
-                              const baseUrl =
-                                String(env.ANTHROPIC_BASE_URL || endpointInput || '').trim();
-                              const defaultModel = String(
-                                env.ANTHROPIC_DEFAULT_OPUS_MODEL ||
-                                  env.ANTHROPIC_DEFAULT_SONNET_MODEL ||
-                                  env.ANTHROPIC_DEFAULT_HAIKU_MODEL ||
-                                  modelInput ||
-                                  ''
-                              ).trim();
-                              const authToken = String(
-                                env.ANTHROPIC_AUTH_TOKEN || 'EMPTY'
-                              ).trim();
-                              const targetProviderId = /^glm/i.test(defaultModel)
-                                ? 'glm'
-                                : /^deepseek/i.test(defaultModel)
-                                  ? 'deepseek'
-                                  : /^claude/i.test(defaultModel)
-                                    ? 'anthropic'
-                                    : selectedProviderId;
-                              setSelectedProviderId(targetProviderId);
-                              if (baseUrl) setEndpointInput(baseUrl);
-                              if (defaultModel) setModelInput(defaultModel);
-                              const saved = await bridge.request('provider.update', {
-                                providerId: targetProviderId,
-                                apiEndpoint: baseUrl || endpointInput,
-                                modelId: defaultModel || modelInput,
-                                apiKey: authToken,
-                              });
-                              const refreshed = await bridge
-                                .request<any>('provider.get')
-                                .catch(() => null);
-                              setProviderData(
-                                refreshed || { ...providerData, active: saved.active }
-                              );
-                              setStatusNotice(
-                                `已从 ~/.claude/settings.json 导入配置 (${targetProviderId} / ${defaultModel} @ ${baseUrl})`
-                              );
-                            }}
-                          >
-                            📥 从 ~/.claude/settings.json 导入配置
                           </button>
                         </div>
 
