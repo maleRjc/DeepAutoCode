@@ -149,7 +149,7 @@ export type ModelMetadata = z.infer<typeof ModelMetadataSchema>;
 export const ProviderConfigSchema = z.object({
   providerId: z.string().min(1),
   displayName: z.string().min(1),
-  protocol: z.enum(['deepseek', 'openai-compatible', 'anthropic', 'openai']),
+  protocol: z.enum(['deepseek', 'openai-compatible', 'anthropic', 'openai', 'glm']),
   apiEndpoint: z.string().url(),
   defaultModelId: z.string().min(1),
   models: z.array(ModelMetadataSchema).min(1),
@@ -160,7 +160,63 @@ export const ProviderConfigSchema = z.object({
 export type ProviderConfig = z.infer<typeof ProviderConfigSchema>;
 
 /**
- * Section 7.1 & 7.2: Built-in Default Providers (DeepSeek default + replaceable OpenAI-compatible / Anthropic)
+ * Normalize base URLs (e.g. `http://10.0.68.183:8000` from vLLM/SGLang `ANTHROPIC_BASE_URL`
+ * or `https://api.deepseek.com/v1`) into a valid `/v1/chat/completions` endpoint.
+ */
+export function resolveChatCompletionsUrl(apiEndpoint: string): string {
+  const trimmed = String(apiEndpoint || '').trim().replace(/\/+$/, '');
+  if (!trimmed) return 'http://10.0.68.183:8000/v1/chat/completions';
+  if (/\/chat\/completions$/i.test(trimmed)) {
+    return trimmed;
+  }
+  if (/\/v\d+(?:beta)?$/i.test(trimmed)) {
+    return `${trimmed}/chat/completions`;
+  }
+  return `${trimmed}/v1/chat/completions`;
+}
+
+/**
+ * Build `~/.claude/settings.json` payload for local vLLM / SGLang GLM deployments.
+ */
+export function buildClaudeSettingsJsonForGlm(params?: {
+  authToken?: string;
+  baseUrl?: string;
+  defaultModel?: string;
+  opusModel?: string;
+  sonnetModel?: string;
+  haikuModel?: string;
+}): Record<string, unknown> {
+  const model = (params?.defaultModel || 'GLM-5.3-Flash').trim() || 'GLM-5.3-Flash';
+  const baseUrl = (params?.baseUrl || 'http://10.0.68.183:8000').trim().replace(/\/v1\/?$/, '') || 'http://10.0.68.183:8000';
+  const authToken = (params?.authToken || 'EMPTY').trim() || 'EMPTY';
+  return {
+    env: {
+      ANTHROPIC_AUTH_TOKEN: authToken,
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: params?.opusModel?.trim() || model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: params?.sonnetModel?.trim() || model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: params?.haikuModel?.trim() || model,
+      DISABLE_AUTOUPDATER: '1',
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+      CLAUDE_CODE_SKIP_FIRST_RUN: '1',
+      CLAUDE_CODE_TELEMETRY: '0',
+      DISABLE_TELEMETRY: '1',
+      CLAUDE_CODE_WEB_FETCH_SKIP_SAFETY_CHECK: '1',
+    },
+    autoUpdate: {
+      enabled: false,
+    },
+    hasCompletedOnboarding: true,
+    skipOnboarding: true,
+    telemetry: {
+      enabled: false,
+    },
+    tui: 'fullscreen',
+  };
+}
+
+/**
+ * Section 7.1 & 7.2: Built-in Default Providers (DeepSeek default + GLM vLLM/SGLang + OpenAI-compatible / Anthropic)
  */
 export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
   deepseek: {
@@ -208,6 +264,57 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
         displayName: 'Legacy alias → Pro thinking (deepseek-reasoner)',
         contextWindow: 1_000_000,
         maxOutputTokens: 384_000,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: false,
+        supportsReasoning: true,
+      },
+    ],
+  },
+  glm: {
+    providerId: 'glm',
+    displayName: 'GLM (vLLM / SGLang · GLM-5.3-Flash)',
+    protocol: 'glm',
+    apiEndpoint: 'http://10.0.68.183:8000',
+    defaultModelId: 'GLM-5.3-Flash',
+    secretKeyRef: 'deepautocode.provider.glm.apiKey',
+    timeoutMs: 60000,
+    models: [
+      {
+        modelId: 'GLM-5.3-Flash',
+        displayName: 'GLM-5.3-Flash (vLLM / SGLang Default)',
+        contextWindow: 128_000,
+        maxOutputTokens: 16_384,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: false,
+        supportsReasoning: true,
+      },
+      {
+        modelId: 'GLM-4-Plus',
+        displayName: 'GLM-4-Plus',
+        contextWindow: 128_000,
+        maxOutputTokens: 8_192,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: true,
+        supportsReasoning: false,
+      },
+      {
+        modelId: 'GLM-4-Flash',
+        displayName: 'GLM-4-Flash',
+        contextWindow: 128_000,
+        maxOutputTokens: 8_192,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: false,
+        supportsReasoning: false,
+      },
+      {
+        modelId: 'GLM-Z1-Flash',
+        displayName: 'GLM-Z1-Flash (Reasoning)',
+        contextWindow: 128_000,
+        maxOutputTokens: 16_384,
         supportsToolCalls: true,
         supportsStreaming: true,
         supportsVision: false,
@@ -472,6 +579,10 @@ export class ProviderManager {
     };
   }
 
+  getProviderById(providerId: string): ProviderConfig {
+    return this.providers.get(providerId) ?? this.providers.get(this.activeProviderId) ?? DEFAULT_PROVIDERS.deepseek;
+  }
+
   async getActiveProviderWithKeyStatus(): Promise<{
     provider: ProviderConfig;
     model: ModelMetadata;
@@ -482,9 +593,11 @@ export class ProviderManager {
     const envFallback =
       provider.providerId === 'deepseek'
         ? process.env.DEEPSEEK_API_KEY
-        : provider.providerId === 'anthropic'
-          ? process.env.ANTHROPIC_API_KEY
-          : process.env.OPENAI_API_KEY;
+        : provider.providerId === 'glm'
+          ? process.env.GLM_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || 'EMPTY'
+          : provider.providerId === 'anthropic'
+            ? process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
+            : process.env.OPENAI_API_KEY;
     return {
       provider,
       model,
@@ -499,7 +612,8 @@ export class ProviderManager {
     const stored = await this.secrets.getSecret(provider.secretKeyRef);
     if (stored && stored.trim().length > 0) return stored.trim();
     if (id === 'deepseek') return process.env.DEEPSEEK_API_KEY;
-    if (id === 'anthropic') return process.env.ANTHROPIC_API_KEY;
+    if (id === 'glm') return process.env.GLM_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || 'EMPTY';
+    if (id === 'anthropic') return process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN;
     return process.env.OPENAI_API_KEY;
   }
 
@@ -633,7 +747,8 @@ export class ProviderManager {
     }
 
     try {
-      const response = await fetchFn(`${provider.apiEndpoint.replace(/\/$/, '')}/chat/completions`, {
+      const chatUrl = resolveChatCompletionsUrl(provider.apiEndpoint);
+      const response = await fetchFn(chatUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

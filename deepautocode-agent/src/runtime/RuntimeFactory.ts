@@ -409,6 +409,9 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     }
     if (input.modelId && input.modelId.trim() && input.modelId.trim() !== manifest.modelId) {
       manifest.modelId = input.modelId.trim();
+      if (/^glm/i.test(manifest.modelId)) manifest.providerId = 'glm';
+      else if (/^deepseek/i.test(manifest.modelId)) manifest.providerId = 'deepseek';
+      else if (/^claude/i.test(manifest.modelId)) manifest.providerId = 'anthropic';
     }
     if (input.workspaceRoot && path.resolve(input.workspaceRoot) !== manifest.workspaceRoot) {
       manifest.workspaceRoot = path.resolve(input.workspaceRoot);

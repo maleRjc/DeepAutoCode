@@ -1,6 +1,7 @@
 import { exec, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -625,6 +626,136 @@ export async function createWorkbenchServer(options?: {
       const saved = await saveIdeSettings(patch);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, settings: saved }));
+      return;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/claude-settings') {
+      const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+      const defaultPayload = {
+        env: {
+          ANTHROPIC_AUTH_TOKEN: 'EMPTY',
+          ANTHROPIC_BASE_URL: 'http://10.0.68.183:8000',
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'GLM-5.3-Flash',
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'GLM-5.3-Flash',
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'GLM-5.3-Flash',
+          DISABLE_AUTOUPDATER: '1',
+          CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+          CLAUDE_CODE_SKIP_FIRST_RUN: '1',
+          CLAUDE_CODE_TELEMETRY: '0',
+          DISABLE_TELEMETRY: '1',
+          CLAUDE_CODE_WEB_FETCH_SKIP_SAFETY_CHECK: '1',
+        },
+        autoUpdate: {
+          enabled: false,
+        },
+        hasCompletedOnboarding: true,
+        skipOnboarding: true,
+        telemetry: {
+          enabled: false,
+        },
+        tui: 'fullscreen',
+      };
+      try {
+        const raw = await fs.readFile(claudeSettingsPath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            exists: true,
+            filePath: claudeSettingsPath,
+            config: parsed,
+          })
+        );
+      } catch {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            exists: false,
+            filePath: claudeSettingsPath,
+            config: defaultPayload,
+          })
+        );
+      }
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/claude-settings') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf-8') || '{}');
+        const authToken = String(body.authToken ?? 'EMPTY').trim() || 'EMPTY';
+        const baseUrl =
+          String(body.baseUrl ?? 'http://10.0.68.183:8000')
+            .trim()
+            .replace(/\/+$/, '') || 'http://10.0.68.183:8000';
+        const defaultModel = String(body.defaultModel ?? 'GLM-5.3-Flash').trim() || 'GLM-5.3-Flash';
+        const opusModel = String(body.opusModel ?? defaultModel).trim() || defaultModel;
+        const sonnetModel = String(body.sonnetModel ?? defaultModel).trim() || defaultModel;
+        const haikuModel = String(body.haikuModel ?? defaultModel).trim() || defaultModel;
+
+        const claudeSettingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+        let existing: Record<string, any> = {};
+        try {
+          existing = JSON.parse(await fs.readFile(claudeSettingsPath, 'utf-8'));
+        } catch {
+          existing = {};
+        }
+
+        const nextConfig = {
+          ...existing,
+          env: {
+            ...(existing.env && typeof existing.env === 'object' ? existing.env : {}),
+            ANTHROPIC_AUTH_TOKEN: authToken,
+            ANTHROPIC_BASE_URL: baseUrl,
+            ANTHROPIC_DEFAULT_OPUS_MODEL: opusModel,
+            ANTHROPIC_DEFAULT_SONNET_MODEL: sonnetModel,
+            ANTHROPIC_DEFAULT_HAIKU_MODEL: haikuModel,
+            DISABLE_AUTOUPDATER: '1',
+            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+            CLAUDE_CODE_SKIP_FIRST_RUN: '1',
+            CLAUDE_CODE_TELEMETRY: '0',
+            DISABLE_TELEMETRY: '1',
+            CLAUDE_CODE_WEB_FETCH_SKIP_SAFETY_CHECK: '1',
+          },
+          autoUpdate: {
+            enabled: false,
+          },
+          hasCompletedOnboarding: true,
+          skipOnboarding: true,
+          telemetry: {
+            enabled: false,
+          },
+          tui: 'fullscreen',
+        };
+
+        await fs.mkdir(path.dirname(claudeSettingsPath), { recursive: true });
+        await fs.writeFile(claudeSettingsPath, JSON.stringify(nextConfig, null, 2) + '\n', 'utf-8');
+
+        // Also update the active GLM provider in DeepAutoCode ProviderManager
+        await bridge.providerManager.configureProvider({
+          providerId: 'glm',
+          apiEndpoint: baseUrl,
+          modelId: opusModel,
+          apiKey: authToken,
+        });
+        const active = await bridge.providerManager.getActiveProviderWithKeyStatus();
+
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            filePath: claudeSettingsPath,
+            config: nextConfig,
+            active,
+          })
+        );
+      } catch (err) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: (err as Error).message }));
+      }
       return;
     }
 

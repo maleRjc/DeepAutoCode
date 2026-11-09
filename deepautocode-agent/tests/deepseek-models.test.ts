@@ -10,6 +10,12 @@ import {
 } from '../src/core/DeepSeekModels.js';
 import { resolveTieredModelForTurn } from '../src/core/GoalSteering.js';
 import { completeDeepSeekFim } from '../src/core/DeepSeekFim.js';
+import {
+  DEFAULT_PROVIDERS,
+  ProviderManager,
+  buildClaudeSettingsJsonForGlm,
+  resolveChatCompletionsUrl,
+} from '../providers/index.js';
 
 describe('DeepSeek model catalog helpers', () => {
   it('normalizes legacy aliases to flash/pro', () => {
@@ -135,5 +141,26 @@ describe('DeepSeek FIM client', () => {
     });
     expect(result.ok).toBe(true);
     expect(result.text).toContain('if a < 2');
+  });
+
+  it('provides built-in GLM (vLLM / SGLang) provider with EMPTY token fallback and ~/.claude/settings.json builder', async () => {
+    expect(DEFAULT_PROVIDERS.glm).toBeDefined();
+    expect(DEFAULT_PROVIDERS.glm.apiEndpoint).toBe('http://10.0.68.183:8000');
+    expect(DEFAULT_PROVIDERS.glm.defaultModelId).toBe('GLM-5.3-Flash');
+    expect(resolveChatCompletionsUrl('http://10.0.68.183:8000')).toBe(
+      'http://10.0.68.183:8000/v1/chat/completions'
+    );
+
+    const pm = new ProviderManager();
+    const key = await pm.resolveApiKey('glm');
+    expect(key).toBe('EMPTY');
+
+    const claudeSettings = buildClaudeSettingsJsonForGlm() as any;
+    expect(claudeSettings.env.ANTHROPIC_AUTH_TOKEN).toBe('EMPTY');
+    expect(claudeSettings.env.ANTHROPIC_BASE_URL).toBe('http://10.0.68.183:8000');
+    expect(claudeSettings.env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('GLM-5.3-Flash');
+    expect(claudeSettings.env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('GLM-5.3-Flash');
+    expect(claudeSettings.env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('GLM-5.3-Flash');
+    expect(claudeSettings.tui).toBe('fullscreen');
   });
 });

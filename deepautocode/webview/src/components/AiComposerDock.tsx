@@ -2939,12 +2939,36 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                     <select
                       className="composer-select model"
                       value={modelInput}
-                      onChange={(e) => setModelInput(e.target.value)}
-                      title="AI Model Routing: Auto / Force Fast / Force Reasoner"
+                      onChange={(e) => {
+                        const nextModel = e.target.value;
+                        setModelInput(nextModel);
+                        if (/^glm/i.test(nextModel)) {
+                          setSelectedProviderId('glm');
+                          void bridge
+                            .request('provider.update', {
+                              providerId: 'glm',
+                              apiEndpoint:
+                                selectedProviderId === 'glm' && endpointInput
+                                  ? endpointInput
+                                  : 'http://10.0.68.183:8000',
+                              modelId: nextModel,
+                              apiKey: 'EMPTY',
+                            })
+                            .then((res: any) => {
+                              if (res?.active) {
+                                setProviderData((prev: any) => ({ ...prev, active: res.active }));
+                              }
+                            })
+                            .catch(() => null);
+                        }
+                      }}
+                      title="AI Model Routing: Auto / Force Fast / Force Reasoner / GLM"
                     >
                       <option value="deepseek-auto">⚡ Auto Router (Flash/Pro)</option>
                       <option value="deepseek-flash">Force Flash</option>
                       <option value="deepseek-v4-pro">Force V4-Pro</option>
+                      <option value="GLM-5.3-Flash">GLM-5.3-Flash (vLLM/SGLang)</option>
+                      <option value="GLM-4-Plus">GLM-4-Plus</option>
                       <option value="deepseek-chat">Legacy → Flash (chat)</option>
                       <option value="deepseek-reasoner">Legacy → Pro (reasoner)</option>
                       <option value="qwen2.5-coder:14b">qwen2.5-coder</option>

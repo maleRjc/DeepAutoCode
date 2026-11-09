@@ -164,6 +164,7 @@ import {
 } from '../../core/DeepSeekModels.js';
 import { SessionReadCache } from '../../core/AgentLoop.js';
 import type { PermissionRuleset } from '../../core/RulePermission.js';
+import { resolveChatCompletionsUrl } from '../../../providers/index.js';
 import { createUnifiedDiff } from '../tools/FileEditEngine.js';
 
 const sessionReadCaches = new Map<string, SessionReadCache>();
@@ -208,8 +209,11 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
     images,
   } = params;
   const sessionId = manifest.sessionId;
-  const { provider } = runtimeCtx.providerManager.getActiveProvider();
-  const endpoint = `${provider.apiEndpoint.replace(/\/$/, '')}/chat/completions`;
+  const provider =
+    typeof runtimeCtx.providerManager.getProviderById === 'function'
+      ? runtimeCtx.providerManager.getProviderById(manifest.providerId)
+      : runtimeCtx.providerManager.getActiveProvider().provider;
+  const endpoint = resolveChatCompletionsUrl(provider.apiEndpoint);
   const isSshMirrorWorkspace = manifest.workspaceRoot.includes('ssh-mirrors');
 
   // Build top-level workspace file list for context

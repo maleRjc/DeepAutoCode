@@ -2772,15 +2772,15 @@ export function useWorkbenchController() {
     setSmokeResult(null);
     setStatusNotice(`Testing AI API Key connectivity for ${selectedProviderId}...`);
     try {
-      // If user typed a new API Key or modified endpoint/model, save it first before testing
+      // Always persist the selected provider, endpoint, model, and optional key before running the smoke test
+      const saved = await bridge.request('provider.update', {
+        providerId: selectedProviderId,
+        apiEndpoint: endpointInput,
+        modelId: modelInput,
+        apiKey: apiKeyInput.trim() || (selectedProviderId === 'glm' ? 'EMPTY' : undefined),
+      });
+      setProviderData((prev: any) => ({ ...prev, active: saved.active }));
       if (apiKeyInput.trim()) {
-        const saved = await bridge.request('provider.update', {
-          providerId: selectedProviderId,
-          apiEndpoint: endpointInput,
-          modelId: modelInput,
-          apiKey: apiKeyInput.trim(),
-        });
-        setProviderData((prev: any) => ({ ...prev, active: saved.active }));
         setApiKeyInput('');
       }
       const res = await bridge.request('provider.test', {
