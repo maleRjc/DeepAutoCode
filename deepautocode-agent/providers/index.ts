@@ -1,4 +1,6 @@
+import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
@@ -93,7 +95,137 @@ export function recordProviderCacheUsageToTrace(params: {
   };
 }
 
-function defaultResilientFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+const sshRelayHosts = new Set<string>();
+let cachedSshRelayAlias: string | null | undefined = undefined;
+
+function isPrivateLanHostname(hostname: string): boolean {
+  return /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(hostname);
+}
+
+export function shouldUseSshRelayForLanHost(hostname: string): boolean {
+  if (!isPrivateLanHostname(hostname)) return false;
+  if (!resolveSshRelayAlias()) return false;
+  if (sshRelayHosts.has(hostname)) return true;
+  try {
+    const ifaces = os.networkInterfaces();
+    let hasClashTun = false;
+    const localPrefixes: string[] = [];
+    for (const [name, addrs] of Object.entries(ifaces)) {
+      if (!addrs) continue;
+      for (const addr of addrs) {
+        if (addr.family !== 'IPv4' || addr.internal) continue;
+        if (/clash|meta|sing-box|wintun/i.test(name) || addr.address.startsWith('198.18.')) {
+          hasClashTun = true;
+        } else if (addr.address.startsWith('10.')) {
+          const parts = addr.address.split('.');
+          localPrefixes.push(`${parts[0]}.${parts[1]}.${parts[2]}.`);
+        }
+      }
+    }
+    if (hasClashTun && hostname.startsWith('10.')) {
+      const onSameSubnet = localPrefixes.some((p) => hostname.startsWith(p));
+      if (!onSameSubnet) {
+        sshRelayHosts.add(hostname);
+        return true;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+function resolveSshRelayAlias(): string | null {
+  if (cachedSshRelayAlias !== undefined) return cachedSshRelayAlias;
+  if (process.env.DAC_SSH_RELAY_HOST?.trim()) {
+    cachedSshRelayAlias = process.env.DAC_SSH_RELAY_HOST.trim();
+    return cachedSshRelayAlias;
+  }
+  try {
+    const sshConfigPath = path.join(os.homedir(), '.ssh', 'config');
+    const raw = fsSync.readFileSync(sshConfigPath, 'utf-8');
+    for (const line of raw.split(/\r?\n/)) {
+      const m = line.trim().match(/^Host\s+([^\s*#]+)/i);
+      if (m?.[1]) {
+        cachedSshRelayAlias = m[1].trim();
+        return cachedSshRelayAlias;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  cachedSshRelayAlias = null;
+  return null;
+}
+
+export function postJsonViaSshRelay(params: {
+  url: string;
+  method?: string;
+  headers: Record<string, string>;
+  bodyStr: string;
+  timeoutMs?: number;
+}): Promise<{ ok: boolean; status: number; text: string }> {
+  const sshHost = resolveSshRelayAlias();
+  if (!sshHost) {
+    return Promise.reject(new Error('No SSH relay host found in ~/.ssh/config'));
+  }
+  return new Promise((resolve, reject) => {
+    const headerArgs: string[] = [];
+    for (const [k, v] of Object.entries(params.headers)) {
+      if (/^content-length$/i.test(k)) continue;
+      const safeHeader = `${k}: ${String(v).replace(/'/g, '')}`;
+      headerArgs.push(`-H '${safeHeader}'`);
+    }
+    const safeUrl = String(params.url).replace(/'/g, '');
+    const method = (params.method || 'POST').toUpperCase();
+    const maxTimeSec = Math.max(10, Math.ceil((params.timeoutMs ?? 60000) / 1000));
+    const remoteCmd = `curl -sS --max-time ${maxTimeSec} -w '\\n__DAC_HTTP_STATUS__:%{http_code}' -X ${method} ${headerArgs.join(' ')} --data-binary @- '${safeUrl}'`;
+
+    const child = spawn(
+      'ssh',
+      ['-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=6', sshHost, remoteCmd],
+      { stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+
+    const outChunks: Buffer[] = [];
+    const errChunks: Buffer[] = [];
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`SSH relay timed out after ${params.timeoutMs ?? 60000}ms`));
+    }, (params.timeoutMs ?? 60000) + 5000);
+
+    child.stdout.on('data', (c) => outChunks.push(Buffer.from(c)));
+    child.stderr.on('data', (c) => errChunks.push(Buffer.from(c)));
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      const rawOut = Buffer.concat(outChunks).toString('utf-8');
+      const statusMatch = rawOut.match(/\n__DAC_HTTP_STATUS__:(\d{3})\s*$/);
+      if (statusMatch) {
+        const status = Number(statusMatch[1]);
+        const bodyText = rawOut.slice(0, statusMatch.index);
+        resolve({
+          ok: status >= 200 && status < 300,
+          status,
+          text: bodyText,
+        });
+        return;
+      }
+      const errText = Buffer.concat(errChunks).toString('utf-8').trim();
+      reject(new Error(errText || `SSH relay exited with code ${code}`));
+    });
+
+    if (params.bodyStr) {
+      child.stdin.write(params.bodyStr);
+    }
+    child.stdin.end();
+  });
+}
+
+async function defaultResilientFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   const parsedUrl = new URL(String(url));
   const isHttps = parsedUrl.protocol === 'https:';
   const bodyStr = typeof init?.body === 'string' ? init.body : '';
@@ -107,30 +239,65 @@ function defaultResilientFetch(url: string | URL, init?: RequestInit): Promise<R
     headers['Content-Length'] = String(Buffer.byteLength(bodyStr, 'utf-8'));
   }
 
-  return new Promise((resolve, reject) => {
-    const reqFn = isHttps ? https.request : http.request;
-    const req = reqFn(
-      parsedUrl,
-      {
+  // If this private LAN host is hijacked by Windows Clash TUN (8.0.0.0/5) or previously failed with ECONNRESET, go straight through SSH relay
+  if (
+    (sshRelayHosts.has(parsedUrl.host) || shouldUseSshRelayForLanHost(parsedUrl.hostname)) &&
+    isPrivateLanHostname(parsedUrl.hostname)
+  ) {
+    const relayed = await postJsonViaSshRelay({
+      url: String(url),
+      method: init?.method ?? 'POST',
+      headers,
+      bodyStr,
+      timeoutMs: 45000,
+    });
+    return new Response(relayed.text, { status: relayed.status });
+  }
+
+  try {
+    return await new Promise<Response>((resolve, reject) => {
+      const reqFn = isHttps ? https.request : http.request;
+      const req = reqFn(
+        parsedUrl,
+        {
+          method: init?.method ?? 'POST',
+          family: 4,
+          headers,
+          timeout: 12000,
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c) => chunks.push(Buffer.from(c)));
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString('utf-8');
+            resolve(new Response(text, { status: res.statusCode ?? 500 }));
+          });
+        }
+      );
+      req.on('timeout', () => req.destroy(new Error('Request timed out after 12000ms')));
+      req.on('error', reject);
+      if (bodyStr) req.write(bodyStr);
+      req.end();
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (
+      isPrivateLanHostname(parsedUrl.hostname) &&
+      /ECONNRESET|ETIMEDOUT|ECONNREFUSED|timed out/i.test(msg) &&
+      resolveSshRelayAlias()
+    ) {
+      const relayed = await postJsonViaSshRelay({
+        url: String(url),
         method: init?.method ?? 'POST',
-        family: 4,
         headers,
-        timeout: 45000,
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        res.on('data', (c) => chunks.push(Buffer.from(c)));
-        res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf-8');
-          resolve(new Response(text, { status: res.statusCode ?? 500 }));
-        });
-      }
-    );
-    req.on('timeout', () => req.destroy(new Error('Request timed out after 45000ms')));
-    req.on('error', reject);
-    if (bodyStr) req.write(bodyStr);
-    req.end();
-  });
+        bodyStr,
+        timeoutMs: 45000,
+      });
+      sshRelayHosts.add(parsedUrl.host);
+      return new Response(relayed.text, { status: relayed.status });
+    }
+    throw err;
+  }
 }
 
 export const ModelMetadataSchema = z.object({
@@ -756,9 +923,12 @@ export class ProviderManager {
         },
         body: JSON.stringify({
           model: model.modelId,
-          messages: [{ role: 'user', content: '请回复：连接正常' }],
-          max_tokens: 16,
+          messages: [{ role: 'user', content: '请直接回复四个字：连接正常' }],
+          max_tokens: 64,
           stream: false,
+          ...(providerId === 'glm' || /^glm/i.test(model.modelId)
+            ? { chat_template_kwargs: { enable_thinking: false } }
+            : {}),
         }),
       });
 
@@ -789,7 +959,13 @@ export class ProviderManager {
       let replyPreview = 'OK';
       try {
         const json = (await response.json()) as any;
-        replyPreview = String(json?.choices?.[0]?.message?.content ?? 'OK').trim();
+        const msgObj = json?.choices?.[0]?.message;
+        const rawText =
+          msgObj?.content ??
+          msgObj?.reasoning_content ??
+          msgObj?.reasoning ??
+          'OK';
+        replyPreview = String(rawText).trim() || 'OK';
       } catch {
         replyPreview = 'OK';
       }

@@ -121,6 +121,22 @@ async function postJsonResilient(params: {
   signal?: AbortSignal;
   timeoutMs?: number;
 }): Promise<{ ok: boolean; status: number; text: string }> {
+  const parsedUrl = new URL(params.url);
+  const isPrivateLan = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(
+    parsedUrl.hostname
+  );
+  if (
+    isPrivateLan &&
+    (sshRelayLanHosts.has(parsedUrl.host) || shouldUseSshRelayForLanHost(parsedUrl.hostname))
+  ) {
+    return postJsonViaSshRelay({
+      url: params.url,
+      headers: params.headers,
+      bodyStr: JSON.stringify(params.body),
+      timeoutMs: params.timeoutMs,
+    });
+  }
+
   const maxAttempts = 3;
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -135,7 +151,21 @@ async function postJsonResilient(params: {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
       const isTransientSocketErr =
-        /ECONNRESET|ETIMEDOUT|EPIPE|socket hang up|EAI_AGAIN|ENOTFOUND|network/i.test(msg);
+        /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|socket hang up|EAI_AGAIN|ENOTFOUND|network/i.test(msg);
+      if (isPrivateLan && isTransientSocketErr && !params.signal?.aborted) {
+        try {
+          const relayed = await postJsonViaSshRelay({
+            url: params.url,
+            headers: params.headers,
+            bodyStr: JSON.stringify(params.body),
+            timeoutMs: params.timeoutMs,
+          });
+          sshRelayLanHosts.add(parsedUrl.host);
+          return relayed;
+        } catch {
+          // continue to standard retry if SSH relay is unavailable
+        }
+      }
       if (isTransientSocketErr && attempt < maxAttempts && !params.signal?.aborted) {
         await new Promise((r) => setTimeout(r, 350 * attempt));
         continue;
@@ -164,10 +194,15 @@ import {
 } from '../../core/DeepSeekModels.js';
 import { SessionReadCache } from '../../core/AgentLoop.js';
 import type { PermissionRuleset } from '../../core/RulePermission.js';
-import { resolveChatCompletionsUrl } from '../../../providers/index.js';
+import {
+  postJsonViaSshRelay,
+  resolveChatCompletionsUrl,
+  shouldUseSshRelayForLanHost,
+} from '../../../providers/index.js';
 import { createUnifiedDiff } from '../tools/FileEditEngine.js';
 
 const sessionReadCaches = new Map<string, SessionReadCache>();
+const sshRelayLanHosts = new Set<string>();
 
 export { postJsonOnce, postJsonResilient };
 
@@ -4247,7 +4282,9 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       const reasoningContent =
         typeof msg.reasoning_content === 'string' && msg.reasoning_content.length > 0
           ? msg.reasoning_content
-          : undefined;
+          : typeof msg.reasoning === 'string' && msg.reasoning.length > 0
+            ? msg.reasoning
+            : undefined;
 
       const rawToolCalls = Array.isArray(msg.tool_calls) ? msg.tool_calls : [];
       const validToolCalls: Array<{
@@ -4294,10 +4331,13 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
 
       // Only stream final assistant answer text; suppress intermediate file-reading/tool chatter
       if (validToolCalls.length === 0) {
-        const cleanedMsgContent =
-          typeof msg.content === 'string'
-            ? msg.content.replace(/\[系统审计记录[\s\S]*$/m, '').trim()
-            : '';
+        const rawTextContent =
+          typeof msg.content === 'string' && msg.content.trim().length > 0
+            ? msg.content
+            : typeof msg.reasoning === 'string' && msg.reasoning.trim().length > 0
+              ? msg.reasoning
+              : '';
+        const cleanedMsgContent = rawTextContent.replace(/\[系统审计记录[\s\S]*$/m, '').trim();
         const finalContent =
           cleanedMsgContent.length > 0
             ? cleanedMsgContent
