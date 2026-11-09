@@ -3,11 +3,18 @@
  * Prefer extracting paths, errors, exit codes, and key hits over blind truncation.
  */
 
+export interface ToolResultTuple {
+  paths: string[];
+  errors: string[];
+  exitCode: number | null;
+  matchedLines: string[];
+}
+
 const PATH_RE =
   /([a-zA-Z0-9_./\\-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp|cuh?|json|md))\b/g;
 const ERROR_RE =
   /(?:error|ERROR|FAILED|SEMANTIC_DIAGNOSTICS_FAILED|OLD_TEXT_NOT_FOUND|HUNK_NOT_FOUND|fatal error)[^\n]{0,160}/g;
-const EXIT_RE = /"exitCode"\s*:\s*(-?\d+)|exit(?:Code)?\s*[=:]\s*(-?\d+)/i;
+const EXIT_RE = /"exitCode"\s*:\s*(-?\d+)|exit(?:ed\s+with\s+code|Code)?\s*[=:]?\s*(-?\d+)/i;
 const LINE_HIT_RE =
   />?\s*([a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+):(\d+):\s*([^\n]{0,120})/g;
 
@@ -89,38 +96,83 @@ function extractFromObject(output: unknown): string[] {
 }
 
 /**
+ * C2: Extract structured 4-tuple (paths, errors, exitCode, matchedLines) from any tool output.
+ */
+export function extractToolResultTuple(
+  _toolName: string | undefined,
+  output: unknown
+): ToolResultTuple {
+  const text = asText(output);
+  const paths = uniqueLimited(Array.from(text.matchAll(PATH_RE)).map((m) => m[1]), 12);
+  const errors = uniqueLimited(Array.from(text.matchAll(ERROR_RE)).map((m) => m[0]), 8);
+  if (output && typeof output === 'object') {
+    const o = output as Record<string, unknown>;
+    if (typeof o.filePath === 'string' && !paths.includes(o.filePath)) {
+      paths.unshift(o.filePath);
+    }
+    if (typeof o.error === 'string' && o.error.trim() && !errors.includes(o.error.trim())) {
+      errors.unshift(o.error.trim().slice(0, 200));
+    }
+  }
+  const matchedLines: string[] = [];
+  LINE_HIT_RE.lastIndex = 0;
+  let hm: RegExpExecArray | null;
+  while ((hm = LINE_HIT_RE.exec(text)) !== null) {
+    matchedLines.push(`${hm[1]}:${hm[2]}: ${hm[3]}`);
+    if (matchedLines.length >= 10) break;
+  }
+  let exitCode: number | null = null;
+  if (output && typeof output === 'object' && typeof (output as any).exitCode === 'number') {
+    exitCode = (output as any).exitCode;
+  } else {
+    const exitMatch = EXIT_RE.exec(text);
+    if (exitMatch) {
+      const parsed = Number(exitMatch[1] ?? exitMatch[2]);
+      if (Number.isFinite(parsed)) exitCode = parsed;
+    }
+  }
+  return {
+    paths,
+    errors,
+    exitCode,
+    matchedLines,
+  };
+}
+
+/**
  * Build a compact, information-preserving summary of a tool result.
  */
 export function summarizeToolOutput(
   toolName: string | undefined,
   output: unknown,
-  originalChars: number,
+  originalCharsOrOptions?: number | { maxChars?: number },
   options?: { maxChars?: number }
 ): string {
-  const maxChars = options?.maxChars ?? 1800;
+  const text = asText(output);
+  const originalChars =
+    typeof originalCharsOrOptions === 'number' ? originalCharsOrOptions : text.length;
+  const opts =
+    typeof originalCharsOrOptions === 'object' && originalCharsOrOptions !== null
+      ? originalCharsOrOptions
+      : options;
+  const maxChars = opts?.maxChars ?? 1800;
   const name = toolName || 'tool';
   const structured = extractFromObject(output);
-  const text = asText(output);
-
-  const paths = uniqueLimited(Array.from(text.matchAll(PATH_RE)).map((m) => m[1]), 10);
-  const errors = uniqueLimited(Array.from(text.matchAll(ERROR_RE)).map((m) => m[0]), 6);
-  const hits: string[] = [];
-  LINE_HIT_RE.lastIndex = 0;
-  let hm: RegExpExecArray | null;
-  while ((hm = LINE_HIT_RE.exec(text)) !== null) {
-    hits.push(`${hm[1]}:${hm[2]}: ${hm[3]}`);
-    if (hits.length >= 8) break;
-  }
-  const exit = EXIT_RE.exec(text);
+  const tuple = extractToolResultTuple(toolName, output);
 
   const parts: string[] = [
     `[compacted summary of ${name} — original ${originalChars} chars]`,
   ];
+  if (tuple.exitCode !== null) {
+    parts.push(`[ToolTuple exitCode=${tuple.exitCode}]`);
+  }
   if (structured.length) parts.push(structured.join('\n'));
-  if (exit) parts.push(`exitCode: ${exit[1] || exit[2]}`);
-  if (paths.length) parts.push(`paths: ${paths.join(', ')}`);
-  if (errors.length) parts.push(`signals:\n- ${errors.join('\n- ')}`);
-  if (hits.length) parts.push(`line_hits:\n- ${hits.join('\n- ')}`);
+  if (tuple.exitCode !== null && !structured.some((l) => l.startsWith('exitCode:'))) {
+    parts.push(`exitCode: ${tuple.exitCode}`);
+  }
+  if (tuple.paths.length) parts.push(`paths: ${tuple.paths.join(', ')}`);
+  if (tuple.errors.length) parts.push(`signals:\n- ${tuple.errors.join('\n- ')}`);
+  if (tuple.matchedLines.length) parts.push(`line_hits:\n- ${tuple.matchedLines.join('\n- ')}`);
 
   // Keep a short head for unstructured blobs when extraction is thin
   if (parts.length <= 2) {

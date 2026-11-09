@@ -1159,6 +1159,7 @@ export async function createWorkbenchServer(options?: {
         let stderr = '';
         let serverReadyTimer: ReturnType<typeof setTimeout> | undefined;
         let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+        let exitDrainTimer: ReturnType<typeof setTimeout> | undefined;
 
         const child = spawn(cmd, {
           cwd: activeWorkspaceRoot,
@@ -1172,8 +1173,29 @@ export async function createWorkbenchServer(options?: {
           settled = true;
           if (serverReadyTimer) clearTimeout(serverReadyTimer);
           if (fallbackTimer) clearTimeout(fallbackTimer);
+          if (exitDrainTimer) clearTimeout(exitDrainTimer);
           clearTimeout(hardTimeout);
           resolve(out);
+        };
+
+        const finalizeWithCode = (code: number | null) => {
+          const combined = `${stdout}\n${stderr}`;
+          if (/EADDRINUSE|已被占用|address already in use/i.test(combined)) {
+            finish({
+              ok: true,
+              exitCode: 0,
+              stdout: `${combined}\n[DeepAutoCode] 检测到目标端口已被占用，说明该服务实例已在后台运行中。`.trim(),
+              stderr: '',
+            });
+            return;
+          }
+          const exitCode = typeof code === 'number' ? code : 0;
+          finish({
+            ok: exitCode === 0,
+            exitCode,
+            stdout,
+            stderr,
+          });
         };
 
         const detachAsRunningServer = (note: string) => {
@@ -1247,24 +1269,22 @@ export async function createWorkbenchServer(options?: {
             stderr: `${stderr}\n${err.message}`.trim(),
           });
         });
+        child.on('exit', (code) => {
+          if (settled || exitDrainTimer) return;
+          exitDrainTimer = setTimeout(() => {
+            if (settled) return;
+            try {
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              child.unref();
+            } catch {
+              // ignore
+            }
+            finalizeWithCode(code);
+          }, 350);
+        });
         child.on('close', (code) => {
-          const combined = `${stdout}\n${stderr}`;
-          if (/EADDRINUSE|已被占用|address already in use/i.test(combined)) {
-            finish({
-              ok: true,
-              exitCode: 0,
-              stdout: `${combined}\n[DeepAutoCode] 检测到目标端口已被占用，说明该服务实例已在后台运行中。`.trim(),
-              stderr: '',
-            });
-            return;
-          }
-          const exitCode = typeof code === 'number' ? code : 0;
-          finish({
-            ok: exitCode === 0,
-            exitCode,
-            stdout,
-            stderr,
-          });
+          finalizeWithCode(code);
         });
       });
 
@@ -2174,6 +2194,9 @@ export async function createWorkbenchServer(options?: {
   });
 
   const wss = new WebSocketServer({ server, path: '/ws' });
+  // Disable Node 20's default 5-minute HTTP requestTimeout so long-running /api/bridge Agent turns never drop prematurely
+  server.requestTimeout = 0;
+  server.headersTimeout = 120000;
   wss.on('error', (err) => {
     console.error('[DeepAutoCode WS Server] Error (guarded):', err?.message || err);
   });

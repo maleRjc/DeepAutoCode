@@ -6,6 +6,10 @@
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
+  "bin": {
+    "dac": "./dist/src/cli/dac.js",
+    "agy": "./dist/src/cli/dac.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/src/index.d.ts",
@@ -16,6 +20,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "dac": "tsx src/cli/dac.ts",
     "test:poc": "tsx scripts/run-poc.ts",
     "test:smoke": "tsx scripts/provider-smoke-test.ts"
   },

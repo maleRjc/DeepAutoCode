@@ -41,7 +41,18 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
       search_codebase: 'allow',
       explore_codebase: 'allow',
       invoke_subagent: 'allow',
+      define_subagent: 'allow',
+      manage_subagents: 'allow',
+      send_message: 'allow',
+      schedule: 'allow',
+      read_transcript: 'allow',
+      migrate_agent_settings: 'allow',
+      search_marketplace: 'allow',
+      list_plugin_accounts: 'allow',
       manage_todo: 'allow',
+      manage_task: 'allow',
+      ask_question: 'allow',
+      search_web: 'allow',
       write_artifact: 'allow',
       browser_action: 'allow',
       open_file_in_ide: 'allow',
@@ -64,7 +75,18 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
       search_codebase: 'allow',
       explore_codebase: 'allow',
       invoke_subagent: 'allow',
+      define_subagent: 'allow',
+      manage_subagents: 'allow',
+      send_message: 'allow',
+      schedule: 'allow',
+      read_transcript: 'allow',
+      migrate_agent_settings: 'allow',
+      search_marketplace: 'allow',
+      list_plugin_accounts: 'allow',
       manage_todo: 'allow',
+      manage_task: 'allow',
+      ask_question: 'allow',
+      search_web: 'allow',
       write_artifact: 'allow',
       browser_action: 'allow',
       open_file_in_ide: 'allow',
@@ -85,7 +107,18 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
     search_codebase: 'allow',
     explore_codebase: 'allow',
     invoke_subagent: 'allow',
+    define_subagent: 'allow',
+    manage_subagents: 'allow',
+    send_message: 'allow',
+    schedule: 'allow',
+    read_transcript: 'allow',
+    migrate_agent_settings: 'allow',
+    search_marketplace: 'allow',
+    list_plugin_accounts: 'allow',
     manage_todo: 'allow',
+    manage_task: 'allow',
+    ask_question: 'allow',
+    search_web: 'allow',
     write_artifact: 'allow',
     browser_action: 'allow',
     open_file_in_ide: 'allow',
@@ -236,13 +269,13 @@ export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentToo
           ? rawArgs.files
           : rawArgs?.path || rawArgs?.filePath
             ? [
-                {
-                  path: String(rawArgs.path || rawArgs.filePath),
-                  start_line:
-                    typeof rawArgs.start_line === 'number' ? rawArgs.start_line : undefined,
-                  end_line: typeof rawArgs.end_line === 'number' ? rawArgs.end_line : undefined,
-                },
-              ]
+              {
+                path: String(rawArgs.path || rawArgs.filePath),
+                start_line:
+                  typeof rawArgs.start_line === 'number' ? rawArgs.start_line : undefined,
+                end_line: typeof rawArgs.end_line === 'number' ? rawArgs.end_line : undefined,
+              },
+            ]
             : [];
 
         if (items.length === 0) {

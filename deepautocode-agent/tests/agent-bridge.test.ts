@@ -33,7 +33,9 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
   });
 
   afterEach(async () => {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs
+      .rm(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 })
+      .catch(() => undefined);
   });
 
   it('PoC-L1 & PoC-L2: persists session, messages, and tool calls to disk and recovers across instance restart', async () => {

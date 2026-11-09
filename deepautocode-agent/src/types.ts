@@ -49,6 +49,8 @@ export const RequestMessageSchema = z.object({
     'trace.get',
     'trace.list',
     'completion.fim',
+    'question.respond',
+    'task.manage',
   ]),
   requestId: z.string().min(1),
   sessionId: z.string().optional(),
@@ -96,6 +98,9 @@ export const EventMessageSchema = z.object({
     'artifact.created',
     'goal.usage',
     'trace.updated',
+    'question.requested',
+    'question.resolved',
+    'task.state.changed',
   ]),
   sessionId: z.string(),
   sequence: z.number().int().nonnegative(),
@@ -183,6 +188,7 @@ export interface SessionMessage {
   timestamp: string;
   toolCalls?: ToolCallRecord[];
   diffIds?: string[];
+  images?: Array<{ name?: string; dataUrl: string; mimeType?: string }>;
 }
 
 export interface SessionManifest {

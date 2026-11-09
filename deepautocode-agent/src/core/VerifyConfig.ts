@@ -139,11 +139,26 @@ export async function inferVerifyConfigFromWorkspace(workspaceRoot: string): Pro
     };
   }
 
-  if (await has('pyproject.toml') || (await has('pytest.ini')) || (await has('requirements.txt'))) {
+  let hasPyFiles = false;
+  try {
+    const entries = await fs.readdir(root);
+    hasPyFiles = entries.some((e) => /\.py$/i.test(e));
+  } catch {
+    // ignore
+  }
+  if (
+    (await has('pyproject.toml')) ||
+    (await has('pytest.ini')) ||
+    (await has('requirements.txt')) ||
+    hasPyFiles
+  ) {
+    const hasPytest = (await has('pyproject.toml')) || (await has('pytest.ini'));
     return {
-      buildCommand: 'python -m compileall .',
-      testCommand: 'pytest -q',
-      combinedCommand: 'python -m compileall . && pytest -q',
+      buildCommand: 'python -m compileall -q .',
+      testCommand: hasPytest ? 'pytest -q' : 'python -m unittest discover',
+      combinedCommand: hasPytest
+        ? 'python -m compileall -q . && pytest -q'
+        : 'python -m compileall -q .',
       sourceGlobs: ['**/*.py'],
       enableEvolveSandbox: true,
       source: 'inferred',

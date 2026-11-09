@@ -152,3 +152,134 @@ export function resolveCompactionPlan(params: ResolveCompactionPlanParams): Comp
     trigger,
   };
 }
+
+export interface BudgetCompactionMessageItem {
+  id?: string;
+  role: 'user' | 'assistant' | 'tool' | 'system' | string;
+  chars?: number;
+  content?: unknown;
+  pinned?: boolean;
+}
+
+export type ChatMessageLike = BudgetCompactionMessageItem;
+
+export interface BudgetCompactionDecision {
+  keep: Array<string | number>;
+  summarize: Array<string | number>;
+  drop: Array<string | number>;
+  totalTokensBefore: number;
+  softTokenBudget: number;
+  overBudgetTokens: number;
+}
+
+/**
+ * C1: Token-budget-driven compaction decision ({ keep, summarize, drop }).
+ * Default softTokenBudget is 128,000 tokens.
+ * - First user/system message + most recent `keepRecentCount` messages are placed in `keep`.
+ * - Older messages within the summarize window (~60% of budget) are placed in `summarize`.
+ * - Oldest excess tool/assistant messages when total exceeds softTokenBudget are placed in `drop`.
+ */
+export function decideBudgetCompaction(
+  items: BudgetCompactionMessageItem[],
+  options?: {
+    softTokenBudget?: number;
+    keepRecentCount?: number;
+    preserveRecentMessages?: number;
+  }
+): BudgetCompactionDecision {
+  const softTokenBudget = Math.max(1024, options?.softTokenBudget ?? 128_000);
+  const keepRecentCount = Math.max(
+    1,
+    options?.keepRecentCount ?? options?.preserveRecentMessages ?? 4
+  );
+  const keep: Array<string | number> = [];
+  const summarize: Array<string | number> = [];
+  const drop: Array<string | number> = [];
+
+  let totalTokensBefore = 0;
+  const itemTokens = items.map((it, idx) => {
+    const rawChars =
+      typeof it.chars === 'number' && Number.isFinite(it.chars)
+        ? it.chars
+        : typeof it.content === 'string'
+        ? it.content.length
+        : JSON.stringify(it.content ?? '').length;
+    const tokens = estimateTokensFromChars(rawChars);
+    totalTokensBefore += tokens;
+    return {
+      ...it,
+      id: it.id !== undefined ? it.id : idx,
+      chars: rawChars,
+      tokens,
+    };
+  });
+
+  if (totalTokensBefore <= softTokenBudget) {
+    for (const it of itemTokens) {
+      keep.push(it.id);
+    }
+    return {
+      keep,
+      summarize,
+      drop,
+      totalTokensBefore,
+      softTokenBudget,
+      overBudgetTokens: 0,
+    };
+  }
+
+  const recentStartIdx = Math.max(0, itemTokens.length - keepRecentCount);
+  const pinnedIndices = new Set<number>();
+  if (itemTokens.length > 0 && itemTokens[0].role === 'user') {
+    pinnedIndices.add(0);
+  }
+  for (let i = 0; i < itemTokens.length; i++) {
+    if (itemTokens[i].pinned || i >= recentStartIdx) {
+      pinnedIndices.add(i);
+    }
+  }
+
+  let runningKeptTokens = 0;
+  for (const idx of pinnedIndices) {
+    runningKeptTokens += itemTokens[idx].tokens;
+  }
+
+  // Walk newest-to-oldest among non-pinned messages: allocate remaining budget to keep, then summarize, then drop oldest
+  const decisionByIdx = new Map<number, 'keep' | 'summarize' | 'drop'>();
+  for (const idx of pinnedIndices) {
+    decisionByIdx.set(idx, 'keep');
+  }
+
+  const summarizeTokenAllowance = Math.floor(softTokenBudget * 0.35);
+  let summarizedRawTokens = 0;
+
+  for (let i = itemTokens.length - 1; i >= 0; i--) {
+    if (decisionByIdx.has(i)) continue;
+    const it = itemTokens[i];
+    if (runningKeptTokens + it.tokens <= softTokenBudget * 0.65) {
+      runningKeptTokens += it.tokens;
+      decisionByIdx.set(i, 'keep');
+    } else if (summarizedRawTokens + it.tokens <= summarizeTokenAllowance * 4) {
+      summarizedRawTokens += it.tokens;
+      decisionByIdx.set(i, 'summarize');
+    } else {
+      decisionByIdx.set(i, 'drop');
+    }
+  }
+
+  for (let i = 0; i < itemTokens.length; i++) {
+    const d = decisionByIdx.get(i) ?? 'keep';
+    if (d === 'keep') keep.push(itemTokens[i].id);
+    else if (d === 'summarize') summarize.push(itemTokens[i].id);
+    else drop.push(itemTokens[i].id);
+  }
+
+  return {
+    keep,
+    summarize,
+    drop,
+    totalTokensBefore,
+    softTokenBudget,
+    overBudgetTokens: Math.max(0, totalTokensBefore - softTokenBudget),
+  };
+}

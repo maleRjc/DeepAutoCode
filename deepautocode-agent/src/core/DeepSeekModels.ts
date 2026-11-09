@@ -136,3 +136,99 @@ export function formatCostCny(cost: number): string {
   if (cost < 0.01) return `¥${cost.toFixed(4)}`;
   return `¥${cost.toFixed(3)}`;
 }
+
+export type AgentLoopPhase = 'plan' | 'exec' | 'verify';
+
+/**
+ * B2: Phase-aware Thinking budget grading:
+ * - Planning / multi-file architecture -> 'high'
+ * - Single-file edit / standard execution -> 'low'
+ * - Debug / verify failure retry -> 'max'
+ */
+export function resolvePhaseReasoningEffort(
+  phaseOrParams:
+    | AgentLoopPhase
+    | {
+        phase: AgentLoopPhase;
+        isRetryAfterFailure?: boolean;
+        isDebugOrVerifyRetry?: boolean;
+        consecutiveMistakes?: number;
+        isArchitectureTask?: boolean;
+      },
+  options?: {
+    isRetryAfterFailure?: boolean;
+    isDebugOrVerifyRetry?: boolean;
+    consecutiveMistakes?: number;
+    isArchitectureTask?: boolean;
+  }
+): DeepSeekReasoningEffort {
+  const phase = typeof phaseOrParams === 'string' ? phaseOrParams : phaseOrParams.phase;
+  const opts = typeof phaseOrParams === 'string' ? options : phaseOrParams;
+  if (
+    opts?.isRetryAfterFailure ||
+    opts?.isDebugOrVerifyRetry ||
+    (typeof opts?.consecutiveMistakes === 'number' && opts.consecutiveMistakes > 0)
+  ) {
+    return 'max';
+  }
+  if (phase === 'plan' || opts?.isArchitectureTask) {
+    return 'high';
+  }
+  if (phase === 'verify') {
+    return 'high';
+  }
+  return 'low';
+}
+
+export interface NormalizedDeepSeekCacheUsage {
+  inputTokens: number;
+  outputTokens: number;
+  promptCacheHitTokens: number;
+  promptCacheMissTokens: number;
+  cacheWriteTokens: number;
+  cacheHitRatio: number;
+}
+
+/**
+ * B1: Normalize DeepSeek / OpenAI-compatible usage payload including
+ * `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`.
+ */
+export function extractDeepSeekCacheUsage(usageRaw: unknown): NormalizedDeepSeekCacheUsage {
+  const u = (usageRaw && typeof usageRaw === 'object' ? usageRaw : {}) as Record<string, any>;
+  const inputTokens = Math.max(
+    0,
+    Number(u.prompt_tokens ?? u.input_tokens ?? u.inputTokens ?? 0) || 0
+  );
+  const outputTokens = Math.max(
+    0,
+    Number(u.completion_tokens ?? u.output_tokens ?? u.outputTokens ?? 0) || 0
+  );
+  const hitRaw =
+    u.prompt_cache_hit_tokens ??
+    u.cache_read_input_tokens ??
+    u.cacheReadTokens ??
+    u.prompt_tokens_details?.cached_tokens ??
+    0;
+  const promptCacheHitTokens = Math.max(0, Math.min(inputTokens || Number(hitRaw) || 0, Number(hitRaw) || 0));
+  const missRaw = u.prompt_cache_miss_tokens;
+  const promptCacheMissTokens =
+    typeof missRaw === 'number' && Number.isFinite(missRaw)
+      ? Math.max(0, missRaw)
+      : Math.max(0, inputTokens - promptCacheHitTokens);
+  const cacheWriteTokens = Math.max(
+    0,
+    Number(u.cache_creation_input_tokens ?? u.cacheWriteTokens ?? 0) || 0
+  );
+  const effectiveInput = Math.max(inputTokens, promptCacheHitTokens + promptCacheMissTokens);
+  const cacheHitRatio =
+    effectiveInput > 0 ? Number((promptCacheHitTokens / effectiveInput).toFixed(4)) : 0;
+
+  return {
+    inputTokens: effectiveInput,
+    outputTokens,
+    promptCacheHitTokens,
+    promptCacheMissTokens,
+    cacheWriteTokens,
+    cacheHitRatio,
+  };
+}

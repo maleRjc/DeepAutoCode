@@ -208,8 +208,8 @@ export async function discoverWorkspaceCustomizations(
     });
   };
 
-  // 1. Discover top-level AGENTS.md / CLAUDE.md / .cursorrules
-  for (const rootRuleFile of ['AGENTS.md', 'CLAUDE.md', '.cursorrules']) {
+  // 1. Discover top-level AGENTS.md / GEMINI.md / CLAUDE.md / .cursorrules
+  for (const rootRuleFile of ['AGENTS.md', 'GEMINI.md', 'CLAUDE.md', '.cursorrules']) {
     try {
       const fullPath = path.join(resolved, rootRuleFile);
       const raw = await fs.readFile(fullPath, 'utf-8');
@@ -328,6 +328,91 @@ export async function discoverWorkspaceCustomizations(
     // ignore missing .agents/skills
   }
 
+  // 3b. Inject Antigravity Built-in Meta Skills (if not overridden by workspace skills)
+  const builtinSkills: Array<{ name: string; description: string; path: string; content: string }> = [
+    {
+      name: 'agy-customizations',
+      description:
+        'Comprehensive guide and reference for the Antigravity & DeepAutoCode Customization System (rules, skills, plugins, hooks, and MCP servers).',
+      path: 'builtin://skills/agy-customizations/SKILL.md',
+      content: `# Antigravity & DeepAutoCode Customization System
+- **Rules**: Place in \`AGENTS.md\`, \`CLAUDE.md\`, \`GEMINI.md\`, \`.agents/rules/*.md\`, or \`.cursor/rules/*.mdc\`. Supports \`globs\` and \`alwaysApply\` frontmatter plus subdirectory scoping.
+- **Skills**: Place in \`.agents/skills/<name>/SKILL.md\` with YAML frontmatter (\`name\`, \`description\`).
+- **Lifecycle Hooks**: Configure in \`.deepautocode/hooks.json\` or \`.agents/hooks.json\` for \`preToolUse\`, \`postToolUse\`, \`postFileEdit\`, \`preVerify\`, and \`onSessionComplete\`.
+- **Plugins**: Bundle skills, rules, agents, and hooks under \`.agents/plugins/<id>/plugin.json\`.`,
+    },
+    {
+      name: 'automation',
+      description:
+        'Interactive guide to design and create a scheduled background automation using the schedule tool (one-shot timer or 5-field cronExpression).',
+      path: 'builtin://skills/automation/SKILL.md',
+      content: `# Scheduled Automation Skill
+1. Clarify the trigger schedule (one-shot \`durationSeconds\` or 5-field \`cronExpression\` like \`0 9 * * 1-5\`) using \`ask_question\` if ambiguous.
+2. Call \`schedule({ prompt, cronExpression, isDaemon: true })\` to register the recurring background job.
+3. End your turn; the runtime will automatically wake up via \`<SYSTEM_MESSAGE>\` when the schedule fires.`,
+    },
+    {
+      name: 'generative_ui',
+      description:
+        'How to render rich interactive HTML widgets, Mermaid diagrams, and carousels inline in the chat or as standalone artifacts.',
+      path: 'builtin://skills/generative_ui/SKILL.md',
+      content: `# Generative UI Skill
+- **Interactive HTML Widgets**: Emit a fenced \`\`\`html code block with self-contained HTML/CSS/JS; the Webview renders an interactive live preview sandbox.
+- **Mermaid Diagrams**: Emit \`\`\`mermaid blocks (\`flowchart\`, \`sequenceDiagram\`, \`stateDiagram-v2\`, \`classDiagram\`, \`erDiagram\`).
+- **Carousels**: Emit \`\`\`\`carousel blocks separated by \`<!-- slide -->\` comments.
+- **LaTeX Math**: Use \`$...$\` for inline math and \`$$...$$\` for display equations.`,
+    },
+    {
+      name: 'plugin',
+      description:
+        'How to manage, search, and create plugins — namespaced bundles of skills, agents, rules, MCP servers, and hooks.',
+      path: 'builtin://skills/plugin/SKILL.md',
+      content: `# Plugin Management & Authoring Skill
+- Search catalog plugins with \`search_marketplace({ queries: [...] })\` and present \`<plugin-card catalog-id="<id>"></plugin-card>\`.
+- Check connected accounts with \`list_plugin_accounts()\`.
+- Migrate external agent settings (Claude Code, Cursor, Gemini CLI) with \`migrate_agent_settings()\`.`,
+    },
+    {
+      name: 'antigravity-guide',
+      description:
+        'Comprehensive guide, quick reference, and sitemap for Google Antigravity & DeepAutoCode (AGY / dac CLI, slash commands, keybindings, subagents, and customizations).',
+      path: 'builtin://skills/antigravity_guide/SKILL.md',
+      content: `# Antigravity & DeepAutoCode Guide
+- **CLI (\`dac\` / \`agy\`)**: \`dac run "<prompt>"\`, \`dac plan "<prompt>"\`, \`dac status\`, \`dac migrate\`.
+- **Slash Commands**: \`/plan\`, \`/goal\`, \`/grill-me\`, \`/teamwork\`, \`/boost\`, \`/schedule\`, \`/compact\`, \`/learn\`, \`/migrate\`.
+- **Subagents**: \`self\`, \`research\`, \`planner\`, \`editor\`, \`verifier\`, \`image-generator\`.`,
+    },
+    {
+      name: 'migrate-agent-settings',
+      description:
+        'Migrates the user MCP servers, skills, slash commands, subagents, and instruction files from Claude Code, Codex, Cursor, and Gemini CLI into one unified Antigravity plugin.',
+      path: 'builtin://skills/migrate-agent-settings/SKILL.md',
+      content: `# Migrate Agent Settings Skill
+Call \`migrate_agent_settings({})\` to scan \`CLAUDE.md\`, \`.claude/\`, \`.cursorrules\`, \`.cursor/rules/\`, and \`GEMINI.md\` and bundle them into \`.agents/plugins/migrated-agent-setup/\`.`,
+    },
+    {
+      name: 'migrate-workflows',
+      description:
+        'Automatically migrate legacy workflows (.agents/workflows/*.md) to modern skills (.agents/skills/<name>/SKILL.md) and safely archive old workflow files.',
+      path: 'builtin://skills/migrate-workflows/SKILL.md',
+      content: `# Migrate Workflows Skill
+Call \`migrate_agent_settings({ migrateWorkflows: true })\` to convert legacy \`.agents/workflows/*.md\` files into \`.agents/skills/<name>/SKILL.md\` and archive the originals under \`.agents/workflows/.archived/\`.`,
+    },
+    {
+      name: 'ui-plugin-navigation',
+      description:
+        'Surface a one-click pill in chat (<ui-plugin-pill panel="mcp|extensions|artifacts|trace|changes|rules" label="Open Panel"></ui-plugin-pill>) to open or toggle IDE side panels.',
+      path: 'builtin://skills/ui-plugin-navigation/SKILL.md',
+      content: `# UI Plugin Navigation Skill
+Emit \`<ui-plugin-pill panel="mcp" label="Open MCP Panel"></ui-plugin-pill>\` (supported panels: \`mcp\`, \`extensions\`, \`artifacts\`, \`trace\`, \`changes\`, \`rules\`) on its own line so the user can open the panel with one click.`,
+    },
+  ];
+  for (const bs of builtinSkills) {
+    if (!skills.some((s) => s.name.toLowerCase() === bs.name.toLowerCase())) {
+      skills.push(bs);
+    }
+  }
+
   // 4. Discover .agents/workflows/*.md
   try {
     const wfDir = path.join(resolved, '.agents', 'workflows');
@@ -351,7 +436,86 @@ export async function discoverWorkspaceCustomizations(
     // ignore
   }
 
+  // 5. Discover .agents/plugins/<plugin> and .deepautocode/plugins/<plugin>
+  try {
+    const { discoverWorkspacePlugins } = await import('./PluginManager.js');
+    const plugins = await discoverWorkspacePlugins(resolved);
+    for (const plugin of plugins) {
+      for (const r of plugin.rules) {
+        rules.push(r);
+      }
+      for (const s of plugin.skills) {
+        skills.push({
+          name: s.qualifiedName,
+          description: s.description,
+          path: s.path,
+          content: s.content?.slice(0, 8000),
+        });
+      }
+    }
+  } catch {
+    // ignore plugin discovery errors
+  }
+
   return { rules, skills, workflows };
+}
+
+/**
+ * Antigravity-style Hierarchical Rule Discovery:
+ * Given active relative file paths (e.g. `packages/subpkg/src/foo.ts`), walks up from each file's
+ * directory to `workspaceRoot`, discovering subdirectory `AGENTS.md`, `GEMINI.md`, `CLAUDE.md`,
+ * and `.agents/rules/*.md` files, deduplicating by canonical relative path.
+ */
+export async function discoverHierarchicalRulesForPaths(
+  workspaceRoot: string,
+  activePaths: string[] = []
+): Promise<WorkspaceRule[]> {
+  const root = path.resolve(workspaceRoot);
+  const seenRelPaths = new Set<string>();
+  const discovered: WorkspaceRule[] = [];
+
+  const candidateDirs = new Set<string>();
+  for (const rel of activePaths) {
+    const clean = String(rel || '').replace(/\\/g, '/').replace(/^\.?\//, '');
+    if (!clean) continue;
+    let currentDir = path.resolve(root, path.dirname(clean));
+    while (currentDir.startsWith(root) && currentDir !== root) {
+      candidateDirs.add(currentDir);
+      const parent = path.dirname(currentDir);
+      if (parent === currentDir) break;
+      currentDir = parent;
+    }
+  }
+
+  // Sort from shallowest subdirectory to deepest so more specific rules come after parent rules
+  const sortedDirs = [...candidateDirs].sort((a, b) => a.length - b.length);
+
+  for (const dir of sortedDirs) {
+    const relDir = path.relative(root, dir).replace(/\\/g, '/');
+    for (const ruleFile of ['AGENTS.md', 'GEMINI.md', 'CLAUDE.md', '.cursorrules']) {
+      const relRulePath = `${relDir}/${ruleFile}`;
+      if (seenRelPaths.has(relRulePath)) continue;
+      try {
+        const raw = await fs.readFile(path.join(dir, ruleFile), 'utf-8');
+        if (raw.trim()) {
+          seenRelPaths.add(relRulePath);
+          const parsed = parseRuleFrontmatter(raw);
+          discovered.push({
+            name: `${relDir}/${ruleFile}`,
+            path: relRulePath,
+            content: (parsed.body.trim() ? parsed.body : raw).slice(0, 6000),
+            globs: parsed.globs,
+            alwaysApply: true,
+            description: parsed.description || `Hierarchical rule in ${relDir}`,
+          });
+        }
+      } catch {
+        // ignore missing
+      }
+    }
+  }
+
+  return discovered;
 }
 
 export async function generateWorkspaceInfo(workspaceRoot: string): Promise<WorkspaceInfo> {
@@ -427,7 +591,9 @@ export function expandSlashCommandPrompt(rawPrompt: string): {
   suggestedMode?: 'plan' | 'auto';
 } {
   const trimmed = rawPrompt.trim();
-  const match = trimmed.match(/^\/(plan|goal|fix|review|test|compact|learn|browser)\b\s*([\s\S]*)$/i);
+  const match = trimmed.match(
+    /^\/(plan|goal|fix|review|test|compact|learn|browser|grill-me|teamwork|boost|schedule|migrate)\b\s*([\s\S]*)$/i
+  );
   if (!match) {
     return { expandedPrompt: rawPrompt };
   }
@@ -446,6 +612,60 @@ export function expandSlashCommandPrompt(rawPrompt: string): {
           `1. Inspect relevant workspace files using read_file / outline_file / search_codebase.\n` +
           `2. Call 'write_artifact' with artifactType="plan" and title="Implementation Plan" to persist a structured step-by-step plan (including target files, root-cause/design analysis, and verification steps).\n` +
           `3. Summarize the plan clearly so the user can click "Proceed & Execute Plan".`,
+      };
+    case 'grill-me':
+      return {
+        slashCommand: '/grill-me',
+        suggestedMode: 'plan',
+        expandedPrompt:
+          `[Antigravity /grill-me Interactive Architectural Interview]\n` +
+          `User Goal: ${rest || 'Align on the architectural design and edge cases before implementation.'}\n\n` +
+          `Instructions:\n` +
+          `1. Inspect relevant workspace files first so you do not ask questions already answered by the code.\n` +
+          `2. Call 'ask_question' with 2-4 high-leverage multiple-choice questions (with "(Recommended)" first options) to resolve genuine design trade-offs.\n` +
+          `3. Once the user responds, synthesize the agreed decisions into a 'plan' artifact via 'write_artifact'.`,
+      };
+    case 'teamwork':
+      return {
+        slashCommand: '/teamwork',
+        suggestedMode: 'auto',
+        expandedPrompt:
+          `[FORCE_AUTO_ACTION] [Antigravity /teamwork Multi-Agent Parallel Orchestration]\n` +
+          `Project Goal: ${rest || 'Decompose the task across specialized subagents and integrate verified changes.'}\n\n` +
+          `Instructions:\n` +
+          `1. Break the task into independent workstreams.\n` +
+          `2. Use 'define_subagent' (if specialized roles are needed) and 'invoke_subagent' (with workspace="branch" for isolated Git worktrees when editing different modules, or role="research"/"editor"/"verifier").\n` +
+          `3. Coordinate results via 'manage_subagents' / 'send_message' and run final verification tests.`,
+      };
+    case 'boost':
+      return {
+        slashCommand: '/boost',
+        suggestedMode: 'auto',
+        expandedPrompt:
+          `[FORCE_AUTO_ACTION] [Antigravity /boost Deep Reasoning, Multi-Perspective & Rigorous Verification]\n` +
+          `Task: ${rest || 'Solve the complex engineering problem with deep first-principles analysis and strict verification.'}\n\n` +
+          `Instructions:\n` +
+          `1. Gather complete evidence in parallel (read full functions, callers, and invariants).\n` +
+          `2. Evaluate competing hypotheses and edge cases mathematically before editing.\n` +
+          `3. Apply surgical fixes, run build & verification tests, and persist an architectural walkthrough artifact.`,
+      };
+    case 'schedule':
+      return {
+        slashCommand: '/schedule',
+        suggestedMode: 'auto',
+        expandedPrompt:
+          `[Antigravity /schedule Timer & Cron Automation]\n` +
+          `Schedule Request: ${rest || 'Create a scheduled timer or recurring cron check.'}\n\n` +
+          `Instructions:\n` +
+          `Call the 'schedule' tool with either 'durationSeconds' (for a one-shot timer) or 'cronExpression' (5-field cron for recurring tasks) and a clear 'prompt' describing what to execute when triggered.`,
+      };
+    case 'migrate':
+      return {
+        slashCommand: '/migrate',
+        suggestedMode: 'auto',
+        expandedPrompt:
+          `[Antigravity /migrate External Agent Settings Migration]\n` +
+          `Call 'migrate_agent_settings' to scan .cursor/, .claude/, CLAUDE.md, and GEMINI.md in this workspace and package them into an Antigravity plugin under '.agents/plugins/migrated-agent-setup/'. ${rest}`,
       };
     case 'goal':
       return {
@@ -881,9 +1101,14 @@ export function getClineDefaultSystemPrompt(
     customRulesSection,
     customSkillsSection,
     ``,
-    `## Antigravity Agentic Capabilities (Artifacts, Subagents & Workflows)`,
-    `- **Structured Artifacts ('write_artifact')**: When asked to create a plan ('/plan'), architectural walkthrough, or track a multi-step task checklist, call 'write_artifact' ({ artifactType: 'plan' | 'task_list' | 'walkthrough' | 'report', title, content }) so the IDE Artifacts Pane renders it with an interactive execution button.`,
-    `- **Subagent Delegation ('invoke_subagent')**: For broad read-only codebase research or multi-file symbol exploration, call 'invoke_subagent' ({ role: 'research' | 'planner' | 'verifier' | 'editor', task, files, queries }). research/planner run a multi-round search→outline→read loop and return a capped evidence report; verifier runs diagnostics + verify; editor applies a budgeted isolated edit (max files/edits, rollback on diagnose fail).`,
+    `## Antigravity Agentic Capabilities (Artifacts, Subagents, Background Tasks & Workflows)`,
+    `- **Structured Artifacts ('write_artifact')**: When asked to create a plan ('/plan'), architectural walkthrough, or track a multi-step task checklist, call 'write_artifact' ({ artifactType: 'plan' | 'task_list' | 'walkthrough' | 'report', title, content }) so the IDE Artifacts Pane renders it with an interactive "Proceed & Execute Plan" button.`,
+    `- **Background Task Manager ('run_command' + 'manage_task')**: For dev servers, file watchers, or GUI launches, pass 'isDaemon: true' or 'waitMsBeforeAsync: 1500' to 'run_command' so it runs asynchronously in the background, and use 'manage_task' ({ action: 'list' | 'status' | 'send_input' | 'kill', taskId, input }) to inspect or terminate it without blocking.`,
+    `- **Structured Clarification ('ask_question')**: When requirements or product choices are genuinely ambiguous and cannot be inferred from the codebase, call 'ask_question' ({ questions: [{ question, options: ['(Recommended) ...', '...'], isMultiSelect }] }) to render an interactive multiple-choice card in the Composer.`,
+    `- **Web Search ('search_web')**: When you need external API documentation, library usage, or error references, call 'search_web' ({ query, domain }) for live search results and URL citations.`,
+    `- **Subagent Network ('define_subagent', 'invoke_subagent', 'manage_subagents', 'send_message')**: Define custom subagent roles via 'define_subagent', launch subagents via 'invoke_subagent' ({ role, task, workspace: 'inherit' | 'branch' | 'share', runInBackground }), message active subagents via 'send_message', and list/kill them via 'manage_subagents'.`,
+    `- **Timers & Cron Automation ('schedule')**: Schedule one-shot timers ('durationSeconds' + 'timerCondition') or recurring 5-field cron jobs ('cronExpression' + 'isDaemon') that automatically wake you up via <SYSTEM_MESSAGE>.`,
+    `- **Transcript Replay ('read_transcript') & Plugin Migration ('migrate_agent_settings')**: Read full untruncated step logs from 'transcript_full.jsonl' via 'read_transcript', or migrate Cursor/Claude Code configs into '.agents/plugins/' via 'migrate_agent_settings'.`,
     `- **Session Todos ('manage_todo')**: For multi-step goals, maintain a checklist via manage_todo ({ action: 'set'|'add'|'complete'|'list', items?/id?/content? }). Incomplete todos are re-injected on self-heal continuations.`,
     ``,
     `## Antigravity 4-Phase Scientific Problem-Solving Protocol`,

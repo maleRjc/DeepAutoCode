@@ -18,8 +18,10 @@ import { RuntimeFactory, type IClineCoreInstance } from '../runtime/RuntimeFacto
 import { ApprovalBridge } from './ApprovalBridge.js';
 import { EventBridge, type UIEventListener } from './EventBridge.js';
 import { SessionBridge } from './SessionBridge.js';
+import { globalBackgroundTaskManager } from '../core/BackgroundTaskManager.js';
+import { globalQuestionBridge } from '../core/QuestionBridge.js';
 
-const MAX_MESSAGE_BYTES = 2 * 1024 * 1024; // 2MB protection against oversized Webview messages
+const MAX_MESSAGE_BYTES = 10 * 1024 * 1024; // 10MB protection (supports pasted screenshots)
 
 /**
  * Section 3.3, 4.1 & 6.4: Unified Agent Client Bridge
@@ -326,12 +328,16 @@ export class AgentClientBridge {
             : undefined;
         const workspaceRoot =
           (payload.workspaceRoot as string | undefined) ?? this.workspaceRoot;
+        const images = Array.isArray(payload.images)
+          ? (payload.images as Array<{ name?: string; dataUrl: string; mimeType?: string }>)
+          : undefined;
         return this.sessionBridge.sendPrompt({
           sessionId: targetId,
           prompt,
           workspaceRoot,
           executionMode,
           modelId,
+          images,
         });
       }
 
@@ -350,6 +356,45 @@ export class AgentClientBridge {
         const approved = Boolean(payload.approved);
         const reason = payload.reason as string | undefined;
         return this.approvalBridge.respond(approvalId, approved, reason);
+      }
+
+      case 'question.respond': {
+        const questionId = String(payload.questionId ?? '');
+        const answers =
+          payload.answers && typeof payload.answers === 'object'
+            ? (payload.answers as Record<string, string | string[]>)
+            : {};
+        const skipped = Boolean(payload.skipped);
+        const ok = globalQuestionBridge.respond({ questionId, answers, skipped });
+        if (sessionId) {
+          this.eventBridge.emit(sessionId, 'question.resolved', { questionId, answers, skipped });
+        }
+        return { ok, questionId };
+      }
+
+      case 'task.manage': {
+        const action = String(payload.action || 'list').toLowerCase();
+        const taskId = payload.taskId ? String(payload.taskId) : '';
+        const targetSessionId =
+          (typeof payload.sessionId === 'string' ? payload.sessionId : undefined) || sessionId;
+        if (action === 'list') {
+          return { tasks: globalBackgroundTaskManager.listTasks(targetSessionId) };
+        }
+        if (action === 'status') {
+          const status = globalBackgroundTaskManager.getTaskStatus(taskId);
+          if (!status) throw new Error(`TASK_NOT_FOUND: Task "${taskId}" not found`);
+          return { task: status };
+        }
+        if (action === 'send_input') {
+          const input = String(payload.input ?? '');
+          const task = await globalBackgroundTaskManager.sendTaskInput(taskId, input);
+          return { task };
+        }
+        if (action === 'kill') {
+          const task = globalBackgroundTaskManager.killTask(taskId);
+          return { task };
+        }
+        throw new Error(`INVALID_TASK_ACTION: Unknown action "${action}"`);
       }
 
       case 'diff.review': {

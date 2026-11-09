@@ -10,6 +10,8 @@ build/out/
 # Runtime & user session data (contains local secrets, SSH mirrors, sessions)
 .deepautocode-data/
 **/.deepautocode-data/
+.deepautocode/
+**/.deepautocode/
 
 # Environment variables & secrets
 .env

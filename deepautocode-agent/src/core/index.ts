@@ -2,16 +2,24 @@ export {
   Agent,
   AgentRuntime,
   ClineCore,
+  SessionReadCache,
+  buildStablePrefix,
+  computeDynamicMaxIterations,
+  isPreflightableEditTool,
   type AgentMessage,
   type AgentMessagePart,
   type AgentModelAdapter,
   type AgentModelStreamChunk,
+  type AgentModelStreamRequest,
   type AgentOptions,
   type AgentRunResult,
+  type StablePrefixBundle,
+  type SessionReadCacheEntry,
 } from './AgentLoop.js';
 
 export {
   discoverWorkspaceCustomizations,
+  discoverHierarchicalRulesForPaths,
   enrichPromptWithMentions,
   expandSlashCommandPrompt,
   filterRulesForPaths,
@@ -211,13 +219,18 @@ export {
 export {
   summarizeToolOutput,
   shouldCompactToolOutput,
+  extractToolResultTuple,
+  type ToolResultTuple,
 } from './ToolResultSummarizer.js';
 
 export {
   resolveCompactionPlan,
+  decideBudgetCompaction,
   estimateTokensFromChars,
   type CompactionPlan,
   type ResolveCompactionPlanParams,
+  type BudgetCompactionMessageItem,
+  type BudgetCompactionDecision,
 } from './ContextCompaction.js';
 
 export {
@@ -299,9 +312,13 @@ export {
   isDeepSeekPeakHour,
   estimateDeepSeekTurnCostCny,
   formatCostCny,
+  resolvePhaseReasoningEffort,
+  extractDeepSeekCacheUsage,
   type DeepSeekApiModelId,
   type DeepSeekReasoningEffort,
   type DeepSeekRequestControls,
+  type AgentLoopPhase,
+  type NormalizedDeepSeekCacheUsage,
 } from './DeepSeekModels.js';
 
 export {
@@ -309,4 +326,75 @@ export {
   type DeepSeekFimParams,
   type DeepSeekFimResult,
 } from './DeepSeekFim.js';
+
+export {
+  BackgroundTaskManager,
+  globalBackgroundTaskManager,
+  type BackgroundTaskSnapshot,
+  type BackgroundTaskStatus,
+} from './BackgroundTaskManager.js';
+
+export {
+  QuestionBridge,
+  globalQuestionBridge,
+  type AskQuestionOptionItem,
+  type PendingQuestionPrompt,
+  type QuestionResponsePayload,
+} from './QuestionBridge.js';
+
+export {
+  loadLifecycleHooks,
+  runLifecycleHooks,
+  type LifecycleHookEvent,
+  type LifecycleHookRule,
+  type LifecycleHooksConfig,
+  type HookExecutionItemResult,
+  type RunLifecycleHooksResult,
+} from './LifecycleHooks.js';
+
+export {
+  performWebSearch,
+  type WebSearchResultItem,
+  type WebSearchResponse,
+} from './WebSearch.js';
+
+export {
+  SubagentOrchestrator,
+  globalSubagentOrchestrator,
+  type SubagentDefinition,
+  type SubagentWorkspaceMode,
+  type SubagentModelTier,
+  type SubagentRunState,
+  type SubagentMessage,
+  type SubagentInstanceSnapshot,
+  type SystemWakeupNotification,
+} from './SubagentOrchestrator.js';
+
+export {
+  ScheduleManager,
+  globalScheduleManager,
+  type ScheduleTaskSnapshot,
+} from './ScheduleManager.js';
+
+export {
+  discoverWorkspacePlugins,
+  migrateExternalAgentSettings,
+  migrateLegacyWorkflowsToSkills,
+  searchMarketplace,
+  installCatalogPlugin,
+  listPluginAccounts,
+  BUILTIN_MARKETPLACE_CATALOG,
+  type AgentPluginManifest,
+  type MarketplaceCatalogEntry,
+  type PluginAccountStatus,
+} from './PluginManager.js';
+
+export {
+  TranscriptLogger,
+  globalTranscriptLogger,
+  type TranscriptStepInput,
+  type TranscriptStepRecord,
+} from './TranscriptLogger.js';
+
+
 

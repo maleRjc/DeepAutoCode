@@ -10,6 +10,14 @@ import type { EventBridge } from './EventBridge.js';
 import type { IClineCoreInstance } from '../runtime/RuntimeFactory.js';
 import type { ResourceManager } from '../runtime/ResourceManager.js';
 import { globalTaskTraceStore } from '../core/trace/TaskTrace.js';
+import {
+  globalBackgroundTaskManager,
+  type BackgroundTaskSnapshot,
+} from '../core/BackgroundTaskManager.js';
+import {
+  globalQuestionBridge,
+  type PendingQuestionPrompt,
+} from '../core/QuestionBridge.js';
 
 export interface ResumedSessionSnapshot {
   manifest: SessionManifest;
@@ -17,6 +25,8 @@ export interface ResumedSessionSnapshot {
   diffs: DiffChangeRecord[];
   missedEvents: EventMessage[];
   pendingApprovals: ReturnType<ApprovalBridge['getPendingApprovals']>;
+  pendingQuestions?: PendingQuestionPrompt[];
+  backgroundTasks?: BackgroundTaskSnapshot[];
   recoveredAcrossInstanceRestart: boolean;
 }
 
@@ -109,6 +119,15 @@ export class SessionBridge {
         case 'trace_updated':
           this.eventBridge.emit(ev.sessionId, 'trace.updated', ev.payload);
           break;
+        case 'question_requested':
+          this.eventBridge.emit(ev.sessionId, 'question.requested', ev.payload);
+          break;
+        case 'question_resolved':
+          this.eventBridge.emit(ev.sessionId, 'question.resolved', ev.payload);
+          break;
+        case 'task_state_changed':
+          this.eventBridge.emit(ev.sessionId, 'task.state.changed', ev.payload);
+          break;
       }
     });
 
@@ -163,6 +182,7 @@ export class SessionBridge {
     workspaceRoot?: string;
     executionMode?: AgentExecutionMode;
     modelId?: string;
+    images?: Array<{ name?: string; dataUrl: string; mimeType?: string }>;
   }): Promise<SessionMessage> {
     const signal = this.resourceManager.createSessionTaskSignal(input.sessionId);
     try {
@@ -172,6 +192,7 @@ export class SessionBridge {
         workspaceRoot: input.workspaceRoot,
         executionMode: input.executionMode,
         modelId: input.modelId,
+        images: input.images,
         signal,
       });
       return message;
@@ -223,6 +244,8 @@ export class SessionBridge {
 
     const missedEvents = this.eventBridge.getEventsSince(sessionId, lastSequence);
     const pendingApprovals = this.approvalBridge.getPendingApprovals(sessionId);
+    const pendingQuestions = globalQuestionBridge.getPendingForSession(sessionId);
+    const backgroundTasks = globalBackgroundTaskManager.listTasks(sessionId);
 
     return {
       manifest,
@@ -230,6 +253,8 @@ export class SessionBridge {
       diffs,
       missedEvents,
       pendingApprovals,
+      pendingQuestions,
+      backgroundTasks,
       recoveredAcrossInstanceRestart,
     };
   }
@@ -296,6 +321,8 @@ export class SessionBridge {
   }> {
     this.resourceManager.cancelSessionTask(sessionId, reason);
     const cancelledApprovals = this.approvalBridge.cancelSessionApprovals(sessionId, reason);
+    globalQuestionBridge.cancelSessionQuestions(sessionId);
+    globalBackgroundTaskManager.killSessionTasks(sessionId, false);
     const abortedRuntime = await this.runtime.abort(sessionId, reason);
     // Stop preserves pending Diffs for Accept/Reject review (Cursor-like).
     const diffs = await this.runtime.readDiffs(sessionId);

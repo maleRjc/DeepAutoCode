@@ -295,7 +295,8 @@ export class CapabilityRegistry {
       const isLongRunningServerCmd =
         /\b(npm(\.cmd)?\s+(start|run\s+(dev|start|serve))|node(\.exe)?\s+[^\s|;&]*server[^\s|;&]*\.js|python\d?\s+[^\s|;&]*-m\s+http\.server)\b/i.test(
           cmdText
-        );
+        ) ||
+        /^(?:\.[\\/])?(?:dist|build|release|out)[\\/][^\s|;&"']+\.exe\s*$/i.test(cmdText);
       const serverReadyPattern =
         /(?:listening on|服务已启动|已启动|started server|http:\/\/localhost:\d+|http:\/\/127\.0\.0\.1:\d+|Local:\s+https?:\/\/|ready in \d+\s*ms)/i;
 
@@ -310,11 +311,24 @@ export class CapabilityRegistry {
         let stderr = '';
         let serverReadyTimer: ReturnType<typeof setTimeout> | undefined;
         let backgroundFallbackTimer: ReturnType<typeof setTimeout> | undefined;
+        let exitDrainTimer: ReturnType<typeof setTimeout> | undefined;
 
-        const child = spawn(cmdText, {
+        let effectiveCmd = cmdText.trim();
+        const extraEnv: Record<string, string> = {};
+        while (true) {
+          const envMatch = effectiveCmd.match(
+            /^([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S+)\s+([\s\S]+)$/
+          );
+          if (!envMatch) break;
+          extraEnv[envMatch[1]] = envMatch[2].replace(/^["']|["']$/g, '');
+          effectiveCmd = envMatch[3].trim();
+        }
+
+        const child = spawn(effectiveCmd || cmdText, {
           cwd,
           shell: true,
           windowsHide: true,
+          env: { ...process.env, ...extraEnv },
           stdio: ['ignore', 'pipe', 'pipe'],
         });
 
@@ -328,8 +342,30 @@ export class CapabilityRegistry {
           settled = true;
           if (serverReadyTimer) clearTimeout(serverReadyTimer);
           if (backgroundFallbackTimer) clearTimeout(backgroundFallbackTimer);
+          if (exitDrainTimer) clearTimeout(exitDrainTimer);
           ctx.signal?.removeEventListener('abort', onAbortSignal);
           resolve(result);
+        };
+
+        const finalizeWithCode = (code: number | null) => {
+          const combined = `${stdout}\n${stderr}`;
+          if (/EADDRINUSE|已被占用|address already in use/i.test(combined)) {
+            finish({
+              exitCode: 0,
+              stdout:
+                `${stdout}\n${stderr}\n` +
+                `[DeepAutoCode] 检测到目标端口已被占用，说明该服务实例已在后台运行中（可直接访问对应端口验证，无需终止现有 Node 进程）。`.trim(),
+              stderr: '',
+              durationMs: Date.now() - start,
+            });
+            return;
+          }
+          finish({
+            exitCode: typeof code === 'number' ? code : 0,
+            stdout,
+            stderr,
+            durationMs: Date.now() - start,
+          });
         };
 
         const detachAndFinishAsRunningServer = (note: string) => {
@@ -367,7 +403,7 @@ export class CapabilityRegistry {
           backgroundFallbackTimer = setTimeout(() => {
             if (!settled && child.exitCode === null) {
               detachAndFinishAsRunningServer(
-                `[DeepAutoCode] 服务启动命令已在后台持续运行 (PID: ${child.pid ?? 'unknown'})。`
+                `[DeepAutoCode] 服务/GUI 进程已在后台持续运行 (PID: ${child.pid ?? 'unknown'})。`
               );
             }
           }, 5000);
@@ -378,6 +414,7 @@ export class CapabilityRegistry {
           settled = true;
           if (serverReadyTimer) clearTimeout(serverReadyTimer);
           if (backgroundFallbackTimer) clearTimeout(backgroundFallbackTimer);
+          if (exitDrainTimer) clearTimeout(exitDrainTimer);
           try {
             child.kill();
           } catch {
@@ -415,25 +452,26 @@ export class CapabilityRegistry {
           });
         });
 
+        // On Windows, commands like `cmd /c "start \"\" app.exe"` exit the shell quickly,
+        // but the spawned GUI grandchild inherits stdout/stderr pipe handles and prevents
+        // `close` from firing until the GUI window is closed. Drain briefly after `exit`.
+        child.on('exit', (code) => {
+          if (settled || exitDrainTimer) return;
+          exitDrainTimer = setTimeout(() => {
+            if (settled) return;
+            try {
+              child.stdout?.destroy();
+              child.stderr?.destroy();
+              child.unref();
+            } catch {
+              // ignore
+            }
+            finalizeWithCode(code);
+          }, 350);
+        });
+
         child.on('close', (code) => {
-          const combined = `${stdout}\n${stderr}`;
-          if (/EADDRINUSE|已被占用|address already in use/i.test(combined)) {
-            finish({
-              exitCode: 0,
-              stdout:
-                `${stdout}\n${stderr}\n` +
-                `[DeepAutoCode] 检测到目标端口已被占用，说明该服务实例已在后台运行中（可直接访问对应端口验证，无需终止现有 Node 进程）。`.trim(),
-              stderr: '',
-              durationMs: Date.now() - start,
-            });
-            return;
-          }
-          finish({
-            exitCode: typeof code === 'number' ? code : 0,
-            stdout,
-            stderr,
-            durationMs: Date.now() - start,
-          });
+          finalizeWithCode(code);
         });
       });
     });

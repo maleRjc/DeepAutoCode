@@ -26,8 +26,9 @@ export interface UIEventMessage {
   | 'goal.usage'
   | 'trace.updated'
   | 'checkpoint.created'
-  | 'diff.proposed'
-  | 'diff.updated';
+  | 'question.requested'
+  | 'question.resolved'
+  | 'task.state.changed';
   sessionId: string;
   sequence: number;
   timestamp: string;

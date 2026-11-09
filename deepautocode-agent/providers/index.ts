@@ -6,6 +6,92 @@ import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
 import { redactSensitiveText } from '../src/security.js';
+import {
+  extractDeepSeekCacheUsage,
+  estimateDeepSeekTurnCostCny,
+  isDeepSeekPeakHour,
+  type NormalizedDeepSeekCacheUsage,
+} from '../src/core/DeepSeekModels.js';
+import type { TaskTraceStore } from '../src/core/trace/TaskTrace.js';
+
+export { extractDeepSeekCacheUsage, type NormalizedDeepSeekCacheUsage };
+
+export interface ProviderCacheTraceTarget {
+  recordModelTurn?: (entry: {
+    modelId: string;
+    tier: string;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+    estimatedCostCny: number;
+    peakHour: boolean;
+    reasoningEffort: string | null;
+  }) => void;
+  recordLlmTurn?: TaskTraceStore['recordLlmTurn'];
+}
+
+/**
+ * B1: Record DeepSeek prompt_cache_hit_tokens & prompt_cache_miss_tokens directly into TaskTrace.
+ */
+export function recordProviderCacheUsageToTrace(params: {
+  usageRaw: unknown;
+  modelId: string;
+  tier?: string;
+  reasoningEffort?: string | null;
+  trace?: ProviderCacheTraceTarget | null;
+  workspaceRoot?: string;
+  sessionId?: string;
+  taskId?: string;
+  turnIndex?: number;
+  latencyMs?: number;
+  tokenBudget?: number;
+}): NormalizedDeepSeekCacheUsage & { estimatedCostCny: number; peakHour: boolean } {
+  const usage = extractDeepSeekCacheUsage(params.usageRaw);
+  const peakHour = isDeepSeekPeakHour();
+  const estimatedCostCny = estimateDeepSeekTurnCostCny({
+    apiModelId: params.modelId,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheReadTokens: usage.promptCacheHitTokens,
+    peak: peakHour,
+  });
+  if (params.trace) {
+    if (typeof params.trace.recordModelTurn === 'function') {
+      params.trace.recordModelTurn({
+        modelId: params.modelId,
+        tier: params.tier ?? 'pro',
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.promptCacheHitTokens,
+        cacheWriteTokens: usage.cacheWriteTokens,
+        estimatedCostCny,
+        peakHour,
+        reasoningEffort: params.reasoningEffort ?? null,
+      });
+    } else if (typeof params.trace.recordLlmTurn === 'function') {
+      params.trace.recordLlmTurn({
+        workspaceRoot: params.workspaceRoot ?? process.cwd(),
+        sessionId: params.sessionId ?? 'default',
+        taskId: params.taskId,
+        turnIndex: params.turnIndex ?? 1,
+        modelId: params.modelId,
+        latencyMs: params.latencyMs ?? 0,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.promptCacheHitTokens,
+        cacheWriteTokens: usage.cacheWriteTokens,
+        tokensUsed: usage.inputTokens + usage.outputTokens,
+        tokenBudget: params.tokenBudget ?? 128000,
+      });
+    }
+  }
+  return {
+    ...usage,
+    estimatedCostCny,
+    peakHour,
+  };
+}
 
 function defaultResilientFetch(url: string | URL, init?: RequestInit): Promise<Response> {
   const parsedUrl = new URL(String(url));

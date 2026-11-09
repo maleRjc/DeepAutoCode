@@ -8,6 +8,7 @@ export default defineConfig({
   build: {
     outDir: path.resolve(__dirname, '../dist/webview'),
     emptyOutDir: true,
+    chunkSizeWarningLimit: 1000,
     rollupOptions: {
       output: {
         entryFileNames: 'assets/index.js',
