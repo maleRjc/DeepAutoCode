@@ -2770,7 +2770,7 @@ export function useWorkbenchController() {
     if (isTestingKey) return;
     setIsTestingKey(true);
     setSmokeResult(null);
-    setStatusNotice(`Testing AI API Key connectivity for ${selectedProviderId}...`);
+    setStatusNotice(`正在测试模型连通性 (${selectedProviderId} / ${modelInput})...`);
     try {
       // Always persist the selected provider, endpoint, model, and optional key before running the smoke test
       const isLocalEndpoint =
@@ -2796,8 +2796,8 @@ export function useWorkbenchController() {
       setSmokeResult(res);
       setStatusNotice(
         res.ok
-          ? `✓ AI Key Verified (${selectedProviderId}/${modelInput}, ${res.latencyMs}ms)`
-          : `✗ AI Key Test Failed: ${res.diagnostic?.userMessage || 'Check API Key'}`
+          ? `✓ 模型连通性验证通过 (${selectedProviderId}/${modelInput}, ${res.latencyMs}ms)`
+          : `✗ 模型连通性测试失败: ${res.diagnostic?.userMessage || '请检查接口地址与配置'}`
       );
     } catch (err) {
       const msg = (err as Error).message || String(err);
