@@ -16,6 +16,8 @@ import {
   extractCompactExecutiveSummary,
   getFileVisualMeta,
   renderSyntaxHighlightedLine,
+  parseGlmControlReason,
+  formatContinuationStatusLabel,
 } from '../utils/workbenchUtils';
 
 export function StatusBar({ ctx }: { ctx: any }) {
@@ -110,6 +112,8 @@ export function StatusBar({ ctx }: { ctx: any }) {
     sessionCheckpoints, setSessionCheckpoints,
     lastModelTier, setLastModelTier,
     goalTokenUsage, setGoalTokenUsage,
+    goalContextPressure,
+    lastContinuationHint,
     activeTaskTrace, setActiveTaskTrace,
     pendingPromptQueue, setPendingPromptQueue,
     hunkDecisions, setHunkDecisions,
@@ -168,7 +172,7 @@ export function StatusBar({ ctx }: { ctx: any }) {
     handleAutoBuildDiagnoseAndFix, handleQuestionResponseSubmit,
     handleManageBackgroundTask, handleAttachImageFiles, handleSendPrompt,
     handleApprovalDecision, addContextChip, loadCheckpointPreviewDiffs,
-    refreshSessionCheckpoints, refreshTaskTrace, handleReviewAllPending,
+    refreshSessionCheckpoints, refreshTaskTrace, refreshTaskTraceList, handleReviewAllPending,
     handleStopAgent, handleDiffReview, getDiffHunks, handleHunkDecision,
     handleSimulateExtensionHostRestart, handleExportDiagnostics, handleTestAiKey,
     openSshConnectionModal, parseQuickSshCommand, handleTestSshConnection,
@@ -205,17 +209,99 @@ export function StatusBar({ ctx }: { ctx: any }) {
           <span>Backend: {backendStatus?.diagnostics?.effectiveMode ?? 'local'}</span>
           {lastModelTier?.effectiveModelId && (
             <span
-              title={lastModelTier.reason || 'Active DeepSeek route'}
+              title={lastModelTier.reason || 'Active model route'}
               style={{
                 color: lastModelTier.peakHour ? '#fbbf24' : '#67e8f9',
                 fontWeight: 600,
               }}
             >
               {lastModelTier.effectiveModelId}
-              {lastModelTier.thinkingEnabled ? '·think' : ''}
-              {lastModelTier.peakHour ? ' · peak' : ' · off-peak'}
+              {lastModelTier.thinkingEnabled
+                ? '·think'
+                : lastModelTier.effectiveModelId.toLowerCase().includes('glm')
+                  ? '·fast'
+                  : ''}
+              {lastModelTier.peakHour ? ' · peak' : ''}
             </span>
           )}
+          {lastModelTier &&
+            (lastModelTier.glmControlReason || parseGlmControlReason(lastModelTier)) && (
+              <span
+                title={lastModelTier.reason || ''}
+                style={{ color: '#4ade80', fontWeight: 600, fontSize: 11 }}
+              >
+                GLM·{lastModelTier.glmControlReason || parseGlmControlReason(lastModelTier)}
+              </span>
+            )}
+          {lastContinuationHint && (
+            <span
+              title={lastContinuationHint.summary}
+              style={{
+                color: '#fb923c',
+                fontWeight: 600,
+                fontSize: 11,
+                cursor: 'pointer',
+              }}
+              onClick={() => {
+                setAiTab('trace');
+                void refreshTaskTrace();
+                void refreshTaskTraceList(12);
+              }}
+            >
+              {formatContinuationStatusLabel(lastContinuationHint)}
+            </span>
+          )}
+          {(() => {
+            const tokFill =
+              goalTokenUsage && goalTokenUsage.tokenBudget > 0
+                ? goalTokenUsage.tokensUsed / goalTokenUsage.tokenBudget
+                : 0;
+            const ctxFill = Math.max(
+              goalContextPressure?.fillRatio ?? 0,
+              lastModelTier?.contextFillRatio ?? 0,
+              tokFill
+            );
+            if (ctxFill <= 0.05) return null;
+            const pct = Math.min(100, Math.round(ctxFill * 100));
+            const hot = ctxFill >= 0.78 || goalContextPressure?.warn;
+            return (
+              <span
+                title={`Context fill ~${pct}%${lastModelTier?.compactProfile ? ` · ${lastModelTier.compactProfile}` : ''}${goalContextPressure?.warn ? ' · compaction active' : ''}`}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: 5,
+                  color: hot ? '#fbbf24' : '#93c5fd',
+                  fontWeight: 600,
+                  fontSize: 11,
+                }}
+              >
+                ctx
+                <span
+                  style={{
+                    display: 'inline-block',
+                    width: 40,
+                    height: 5,
+                    borderRadius: 3,
+                    background: 'rgba(148, 163, 184, 0.25)',
+                    overflow: 'hidden',
+                  }}
+                >
+                  <span
+                    style={{
+                      display: 'block',
+                      height: '100%',
+                      width: `${pct}%`,
+                      background: hot
+                        ? 'rgba(251, 191, 36, 0.95)'
+                        : 'rgba(59, 130, 246, 0.85)',
+                    }}
+                  />
+                </span>
+                {pct}%
+              </span>
+            );
+          })()}
           {goalTokenUsage && (
             <span
               title={`Remaining ${goalTokenUsage.remaining.toLocaleString()} tokens; cache hit ${goalTokenUsage.cacheReadTokens.toLocaleString()}; est ¥${goalTokenUsage.estimatedCostCnyTotal.toFixed(4)}`}

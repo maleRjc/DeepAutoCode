@@ -1,4 +1,5 @@
 import { exec, spawn } from 'node:child_process';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
@@ -33,6 +34,13 @@ const REPO_ROOT = isCompiledDist
   ? path.resolve(__dirname, '../../..')
   : path.resolve(__dirname, '../..');
 const MONOREPO_ROOT = path.resolve(REPO_ROOT, '..');
+
+if (
+  !process.env.DEEPAUTOCODE_REPO_ROOT &&
+  fsSync.existsSync(path.join(MONOREPO_ROOT, 'deepautocode-agent', 'package.json'))
+) {
+  process.env.DEEPAUTOCODE_REPO_ROOT = MONOREPO_ROOT;
+}
 
 // Global crash guards so unhandled async/stream errors never terminate the IDE Workbench Server
 process.on('uncaughtException', (err) => {

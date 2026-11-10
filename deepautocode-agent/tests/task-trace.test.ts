@@ -48,7 +48,7 @@ describe('TaskTraceStore', () => {
       workspaceRoot,
       sessionId,
       turnIndex: 1,
-      modelId: 'deepseek-flash',
+      modelId: 'GLM-5.3-Flash',
       latencyMs: 120,
       inputTokens: 100,
       outputTokens: 40,
@@ -56,9 +56,14 @@ describe('TaskTraceStore', () => {
       cacheWriteTokens: 10,
       tokensUsed: 140,
       tokenBudget: 180000,
+      thinkingEnabled: false,
+      glmControlReason: 'toolTurnFastPath',
+      contextFillRatio: 0.08,
     });
     expect(llm?.kind).toBe('llm.turn');
     expect(llm?.cacheReadTokens).toBe(55);
+    expect(llm?.glmControlReason).toBe('toolTurnFastPath');
+    expect(llm?.thinkingEnabled).toBe(false);
 
     const tool = store.recordToolCall({
       workspaceRoot,
@@ -71,6 +76,31 @@ describe('TaskTraceStore', () => {
       ok: true,
     });
     expect(tool?.ok).toBe(true);
+
+    const tier = store.recordSignal({
+      workspaceRoot,
+      sessionId,
+      signal: 'model_tier',
+      summary: 'T1 GLM-5.3-Flash think:off · compileRemediation',
+      detail: {
+        turnIndex: 1,
+        thinkingEnabled: false,
+        glmControlReason: 'compileRemediation',
+        contextFillRatio: 0.42,
+      },
+    });
+    expect(tier?.signal).toBe('model_tier');
+    expect(tier?.detail?.glmControlReason).toBe('compileRemediation');
+
+    const cont = store.recordSignal({
+      workspaceRoot,
+      sessionId,
+      signal: 'continuation',
+      summary: '续跑：缺少修复方案 (#1)',
+      detail: { case: 'compile_lacks_plan', compileRemediationContinuationCount: 1 },
+    });
+    expect(cont?.signal).toBe('continuation');
+    expect(cont?.detail?.case).toBe('compile_lacks_plan');
 
     const verify = store.recordVerify({
       workspaceRoot,
@@ -93,6 +123,8 @@ describe('TaskTraceStore', () => {
       'task.start',
       'llm.turn',
       'tool.call',
+      'agent.signal',
+      'agent.signal',
       'verify.result',
       'task.end',
     ]);

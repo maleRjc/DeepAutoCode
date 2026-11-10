@@ -12,7 +12,9 @@
     "desktop": "tsx src/desktop/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "verify:brand": "node scripts/verify-brand-assets.mjs"
+    "verify:brand": "node scripts/verify-brand-assets.mjs",
+    "ensure:pandoc": "node scripts/run-ensure-pandoc.mjs",
+    "postinstall": "node scripts/run-ensure-pandoc.mjs"
   },
   "dependencies": {
     "@deepautocode/agent": "file:../deepautocode-agent",

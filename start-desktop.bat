@@ -37,6 +37,13 @@ if not exist "%~dp0deepautocode\node_modules\electron\dist\electron.exe" (
     exit /b 1
   )
 )
+if not exist "%~dp0.tools\pandoc\win\pandoc.exe" (
+  echo Ensuring bundled pandoc for Markdown/PDF export...
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0deepautocode\scripts\ensure-pandoc.ps1" -RepoRoot "%~dp0."
+  if errorlevel 1 (
+    echo Pandoc download failed — Agent can still write .md; run: cd deepautocode ^&^& npm run ensure:pandoc
+  )
+)
 echo Building deepautocode webview (so UI fixes are always fresh)...
 cd /d "%~dp0deepautocode"
 call npm.cmd run build:webview

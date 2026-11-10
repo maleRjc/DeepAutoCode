@@ -147,7 +147,8 @@ export function TitlebarMenu({ ctx }: { ctx: any }) {
     sshBrowseData, setSshBrowseData,
     workspaceSectionOpen, setWorkspaceSectionOpen,
     expandedMessageIds, setExpandedMessageIds,
-    aiMessagesEndRef, codeGutterRef, codeHighlightRef, codeTextareaRef,
+    aiMessagesEndRef, scrollComposerToBottom,
+    codeGutterRef, codeHighlightRef, codeTextareaRef,
     currentTheme, isLightTheme, locale, t, tr, displayWorkspaceName,
     activeTab, codeLines, pendingDiffForActive, pendingDiffMarks,
     bridge,
@@ -649,7 +650,16 @@ export function TitlebarMenu({ ctx }: { ctx: any }) {
           </button>
           <button
             className={`icon-btn ${showRightAiDock ? 'active' : ''}`}
-            onClick={() => setShowRightAiDock((v) => !v)}
+            onClick={() => {
+              setShowRightAiDock((v) => {
+                const next = !v;
+                if (next) {
+                  setAiTab('composer');
+                  scrollComposerToBottom('auto');
+                }
+                return next;
+              });
+            }}
             title={t('title.aiFull')}
           >
             ✨ {t('title.ai')}

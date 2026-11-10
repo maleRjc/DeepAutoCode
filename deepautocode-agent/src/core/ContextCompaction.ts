@@ -33,6 +33,8 @@ export interface ResolveCompactionPlanParams {
   tokenBudget?: number | null;
   /** Tokens already billed to the provider (from usage events) */
   tokensUsed?: number;
+  /** GLM 96K-style budgets: compact earlier and harder */
+  compactProfile?: 'default' | 'glm128k';
 }
 
 export function estimateTokensFromChars(chars: number): number {
@@ -43,6 +45,10 @@ export function estimateTokensFromChars(chars: number): number {
  * Resolve how aggressively to compact older tool outputs.
  */
 export function resolveCompactionPlan(params: ResolveCompactionPlanParams): CompactionPlan {
+  const glmAggressive = params.compactProfile === 'glm128k';
+  const compactEntryRatio = glmAggressive ? 0.38 : 0.45;
+  const compactEntryChars = glmAggressive ? 28_000 : 36_000;
+  const softTriggerRatio = glmAggressive ? 0.38 : 0.45;
   const toolChars = Math.max(0, params.toolResultChars || 0);
   const estimatedToolTokens = estimateTokensFromChars(toolChars);
   const budget =
@@ -62,28 +68,28 @@ export function resolveCompactionPlan(params: ResolveCompactionPlanParams): Comp
     // Soft ladders without an explicit budget
     if (toolChars >= 140_000) fillRatio = 0.95;
     else if (toolChars >= 80_000) fillRatio = 0.75;
-    else if (toolChars >= 36_000) fillRatio = 0.55;
-    else fillRatio = toolChars / 36_000;
+    else if (toolChars >= compactEntryChars) fillRatio = glmAggressive ? 0.58 : 0.55;
+    else fillRatio = toolChars / compactEntryChars;
     toolRatio = fillRatio;
   }
 
   const warnBudget = fillRatio >= 0.8;
   const trigger: CompactionPlan['trigger'] =
-    fillRatio < 0.45 && toolChars < 36_000
+    fillRatio < compactEntryRatio && toolChars < compactEntryChars
       ? 'none'
-      : budget && providerRatio >= 0.45 && providerRatio >= toolRatio * 0.95
-        ? toolRatio >= 0.45
+      : budget && providerRatio >= softTriggerRatio && providerRatio >= toolRatio * 0.95
+        ? toolRatio >= softTriggerRatio
           ? 'hybrid'
           : 'provider_tokens'
-        : toolRatio >= 0.45 || toolChars >= 36_000
-          ? budget && providerRatio >= 0.45
+        : toolRatio >= softTriggerRatio || toolChars >= compactEntryChars
+          ? budget && providerRatio >= softTriggerRatio
             ? 'hybrid'
             : 'tool_chars'
-          : budget && providerRatio >= 0.45
+          : budget && providerRatio >= softTriggerRatio
             ? 'provider_tokens'
             : 'none';
 
-  if (fillRatio < 0.45 && toolChars < 36_000) {
+  if (fillRatio < compactEntryRatio && toolChars < compactEntryChars) {
     return {
       shouldCompact: false,
       keepRecentMessages: 4,

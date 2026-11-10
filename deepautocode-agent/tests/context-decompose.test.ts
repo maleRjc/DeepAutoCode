@@ -15,6 +15,12 @@ describe('ContextCompaction', () => {
     const low = resolveCompactionPlan({ toolResultChars: 10_000 });
     expect(low.shouldCompact).toBe(false);
 
+    const glmEarly = resolveCompactionPlan({
+      toolResultChars: 30_000,
+      compactProfile: 'glm128k',
+    });
+    expect(glmEarly.shouldCompact).toBe(true);
+
     const mid = resolveCompactionPlan({ toolResultChars: 40_000 });
     expect(mid.shouldCompact).toBe(true);
     expect(mid.keepRecentMessages).toBe(4);

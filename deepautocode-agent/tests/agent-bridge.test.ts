@@ -923,6 +923,43 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
     expect(pdfTutorialIntent.intent).toBe('auto-action');
     expect(pdfTutorialIntent.allowFileMutations).toBe(true);
     expect(pdfTutorialIntent.reason).toBe('workspace-artifact-deliverable');
+
+    const forceAutoInPlanUi = classifyPromptIntent(
+      '[FORCE_AUTO_ACTION] 能帮我把LL和Simple协议的kernel执行过程的详细解说生成一份完整的pdf文档吗 ？'
+    );
+    expect(forceAutoInPlanUi.allowFileMutations).toBe(true);
+    expect(forceAutoInPlanUi.reason).toBe('explicit-force-auto-action');
+
+    const {
+      promptRequestsWorkspaceArtifact,
+      promptRequestsCompileRemediation,
+      assistantLacksRemediationPlan,
+    } = await import('../src/core/index.js');
+    expect(
+      promptRequestsWorkspaceArtifact(
+        '[FORCE_AUTO_ACTION] 生成一份完整的 pdf 教程'
+      )
+    ).toBe(true);
+    expect(
+      promptRequestsCompileRemediation(
+        '[FORCE_AUTO_ACTION] prims_ll.h:181: error: non-void function should return a value'
+      )
+    ).toBe(true);
+    expect(
+      promptRequestsCompileRemediation('[FORCE_AUTO_ACTION] 生成 pdf 教程')
+    ).toBe(false);
+    expect(assistantLacksRemediationPlan('Now I see the issue. The debug printf...')).toBe(true);
+    expect(
+      assistantLacksRemediationPlan('## 根因\n...\n## 修复步骤\n1. 删除 printf')
+    ).toBe(false);
+    expect(assistantLacksRemediationPlan('## Root Cause\n...\n## Fix Steps\n1. remove printf')).toBe(
+      false
+    );
+    expect(
+      assistantLacksRemediationPlan(
+        'Apply edit_file on `prims_ll.h:181` — 删除 debug printf，改为 return val;'
+      )
+    ).toBe(false);
   });
 
   it('Verifies autonomous browser_action tool execution and /browser workflow expansion', async () => {

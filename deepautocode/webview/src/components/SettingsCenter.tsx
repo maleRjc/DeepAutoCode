@@ -450,13 +450,15 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                           <input
                             className="settings-input"
                             list="dac-provider-model-presets"
-                            placeholder="例如 deepseek-flash / glm-4-plus 或自定义模型名称"
+                            placeholder="例如 GLM-5.3-Flash / deepseek-flash / glm-4-plus"
                             value={modelInput}
                             onChange={(e) => setModelInput(e.target.value)}
                           />
                           <datalist id="dac-provider-model-presets">
                             <option value="deepseek-flash" />
                             <option value="deepseek-v4-pro" />
+                            <option value="GLM-5.3-Flash" />
+                            <option value="glm-5.3-flash" />
                             <option value="glm-4-plus" />
                             <option value="glm-4-flash" />
                             <option value="glm-z1-flash" />

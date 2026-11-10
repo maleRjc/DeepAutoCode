@@ -11,6 +11,8 @@ import {
   parseToolArgumentsResilient,
   resolveGlmRequestControls,
   resolveModelContextBudget,
+  resolveModelMaxOutputTokens,
+  resolveNestedLlmMaxTokens,
 } from '../src/core/DeepSeekModels.js';
 import { resolveTieredModelForTurn } from '../src/core/GoalSteering.js';
 import { completeDeepSeekFim } from '../src/core/DeepSeekFim.js';
@@ -226,6 +228,18 @@ describe('DeepSeek FIM client', () => {
       userPrompt: '继续',
     });
     expect(healCtrl.enableThinking).toBe(true);
+
+    const compileFast = resolveGlmRequestControls({
+      modelId: 'GLM-5.3-Flash',
+      phase: 'exec',
+      turnIndex: 2,
+      hasFailure: true,
+      userPrompt: '[FORCE_AUTO_ACTION] prims_ll.h:181: error: should return a value',
+      compileRemediationTurn: true,
+      toolCallingTurn: true,
+    });
+    expect(compileFast.enableThinking).toBe(false);
+    expect(compileFast.reason).toBe('compile-remediation-fast');
     expect(healCtrl.temperature).toBe(0.6);
     expect(healCtrl.topP).toBe(0.95);
     expect(healCtrl.chatTemplateKwargs).toEqual({ enable_thinking: true });
@@ -234,6 +248,32 @@ describe('DeepSeek FIM client', () => {
     expect(resolveModelContextBudget({ modelId: 'GLM-5.3-Flash', configuredBudget: 180_000 })).toBe(
       96_000
     );
+    expect(
+      resolveModelMaxOutputTokens({
+        modelId: 'GLM-5.3-Flash',
+        catalogMaxOutput: 16_384,
+      })
+    ).toBe(16_384);
+    expect(resolveModelMaxOutputTokens({ modelId: 'GLM-5.3-Flash' })).toBe(16_384);
+    expect(resolveModelMaxOutputTokens({ modelId: 'glm-4-flash' })).toBe(8_192);
+    expect(
+      resolveNestedLlmMaxTokens({
+        modelId: 'GLM-5.3-Flash',
+        role: 'subagent',
+      })
+    ).toBe(8_192);
+    expect(
+      resolveNestedLlmMaxTokens({
+        modelId: 'glm-4-flash',
+        role: 'subagent',
+      })
+    ).toBeGreaterThanOrEqual(3_500);
+    expect(
+      resolveNestedLlmMaxTokens({
+        modelId: 'GLM-5.3-Flash',
+        role: 'synthesize',
+      })
+    ).toBeGreaterThanOrEqual(1_800);
     expect(resolveModelContextBudget({ modelId: 'deepseek-flash', configuredBudget: 180_000 })).toBe(
       180_000
     );

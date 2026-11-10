@@ -23,6 +23,7 @@ import {
   globalTaskTraceStore,
   type TraceTerminalStatus,
 } from '../core/trace/TaskTrace.js';
+import type { ComposerContextPlan } from '../core/ComposerContextRouter.js';
 import {
   DEEPSEEK_FLASH,
   buildDeepSeekRequestControls,
@@ -52,12 +53,16 @@ export interface ClineRuntimeEvent {
     | 'error'
     | 'sandbox_branch_created'
     | 'circuit_breaker_triggered'
+    | 'compile_remediation_exhausted'
+    | 'trace_exported'
     | 'artifact_created'
     | 'goal_usage'
     | 'trace_updated'
     | 'question_requested'
     | 'question_resolved'
-    | 'task_state_changed';
+    | 'task_state_changed'
+    | 'agent_progress'
+    | 'reasoning_delta';
   sessionId: string;
   payload: Record<string, unknown>;
 }
@@ -87,6 +92,7 @@ export interface SendPromptInput {
   modelId?: string;
   images?: Array<{ name?: string; dataUrl: string; mimeType?: string }>;
   signal?: AbortSignal;
+  contextPlan?: ComposerContextPlan;
 }
 
 /**
@@ -487,6 +493,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         manifest,
         prompt: input.prompt,
         images: input.images,
+        contextPlan: input.contextPlan,
         signal: abortController.signal,
         toolCalls,
         diffIds,
@@ -536,6 +543,26 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                 : undefined,
       });
       if (endEvt) emitTraceUpdated(endEvt);
+      void globalTaskTraceStore
+        .exportSnapshotToWorkspace({
+          workspaceRoot: manifest.workspaceRoot,
+          taskId,
+        })
+        .then((exp) => {
+          if (exp.ok && exp.filePath) {
+            this.emit({
+              type: 'trace_exported',
+              sessionId: input.sessionId,
+              payload: {
+                taskId: exp.taskId,
+                filePath: exp.filePath,
+                trigger: 'session_end',
+                terminalStatus: circuitTriggered ? 'circuit' : traceTerminal,
+              },
+            });
+          }
+        })
+        .catch(() => undefined);
     }
 
     const assistantSeq = (await this.readMessages(input.sessionId)).length + 1;
@@ -647,6 +674,7 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     manifest: SessionManifest;
     prompt: string;
     images?: Array<{ name?: string; dataUrl: string; mimeType?: string }>;
+    contextPlan?: ComposerContextPlan;
     signal: AbortSignal;
     toolCalls: ToolCallRecord[];
     diffIds: string[];
@@ -669,19 +697,25 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
     const chunks: string[] = [];
 
     const streamText = async (text: string) => {
-      const parts = text.match(/.{1,36}(\s|$)|.{1,36}/g) ?? [text];
-      for (const part of parts) {
-        if (signal.aborted) {
-          throw new Error('CAPABILITY_CANCELLED: Task aborted during streaming');
-        }
-        chunks.push(part);
-        this.emit({
-          type: 'text_delta',
-          sessionId,
-          payload: { delta: part },
-        });
-        await new Promise((r) => setTimeout(r, 5));
+      if (!text) return;
+      if (signal.aborted) {
+        throw new Error('CAPABILITY_CANCELLED: Task aborted during streaming');
       }
+      chunks.push(text);
+      this.emit({
+        type: 'text_delta',
+        sessionId,
+        payload: { delta: text },
+      });
+    };
+
+    const streamReasoning = async (text: string) => {
+      if (!text || signal.aborted) return;
+      this.emit({
+        type: 'reasoning_delta',
+        sessionId,
+        payload: { delta: text },
+      });
     };
 
     const policyGate: {
@@ -913,10 +947,12 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
           manifest,
           prompt,
           images,
+          contextPlan: params.contextPlan,
           apiKey: apiKey.trim(),
           signal,
           chunks,
           streamText,
+          streamReasoning,
           runCapabilityTool,
           diffIds,
           taskId,
@@ -930,9 +966,15 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         if (chunks.join('').trim().length > 0 || diffIds.length > 0 || toolCalls.length > 0) {
           if (chunks.join('').trim().length === 0) {
             const writtenFiles = toolCalls
-              .filter((tc) => tc.toolName === 'write-file' && tc.status === 'completed')
-              .map((tc) => `\`${String(tc.args?.filePath || '')}\``)
-              .filter(Boolean);
+              .filter(
+                (tc) =>
+                  /^(write[-_]file|write_artifact|editor)$/i.test(String(tc.toolName || '')) &&
+                  tc.status === 'completed'
+              )
+              .map((tc) =>
+                `\`${String(tc.args?.filePath || tc.args?.path || tc.args?.title || 'artifact')}\``
+              )
+              .filter((p) => p !== '``');
             const wantedArtifact =
               /(?:生成|导出|pdf|文档|教程|markdown|\.md|write_file|写一份)/i.test(prompt) ||
               /\[FORCE_AUTO_ACTION\]/i.test(prompt);
@@ -942,9 +984,9 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
                 ? `- **已生成/更新文件 (${writtenFiles.length})**: ${writtenFiles.join('、')}`
                 : `- **已完成工具调用**: 共执行 ${toolCalls.length} 步工作区操作`,
               writtenFiles.length === 0 && wantedArtifact
-                ? `- **⚠️ 未写入任何文件**：若目标是生成 PDF/文档，请确认 Composer 为 **Auto** 模式（非 Plan/只读），并避免使用「仅查询」；只读模式下只能调查源码，无法 write_file。`
+                ? `- **⚠️ 未写入任何文件**：模型在 Auto 下仍未调用 write_file（可能停留在 grep/pandoc 探测）。请重试并明确要求路径如 docs/tutorials/*.md；或展开工具详情确认 POLICY_DENIED。`
                 : writtenFiles.length === 0 && toolCalls.length >= 15
-                  ? `- **⚠️ 工具步骤较多 (${toolCalls.length}) 但无文件产出**：可能卡在 Plan 只读或命令被 CommandGuard 拦截；请展开工具详情查看 POLICY_DENIED，并切换到 Auto 后重试。`
+                  ? `- **⚠️ 工具步骤较多 (${toolCalls.length}) 但无文件产出**：请减少重复 run_command，要求 Agent 先 write_file 完整 Markdown 再转 PDF。`
                   : '',
               diffIds.length > 0
                 ? `- **代码变更审查**: 已生成 ${diffIds.length} 项文件变更记录，可在下方卡片或编辑器中点击 **Accept** / **Reject**`
@@ -959,6 +1001,12 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
         if (errMsg.includes('401') || /Authentication Fails|invalid.*api.*key/i.test(errMsg)) {
           authFailedNotice =
             `> ⚠️ **DeepSeek API Key 未通过验证 (HTTP 401)**：请在 **⚙️ Settings -> Models & Providers** 中粘贴有效密钥，并点击 **⚡ Test AI Key (测试 AI 调用)** 确认连接正常。\n\n`;
+        } else if (/timed out after/i.test(errMsg)) {
+          authFailedNotice =
+            `> ⚠️ **模型 HTTP 超时**：${errMsg}。\n` +
+            `常见原因：① GLM/Reasoner 单轮响应较慢（已加长超时并重试）；② 误用 \`read_file\` 读取 PDF/二进制导致上下文暴涨。\n` +
+            `建议：改读对应 \`.md\` 源文件，或在 Settings 换更快模型；远端工作区请确认 API 可达。\n` +
+            `（以下为本机只读结构分析，不能替代云端 Agent 工具链。）\n\n`;
         } else {
           authFailedNotice = `> ⚠️ **云端模型调用提示**：${errMsg}（已自动切换至本地结构化分析引擎）\n\n`;
         }

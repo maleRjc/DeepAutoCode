@@ -1,5 +1,5 @@
 import type React from 'react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { marksFromDiffRecord, type DiffLineKind } from '../../../src/diff-line-marks';
 import {
   parseDiffHunks,
@@ -31,6 +31,8 @@ import {
   wordAtCursor,
   detectUiPromptIntent as detectUiPromptIntentUtil,
   promptWantsWorkspaceArtifact,
+  resolveComposerContextPlan,
+  shouldForkComposerSession,
   buildCheckpointContentDiff,
   formatToolStepLabel,
   parseDiffToSplitRows,
@@ -39,6 +41,14 @@ import {
   formatLatexMathText,
   extractLatestSourceRefFromText as extractLatestSourceRefFromTextUtil,
   extractCompactExecutiveSummary as extractCompactExecutiveSummaryUtil,
+  readGlmThinkingPanelPref,
+  writeGlmThinkingPanelPref,
+  extractLastContinuation,
+  formatContinuationStatusLabel,
+  shouldShowContinuationAlert,
+  continuationAlertLevel,
+  isCompileContinuationCase,
+  buildCompileRemediationFollowUpPrompt,
   getFileVisualMeta,
   renderSyntaxHighlightedLine as renderSyntaxHighlightedLineUtil,
 } from '../utils/workbenchUtils';
@@ -256,6 +266,12 @@ export function useWorkbenchController() {
   const [activeSessionId, setActiveSessionId] = useState<string>('');
   const [messages, setMessages] = useState<any[]>([]);
   const [streamingText, setStreamingText] = useState<string>('');
+  const [streamingReasoningText, setStreamingReasoningText] = useState<string>('');
+  const [showReasoningPanel, setShowReasoningPanel] = useState<boolean>(false);
+  const [goalContextPressure, setGoalContextPressure] = useState<{
+    fillRatio: number;
+    warn: boolean;
+  }>({ fillRatio: 0, warn: false });
   const [liveToolCalls, setLiveToolCalls] = useState<any[]>([]);
   /** Click-to-expand live processing steps (PROCESSING card) */
   const [showLiveSteps, setShowLiveSteps] = useState<boolean>(false);
@@ -295,6 +311,9 @@ export function useWorkbenchController() {
     effectiveModelId?: string;
     tier?: string;
     reason?: string;
+    glmControlReason?: string;
+    contextFillRatio?: number;
+    compactProfile?: string;
     thinkingEnabled?: boolean;
     reasoningEffort?: string | null;
     peakHour?: boolean;
@@ -309,6 +328,21 @@ export function useWorkbenchController() {
     peakHour: boolean;
   } | null>(null);
   const [activeTaskTrace, setActiveTaskTrace] = useState<any | null>(null);
+  const [recentTaskTraces, setRecentTaskTraces] = useState<any[]>([]);
+  const [lastContinuationHint, setLastContinuationHint] = useState<{
+    caseId: string;
+    summary: string;
+    ts?: string;
+    selfHealCount?: number;
+    compileRemediationContinuationCount?: number;
+    sessionWrites?: number;
+  } | null>(null);
+  const [continuationAlert, setContinuationAlert] = useState<{
+    caseId: string;
+    summary: string;
+    level: 'warn' | 'error';
+  } | null>(null);
+  const [compileFollowUpPrompt, setCompileFollowUpPrompt] = useState<string | null>(null);
   const [pendingPromptQueue, setPendingPromptQueue] = useState<
     Array<{ prompt: string; mode?: 'plan' | 'auto' | 'manual' }>
   >([]);
@@ -367,6 +401,7 @@ export function useWorkbenchController() {
   const lastSeqBySessionRef = useRef<Record<string, number>>({});
   const activeSessionIdRef = useRef<string>('');
   const bootstrappedRef = useRef<boolean>(false);
+  const aiMessagesStreamRef = useRef<HTMLDivElement | null>(null);
   const aiMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const codeGutterRef = useRef<HTMLDivElement | null>(null);
   const codeHighlightRef = useRef<HTMLDivElement | null>(null);
@@ -374,9 +409,37 @@ export function useWorkbenchController() {
   const [workspaceSectionOpen, setWorkspaceSectionOpen] = useState<boolean>(true);
   const [expandedMessageIds, setExpandedMessageIds] = useState<Record<string, boolean>>({});
 
+  const scrollComposerToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    const run = () => {
+      const stream = aiMessagesStreamRef.current;
+      if (stream) {
+        stream.scrollTop = stream.scrollHeight;
+      } else {
+        aiMessagesEndRef.current?.scrollIntoView({ behavior, block: 'end' });
+      }
+    };
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => requestAnimationFrame(run));
+    } else {
+      run();
+    }
+  }, []);
+
   useEffect(() => {
-    aiMessagesEndRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
-  }, [messages.length, pendingApprovals.length]);
+    if (aiTab !== 'composer' || !showRightAiDock) return;
+    scrollComposerToBottom('auto');
+  }, [
+    aiTab,
+    showRightAiDock,
+    activeSessionId,
+    messages,
+    streamingText,
+    streamingReasoningText,
+    liveToolCalls,
+    isSendingPrompt,
+    pendingApprovals.length,
+    scrollComposerToBottom,
+  ]);
 
   const currentTheme = ideSettings.editor?.theme ?? initialStartupTheme;
   const isLightTheme = currentTheme === 'cursor-light' || currentTheme === 'light';
@@ -1822,8 +1885,22 @@ export function useWorkbenchController() {
         markSessionRunning(sid, true);
         setStreamingText((prev) => prev + String(ev.payload.delta ?? ''));
         break;
+      case 'assistant.reasoning.delta':
+        markSessionRunning(sid, true);
+        setStreamingReasoningText((prev) => prev + String(ev.payload.delta ?? ''));
+        setShowReasoningPanel((open) => {
+          if (open) return true;
+          return (
+            goalContextPressure.warn ||
+            goalContextPressure.fillRatio >= 0.72 ||
+            Boolean(lastModelTier?.thinkingEnabled)
+          );
+        });
+        break;
       case 'assistant.text.done':
         setStreamingText('');
+        setStreamingReasoningText('');
+        setShowReasoningPanel(false);
         setLiveToolCalls([]);
         markSessionRunning(sid, false);
         setIsSendingPrompt(false);
@@ -1886,6 +1963,11 @@ export function useWorkbenchController() {
         }
         break;
       }
+      case 'agent.progress':
+        if (isActive && ev.payload?.message) {
+          appendLog(`[Agent] ${String(ev.payload.message)}`);
+        }
+        break;
       case 'diff.updated':
         setDiffs((prev) => {
           const exists = prev.some((d) => d.diffId === ev.payload.diffId);
@@ -1899,6 +1981,18 @@ export function useWorkbenchController() {
           effectiveModelId: String(ev.payload.effectiveModelId || ''),
           tier: String(ev.payload.tier || ''),
           reason: String(ev.payload.reason || ''),
+          glmControlReason:
+            typeof ev.payload.glmControlReason === 'string'
+              ? String(ev.payload.glmControlReason)
+              : undefined,
+          contextFillRatio:
+            typeof ev.payload.contextFillRatio === 'number'
+              ? Number(ev.payload.contextFillRatio)
+              : undefined,
+          compactProfile:
+            typeof ev.payload.compactProfile === 'string'
+              ? String(ev.payload.compactProfile)
+              : undefined,
           thinkingEnabled: Boolean(ev.payload.thinkingEnabled),
           reasoningEffort:
             ev.payload.reasoningEffort == null
@@ -1906,6 +2000,12 @@ export function useWorkbenchController() {
               : String(ev.payload.reasoningEffort),
           peakHour: Boolean(ev.payload.peakHour),
         });
+        if (typeof ev.payload.contextFillRatio === 'number') {
+          setGoalContextPressure((prev) => ({
+            fillRatio: Number(ev.payload.contextFillRatio),
+            warn: prev.warn || Number(ev.payload.contextFillRatio) >= 0.78,
+          }));
+        }
         if (
           typeof ev.payload.tokensUsed === 'number' ||
           typeof ev.payload.tokenBudget === 'number'
@@ -1928,6 +2028,12 @@ export function useWorkbenchController() {
       case 'goal.usage': {
         const used = Number(ev.payload.tokensUsed ?? 0);
         const budget = Number(ev.payload.tokenBudget ?? 180000);
+        const fillRatio = Number(ev.payload.fillRatio ?? (budget > 0 ? used / budget : 0));
+        const warnBudget = Boolean(ev.payload.warnBudget || ev.payload.contextPressure);
+        setGoalContextPressure({ fillRatio, warn: warnBudget });
+        if (warnBudget || fillRatio >= 0.78) {
+          setShowReasoningPanel(true);
+        }
         setGoalTokenUsage((prev) => {
           const turnCacheRead = Number(ev.payload.cacheReadTokens ?? 0);
           const turnCacheWrite = Number(ev.payload.cacheWriteTokens ?? 0);
@@ -1959,6 +2065,96 @@ export function useWorkbenchController() {
       case 'trace.updated': {
         if (isActive && ev.payload?.snapshot) {
           setActiveTaskTrace(ev.payload.snapshot);
+          const hint = extractLastContinuation(ev.payload.snapshot?.events);
+          if (hint) setLastContinuationHint(hint);
+        }
+        const traceEvt = ev.payload?.event;
+        if (
+          isActive &&
+          traceEvt?.kind === 'agent.signal' &&
+          traceEvt?.signal === 'continuation'
+        ) {
+          const d = traceEvt.detail || {};
+          const caseId = String(d.case || 'unknown');
+          const summary = String(traceEvt.summary || '');
+          setLastContinuationHint({
+            caseId,
+            summary,
+            ts: traceEvt.ts,
+            selfHealCount: typeof d.selfHealCount === 'number' ? d.selfHealCount : undefined,
+            compileRemediationContinuationCount:
+              typeof d.compileRemediationContinuationCount === 'number'
+                ? d.compileRemediationContinuationCount
+                : undefined,
+            sessionWrites: typeof d.sessionWrites === 'number' ? d.sessionWrites : undefined,
+          });
+          if (isCompileContinuationCase(caseId)) {
+            setShowReasoningPanel(true);
+          }
+          if (shouldShowContinuationAlert(caseId)) {
+            setContinuationAlert({
+              caseId,
+              summary,
+              level: continuationAlertLevel(caseId),
+            });
+            setStatusNotice(`Agent 续跑: ${formatContinuationStatusLabel({
+              caseId,
+              summary,
+              compileRemediationContinuationCount:
+                typeof d.compileRemediationContinuationCount === 'number'
+                  ? d.compileRemediationContinuationCount
+                  : undefined,
+              selfHealCount: typeof d.selfHealCount === 'number' ? d.selfHealCount : undefined,
+            })}`);
+          }
+        }
+        if (isActive) {
+          void refreshTaskTraceList(12);
+        }
+        break;
+      }
+      case 'compile.remediation.exhausted': {
+        if (!isActive) break;
+        const hints = Array.isArray(ev.payload?.hints)
+          ? (ev.payload.hints as string[]).filter(Boolean)
+          : [];
+        const summary = String(
+          ev.payload?.message ||
+            '编译续跑已达上限，请按建议手动发起下一轮。'
+        );
+        setContinuationAlert({
+          caseId: 'compile_remediation_exhausted',
+          summary:
+            hints.length > 0 ? `${summary}\n${hints.map((h, i) => `${i + 1}. ${h}`).join('\n')}` : summary,
+          level: 'error',
+        });
+        setLastContinuationHint({
+          caseId: 'compile_remediation_exhausted',
+          summary,
+        });
+        setShowReasoningPanel(true);
+        setAiTab('composer');
+        const followUp = String(ev.payload?.followUpPrompt || '').trim();
+        if (followUp) {
+          setCompileFollowUpPrompt(followUp);
+        } else {
+          setCompileFollowUpPrompt(
+            buildCompileRemediationFollowUpPrompt({
+              failureSnippet: String(ev.payload?.failureSnippet || ''),
+            })
+          );
+        }
+        setStatusNotice('编译自愈续跑已达上限 — 查看 Composer 横幅建议');
+        void refreshTaskTrace();
+        break;
+      }
+      case 'trace.exported': {
+        if (!isActive) break;
+        const filePath = String(ev.payload?.filePath || '');
+        if (filePath) {
+          setStatusNotice(`Trace 已自动保存: ${filePath}`);
+          appendLog(`[Trace] auto-exported → ${filePath}`);
+          void refreshWorkspaceTree();
         }
         break;
       }
@@ -2080,13 +2276,16 @@ export function useWorkbenchController() {
     setIsSendingPrompt(runningSessionIdsRef.current.has(sessionId));
   }
 
-  async function handleCreateSession(initialPrompt?: string) {
+  async function handleCreateSession(
+    initialPrompt?: string,
+    options?: { skipInitialRun?: boolean }
+  ) {
     const folderName = workspaceRoot ? workspaceRoot.split(/[\\/]/).pop() : 'Workspace';
     const created = await bridge.request<any>('session.create', {
       title: initialPrompt
         ? initialPrompt.slice(0, 28)
         : `${folderName} Session ${sessions.length + 1}`,
-      prompt: initialPrompt,
+      prompt: options?.skipInitialRun ? undefined : initialPrompt,
       workspaceRoot: workspaceRoot || undefined,
       executionMode,
       modelId: modelInput || undefined,
@@ -2267,12 +2466,20 @@ export function useWorkbenchController() {
     setAttachedImages([]);
     setPromptInput('');
     setStreamingText('');
+    setStreamingReasoningText('');
+    {
+      const thinkingPref = readGlmThinkingPanelPref(modelInput);
+      setShowReasoningPanel(thinkingPref === 'open');
+    }
     setLiveToolCalls([]);
     setGoalTokenUsage(null);
     setIsSendingPrompt(true);
     // Capture the session this turn belongs to (parallel-safe finally cleanup)
     let turnSessionId = sendSessionId;
     if (turnSessionId) markSessionRunning(turnSessionId, true);
+    setLastContinuationHint(null);
+    setContinuationAlert(null);
+    setCompileFollowUpPrompt(null);
     setStatusNotice('Agent is thinking and executing tools...');
 
     let finalPrompt = raw;
@@ -2373,10 +2580,38 @@ export function useWorkbenchController() {
       finalPrompt = `[Context Active File: ${activeTab.path}]\n${finalPrompt}`;
     }
 
+    const autoForkLowRelation =
+      typeof localStorage === 'undefined' ||
+      localStorage.getItem('dac.autoNewSessionOnIntentSwitch') !== 'false';
+    const contextPlan = resolveComposerContextPlan({
+      newPrompt: raw,
+      messages: messages.map((m) => ({
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : '',
+      })),
+      allowFork: autoForkLowRelation,
+    });
+    if (
+      autoForkLowRelation &&
+      contextPlan.mode === 'fork_session' &&
+      turnSessionId &&
+      messages.length >= 1
+    ) {
+      setStatusNotice(`🧭 ${contextPlan.reason}`);
+      await handleCreateSession(raw.slice(0, 40), { skipInitialRun: true });
+      turnSessionId = activeSessionIdRef.current;
+      if (turnSessionId) markSessionRunning(turnSessionId, true);
+      contextPlan.mode = 'continue_full';
+      contextPlan.historyMessagePairs = 0;
+      contextPlan.includeToolAudit = false;
+    } else if (messages.length >= 1) {
+      setStatusNotice(`🧭 ${contextPlan.reason}`);
+    }
+
     // Optimistically append user message immediately so the user sees instant feedback
     const optimisticUserMsg = {
       id: `optimistic_u_${Date.now()}`,
-      sessionId: activeSessionId || 'pending',
+      sessionId: turnSessionId || activeSessionId || 'pending',
       role: 'user',
         content: raw,
         images: imagesToSend.length > 0 ? imagesToSend : undefined,
@@ -2401,6 +2636,7 @@ export function useWorkbenchController() {
                 executionMode: effectiveMode,
                 modelId: modelInput || undefined,
                 images: imagesToSend.length > 0 ? imagesToSend : undefined,
+                contextPlan,
               },
               turnSessionId
             );
@@ -2539,8 +2775,73 @@ export function useWorkbenchController() {
     try {
       const snap = await bridge.request<any>('trace.get', { sessionId: sid }, sid);
       setActiveTaskTrace(snap || null);
+      const hint = extractLastContinuation(snap?.events);
+      if (hint) setLastContinuationHint(hint);
     } catch {
       setActiveTaskTrace(null);
+    }
+  }
+
+  async function refreshTaskTraceList(limit = 16) {
+    try {
+      const list = await bridge.request<any[]>('trace.list', { limit });
+      setRecentTaskTraces(Array.isArray(list) ? list : []);
+    } catch {
+      setRecentTaskTraces([]);
+    }
+  }
+
+  async function loadTaskTraceById(taskId: string) {
+    if (!taskId) {
+      await refreshTaskTrace();
+      return;
+    }
+    try {
+      const snap = await bridge.request<any>('trace.get', { taskId });
+      setActiveTaskTrace(snap || null);
+      const hint = extractLastContinuation(snap?.events);
+      if (hint) setLastContinuationHint(hint);
+    } catch {
+      setActiveTaskTrace(null);
+    }
+  }
+
+  function applyCompileFollowUpToComposer(prompt?: string) {
+    const text = (
+      prompt ||
+      compileFollowUpPrompt ||
+      buildCompileRemediationFollowUpPrompt()
+    ).trim();
+    if (!text) return;
+    setPromptInput(text);
+    setExecutionMode('auto');
+    setManualIntentChoice('auto-action');
+    setAiTab('composer');
+    setStatusNotice('已填入编译修复跟进 prompt — 检查后即可发送');
+  }
+
+  async function exportTaskTraceSnapshot(params?: { taskId?: string; sessionId?: string }) {
+    const sid = params?.sessionId || activeSessionId;
+    try {
+      const res = await bridge.request<{ ok: boolean; filePath?: string; error?: string }>(
+        'trace.exportSnapshot',
+        {
+          taskId: params?.taskId || activeTaskTrace?.taskId,
+          sessionId: sid,
+        },
+        sid || undefined
+      );
+      if (res?.ok && res.filePath) {
+        setStatusNotice(`Trace 已保存: ${res.filePath}`);
+        appendLog(`[Trace] exported → ${res.filePath}`);
+        void refreshWorkspaceTree();
+        return res.filePath;
+      }
+      setStatusNotice(res?.error ? `Trace 导出失败: ${res.error}` : 'Trace 导出失败');
+      return null;
+    } catch (err) {
+      setStatusNotice(`Trace 导出失败: ${(err as Error).message}`);
+      return null;
     }
   }
 
@@ -3312,6 +3613,8 @@ export function useWorkbenchController() {
     activeSessionId, setActiveSessionId,
     messages, setMessages,
     streamingText, setStreamingText,
+    streamingReasoningText, setStreamingReasoningText,
+    showReasoningPanel, setShowReasoningPanel,
     liveToolCalls, setLiveToolCalls,
     showLiveSteps, setShowLiveSteps,
     pendingApprovals, setPendingApprovals,
@@ -3336,7 +3639,13 @@ export function useWorkbenchController() {
     sessionCheckpoints, setSessionCheckpoints,
     lastModelTier, setLastModelTier,
     goalTokenUsage, setGoalTokenUsage,
+    goalContextPressure, setGoalContextPressure,
     activeTaskTrace, setActiveTaskTrace,
+    recentTaskTraces, setRecentTaskTraces,
+    lastContinuationHint, setLastContinuationHint,
+    continuationAlert, setContinuationAlert,
+    compileFollowUpPrompt, setCompileFollowUpPrompt,
+    applyCompileFollowUpToComposer,
     pendingPromptQueue, setPendingPromptQueue,
     hunkDecisions, setHunkDecisions,
     mentionActiveIndex, setMentionActiveIndex,
@@ -3373,7 +3682,10 @@ export function useWorkbenchController() {
     sshBrowseData, setSshBrowseData,
     workspaceSectionOpen, setWorkspaceSectionOpen,
     expandedMessageIds, setExpandedMessageIds,
-    aiMessagesEndRef, codeGutterRef, codeHighlightRef, codeTextareaRef,
+    aiMessagesStreamRef,
+    aiMessagesEndRef,
+    scrollComposerToBottom,
+    codeGutterRef, codeHighlightRef, codeTextareaRef,
     currentTheme, isLightTheme, locale, t, tr, displayWorkspaceName,
     activeTab, codeLines, pendingDiffForActive, pendingDiffMarks,
     bridge,
@@ -3394,7 +3706,9 @@ export function useWorkbenchController() {
     handleAutoBuildDiagnoseAndFix, handleQuestionResponseSubmit,
     handleManageBackgroundTask, handleAttachImageFiles, handleSendPrompt,
     handleApprovalDecision, addContextChip, loadCheckpointPreviewDiffs,
-    refreshSessionCheckpoints, refreshTaskTrace, handleReviewAllPending,
+    refreshSessionCheckpoints, refreshTaskTrace, refreshTaskTraceList, loadTaskTraceById,
+    exportTaskTraceSnapshot,
+    handleReviewAllPending,
     handleStopAgent, handleDiffReview, getDiffHunks, handleHunkDecision,
     handleSimulateExtensionHostRestart, handleExportDiagnostics, handleTestAiKey,
     openSshConnectionModal, parseQuickSshCommand, handleTestSshConnection,
