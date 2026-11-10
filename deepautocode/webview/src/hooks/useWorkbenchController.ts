@@ -866,6 +866,9 @@ export function useWorkbenchController() {
       setBackendStatus(back);
 
       if (currentWsRoot) {
+        setLiveToolCalls([]);
+        setIsSendingPrompt(false);
+        setStreamingText('');
         setShowLeftSidebar(true);
         setShowRightAiDock(true);
         const normRoot = (p: string) => (p || '').replace(/\\/g, '/').toLowerCase();
@@ -1006,6 +1009,9 @@ export function useWorkbenchController() {
       // Clear tabs from previous project (keep Settings tab if open)
       setTabs((prev) => prev.filter((t) => t.kind === 'settings'));
       setActiveTabPath('');
+      setLiveToolCalls([]);
+      setIsSendingPrompt(false);
+      setStreamingText('');
 
       // Open a representative file from the newly opened project
       const nextFiles: string[] = Array.isArray(res.files) ? res.files : [];

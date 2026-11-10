@@ -1664,7 +1664,7 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                   );
                 })}
 
-                {(isSendingPrompt || liveToolCalls.length > 0) && (
+                {isSendingPrompt && (
                   <div className="progress-live-card">
                     <div
                       role="button"
