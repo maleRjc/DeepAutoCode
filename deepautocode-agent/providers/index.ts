@@ -1030,7 +1030,12 @@ export class ProviderManager {
       secretKeyRef: `deepautocode.provider.${input.providerId}.apiKey`,
     };
 
-    const nextEndpoint = input.apiEndpoint?.trim() || existing.apiEndpoint;
+    const rawEndpoint = input.apiEndpoint?.trim() || existing.apiEndpoint;
+    const nextEndpoint = /^https?:\/\//i.test(rawEndpoint)
+      ? rawEndpoint
+      : /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.0\.0\.1|localhost)/i.test(rawEndpoint)
+        ? `http://${rawEndpoint}`
+        : `https://${rawEndpoint}`;
     const nextModelId = input.modelId?.trim() || existing.defaultModelId;
 
     const updated: ProviderConfig = {

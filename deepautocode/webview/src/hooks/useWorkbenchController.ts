@@ -2773,19 +2773,31 @@ export function useWorkbenchController() {
     setStatusNotice(`正在测试模型连通性 (${selectedProviderId} / ${modelInput})...`);
     try {
       // Always persist the selected provider, endpoint, model, and optional key before running the smoke test
+      const rawEndpoint = endpointInput.trim();
       const isLocalEndpoint =
         /^(?:https?:\/\/)?(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.0\.0\.1|localhost)/i.test(
-          endpointInput.trim()
+          rawEndpoint
         );
+      const nextEndpoint = !rawEndpoint
+        ? ''
+        : /^https?:\/\//i.test(rawEndpoint)
+          ? rawEndpoint
+          : isLocalEndpoint
+            ? `http://${rawEndpoint}`
+            : `https://${rawEndpoint}`;
+      if (nextEndpoint && nextEndpoint !== endpointInput) {
+        setEndpointInput(nextEndpoint);
+      }
       const saved = await bridge.request('provider.update', {
         providerId: selectedProviderId,
-        apiEndpoint: endpointInput,
-        modelId: modelInput,
+        apiEndpoint: nextEndpoint,
+        modelId: modelInput.trim(),
         apiKey:
           apiKeyInput.trim() ||
           (selectedProviderId === 'glm' || isLocalEndpoint ? 'EMPTY' : undefined),
       });
-      setProviderData((prev: any) => ({ ...prev, active: saved.active }));
+      const refreshed = await bridge.request<any>('provider.get').catch(() => null);
+      setProviderData(refreshed || ((prev: any) => ({ ...prev, active: saved.active })));
       if (apiKeyInput.trim()) {
         setApiKeyInput('');
       }

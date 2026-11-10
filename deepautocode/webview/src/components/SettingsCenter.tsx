@@ -181,6 +181,13 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
     renderFormattedMarkdown,
   } = ctx;
 
+  const [isSavingProvider, setIsSavingProvider] = React.useState(false);
+  const [providerSaveNotice, setProviderSaveNotice] = React.useState<{
+    ok: boolean;
+    message: string;
+    detail?: string;
+  } | null>(null);
+
 
   return (
               <div
@@ -494,81 +501,155 @@ export function SettingsCenter({ ctx }: { ctx: any }) {
                         <div style={{ display: 'flex', gap: 10, marginTop: 14, flexWrap: 'wrap' }}>
                           <button
                             className="btn primary"
+                            disabled={isSavingProvider}
                             onClick={async () => {
-                              const nextEndpoint = endpointInput.trim();
-                              const nextModel = modelInput.trim();
-                              const isLocalEndpoint =
-                                /^(?:https?:\/\/)?(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.0\.0\.1|localhost)/i.test(
-                                  nextEndpoint
-                                );
-                              const effectiveKey =
-                                apiKeyInput.trim() ||
-                                (selectedProviderId === 'glm' || isLocalEndpoint
-                                  ? 'EMPTY'
-                                  : undefined);
-                              const res = await bridge.request('provider.update', {
-                                providerId: selectedProviderId,
-                                apiEndpoint: nextEndpoint,
-                                modelId: nextModel,
-                                apiKey: effectiveKey,
-                              });
-                              // Also keep ~/.claude/settings.json universally compatible with current settings
-                              const claudeResp = await fetch('/api/claude-settings', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
+                              setIsSavingProvider(true);
+                              setProviderSaveNotice(null);
+                              setSmokeResult(null);
+                              try {
+                                const rawEndpoint = endpointInput.trim();
+                                const isLocalEndpoint =
+                                  /^(?:https?:\/\/)?(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|127\.0\.0\.1|localhost)/i.test(
+                                    rawEndpoint
+                                  );
+                                const nextEndpoint = !rawEndpoint
+                                  ? ''
+                                  : /^https?:\/\//i.test(rawEndpoint)
+                                    ? rawEndpoint
+                                    : isLocalEndpoint
+                                      ? `http://${rawEndpoint}`
+                                      : `https://${rawEndpoint}`;
+                                if (nextEndpoint && nextEndpoint !== endpointInput) {
+                                  setEndpointInput(nextEndpoint);
+                                }
+                                const nextModel = modelInput.trim();
+                                const effectiveKey =
+                                  apiKeyInput.trim() ||
+                                  (selectedProviderId === 'glm' || isLocalEndpoint
+                                    ? 'EMPTY'
+                                    : undefined);
+                                const res = await bridge.request('provider.update', {
                                   providerId: selectedProviderId,
-                                  authToken: effectiveKey || 'EMPTY',
-                                  baseUrl: nextEndpoint,
-                                  defaultModel: nextModel,
-                                  opusModel: nextModel,
-                                  sonnetModel: nextModel,
-                                  haikuModel: nextModel,
-                                }),
-                              })
-                                .then((r) => r.json())
-                                .catch(() => null);
-                              if (sshStatus?.connected && claudeResp?.config) {
-                                const jsonText = JSON.stringify(claudeResp.config, null, 2);
-                                const b64 = btoa(unescape(encodeURIComponent(jsonText)));
-                                await bridge
-                                  .request(
-                                    'capability.invoke',
-                                    {
-                                      capability: 'run-build',
-                                      executionMode: 'auto',
-                                      params: {
-                                        command: `mkdir -p ~/.claude && echo '${b64}' | base64 -d > ~/.claude/settings.json`,
-                                      },
-                                    },
-                                    activeSessionId || undefined
-                                  )
+                                  apiEndpoint: nextEndpoint,
+                                  modelId: nextModel,
+                                  apiKey: effectiveKey,
+                                });
+                                // Also keep ~/.claude/settings.json universally compatible with current settings
+                                const claudeResp = await fetch('/api/claude-settings', {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({
+                                    providerId: selectedProviderId,
+                                    authToken: effectiveKey || 'EMPTY',
+                                    baseUrl: nextEndpoint,
+                                    defaultModel: nextModel,
+                                    opusModel: nextModel,
+                                    sonnetModel: nextModel,
+                                    haikuModel: nextModel,
+                                  }),
+                                })
+                                  .then((r) => r.json())
                                   .catch(() => null);
+                                if (sshStatus?.connected && claudeResp?.config) {
+                                  const jsonText = JSON.stringify(claudeResp.config, null, 2);
+                                  const b64 = btoa(unescape(encodeURIComponent(jsonText)));
+                                  await bridge
+                                    .request(
+                                      'capability.invoke',
+                                      {
+                                        capability: 'run-build',
+                                        executionMode: 'auto',
+                                        params: {
+                                          command: `mkdir -p ~/.claude && echo '${b64}' | base64 -d > ~/.claude/settings.json`,
+                                        },
+                                      },
+                                      activeSessionId || undefined
+                                    )
+                                    .catch(() => null);
+                                }
+                                const refreshed = await bridge
+                                  .request<any>('provider.get')
+                                  .catch(() => null);
+                                setProviderData(
+                                  refreshed || { ...providerData, active: res.active }
+                                );
+                                setApiKeyInput('');
+                                const savedEndpoint =
+                                  res?.updated?.apiEndpoint ||
+                                  res?.active?.provider?.apiEndpoint ||
+                                  nextEndpoint;
+                                const savedModel =
+                                  res?.updated?.defaultModelId ||
+                                  res?.active?.model?.modelId ||
+                                  nextModel;
+                                setProviderSaveNotice({
+                                  ok: true,
+                                  message: `✅ Provider 配置已保存 (${selectedProviderId} / ${savedModel})`,
+                                  detail: `接口地址：${savedEndpoint}`,
+                                });
+                                setStatusNotice(
+                                  `已保存模型配置 (${selectedProviderId} / ${savedModel})`
+                                );
+                              } catch (err) {
+                                const msg = (err as Error)?.message || String(err);
+                                setProviderSaveNotice({
+                                  ok: false,
+                                  message: `❌ 保存 Provider 配置失败`,
+                                  detail: msg,
+                                });
+                                setStatusNotice(`保存模型配置失败: ${msg}`);
+                              } finally {
+                                setIsSavingProvider(false);
                               }
-                              const refreshed = await bridge
-                                .request<any>('provider.get')
-                                .catch(() => null);
-                              setProviderData(
-                                refreshed || { ...providerData, active: res.active }
-                              );
-                              setApiKeyInput('');
-                              setStatusNotice(
-                                `已保存模型配置 (${selectedProviderId} / ${nextModel})`
-                              );
                             }}
                           >
-                            {t('settings.models.save')}
+                            {isSavingProvider ? '⏳ 正在保存...' : t('settings.models.save')}
                           </button>
                           <button
                             className="btn"
                             disabled={isTestingKey}
-                            onClick={() => void handleTestAiKey()}
+                            onClick={() => {
+                              setProviderSaveNotice(null);
+                              void handleTestAiKey();
+                            }}
                           >
                             {isTestingKey
                               ? t('settings.models.verifying')
                               : t('settings.models.testFull')}
                           </button>
                         </div>
+
+                        {providerSaveNotice && !smokeResult && (
+                          <div
+                            className={`ai-key-test-banner ${
+                              providerSaveNotice.ok ? 'ok' : 'fail'
+                            }`}
+                          >
+                            <div
+                              style={{
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'center',
+                              }}
+                            >
+                              <strong style={{ fontSize: 13 }}>
+                                {providerSaveNotice.message}
+                              </strong>
+                              <span
+                                className={`badge ${
+                                  providerSaveNotice.ok ? 'success' : 'danger'
+                                }`}
+                              >
+                                {providerSaveNotice.ok ? 'SAVED' : 'ERROR'}
+                              </span>
+                            </div>
+                            {providerSaveNotice.detail && (
+                              <div style={{ color: 'var(--text-primary)', fontSize: 12, marginTop: 4 }}>
+                                <code className="md-inline-code">{providerSaveNotice.detail}</code>
+                              </div>
+                            )}
+                          </div>
+                        )}
 
                         {smokeResult && (
                           <div
