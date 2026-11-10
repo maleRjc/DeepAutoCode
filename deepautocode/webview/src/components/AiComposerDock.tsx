@@ -1,8 +1,10 @@
-import React from 'react';
+import React, { useMemo, useState } from 'react';
 import { BrandMark } from './BrandMark';
 import { APP_LOCALES } from '../i18n/index.js';
 import {
   formatCompactTokens,
+  parseGlmControlReason,
+  writeGlmThinkingPanelPref,
   IMAGE_FILE_EXT_PATTERN,
   getImageMimeType,
   wordAtCursor,
@@ -91,6 +93,8 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
     activeSessionId, setActiveSessionId,
     messages, setMessages,
     streamingText, setStreamingText,
+    streamingReasoningText, setStreamingReasoningText,
+    showReasoningPanel, setShowReasoningPanel,
     liveToolCalls, setLiveToolCalls,
     showLiveSteps, setShowLiveSteps,
     pendingApprovals, setPendingApprovals,
@@ -115,7 +119,14 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
     sessionCheckpoints, setSessionCheckpoints,
     lastModelTier, setLastModelTier,
     goalTokenUsage, setGoalTokenUsage,
+    goalContextPressure,
     activeTaskTrace, setActiveTaskTrace,
+    recentTaskTraces,
+    lastContinuationHint,
+    continuationAlert,
+    setContinuationAlert,
+    compileFollowUpPrompt,
+    applyCompileFollowUpToComposer,
     pendingPromptQueue, setPendingPromptQueue,
     hunkDecisions, setHunkDecisions,
     mentionActiveIndex, setMentionActiveIndex,
@@ -152,7 +163,10 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
     sshBrowseData, setSshBrowseData,
     workspaceSectionOpen, setWorkspaceSectionOpen,
     expandedMessageIds, setExpandedMessageIds,
-    aiMessagesEndRef, codeGutterRef, codeHighlightRef, codeTextareaRef,
+    aiMessagesStreamRef,
+    aiMessagesEndRef,
+    scrollComposerToBottom,
+    codeGutterRef, codeHighlightRef, codeTextareaRef,
     currentTheme, isLightTheme, locale, t, tr, displayWorkspaceName,
     activeTab, codeLines, pendingDiffForActive, pendingDiffMarks,
     bridge,
@@ -173,7 +187,9 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
     handleAutoBuildDiagnoseAndFix, handleQuestionResponseSubmit,
     handleManageBackgroundTask, handleAttachImageFiles, handleSendPrompt,
     handleApprovalDecision, addContextChip, loadCheckpointPreviewDiffs,
-    refreshSessionCheckpoints, refreshTaskTrace, handleReviewAllPending,
+    refreshSessionCheckpoints, refreshTaskTrace, refreshTaskTraceList, loadTaskTraceById,
+    exportTaskTraceSnapshot,
+    handleReviewAllPending,
     handleStopAgent, handleDiffReview, getDiffHunks, handleHunkDecision,
     handleSimulateExtensionHostRestart, handleExportDiagnostics, handleTestAiKey,
     openSshConnectionModal, parseQuickSshCommand, handleTestSshConnection,
@@ -186,6 +202,14 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
     renderFormattedMarkdown,
   } = ctx;
 
+  const [traceStatusFilter, setTraceStatusFilter] = useState<
+    'all' | 'running' | 'success' | 'failed' | 'cancelled'
+  >('all');
+  const filteredRecentTraces = useMemo(() => {
+    const list = Array.isArray(recentTaskTraces) ? recentTaskTraces : [];
+    if (traceStatusFilter === 'all') return list;
+    return list.filter((tr) => String(tr?.status || '') === traceStatusFilter);
+  }, [recentTaskTraces, traceStatusFilter]);
 
   return (
         <aside className="ai-dock" style={{ display: showRightAiDock ? 'flex' : 'none' }}>
@@ -194,7 +218,10 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
               <button
                 type="button"
                 className={`ai-dock-tab ${aiTab === 'composer' ? 'active' : ''}`}
-                onClick={() => setAiTab('composer')}
+                onClick={() => {
+                  setAiTab('composer');
+                  scrollComposerToBottom('auto');
+                }}
               >
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
                   <BrandMark size={14} radius={3} />
@@ -240,6 +267,7 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                 onClick={() => {
                   setAiTab('trace');
                   void refreshTaskTrace();
+                  void refreshTaskTraceList(16);
                 }}
               >
                 <span>📡 {t('dock.trace')}</span>
@@ -315,7 +343,7 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                     }}
                     title={s?.title || sid}
                     onClick={() => {
-                      void selectAndResumeSession(sid);
+                      void selectAndResumeSession(sid).then(() => scrollComposerToBottom('auto'));
                       void refreshSessionCheckpoints(sid);
                       setAiTab('composer');
                     }}
@@ -337,6 +365,7 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
             </div>
           )}
 
+          <div className="ai-dock-main">
           {aiTab === 'changes' ? (
             <div className="ai-messages-stream">
               <div
@@ -945,16 +974,83 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
             </div>
           ) : aiTab === 'trace' ? (
             <div className="ai-messages-stream">
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 6 }}>
                 <span style={{ fontSize: 12, fontWeight: 700 }}>{t('dock.trace')}</span>
-                <button
-                  type="button"
-                  className="btn"
-                  style={{ padding: '3px 8px', fontSize: 11 }}
-                  onClick={() => void refreshTaskTrace()}
-                >
-                  {t('trace.refresh')}
-                </button>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <select
+                    className="input"
+                    style={{ fontSize: 11, maxWidth: 88, padding: '2px 6px' }}
+                    value={traceStatusFilter}
+                    onChange={(e) =>
+                      setTraceStatusFilter(
+                        e.target.value as 'all' | 'running' | 'success' | 'failed' | 'cancelled'
+                      )
+                    }
+                    title="Filter trace.list by status"
+                  >
+                    <option value="all">全部</option>
+                    <option value="running">running</option>
+                    <option value="success">success</option>
+                    <option value="failed">failed</option>
+                    <option value="cancelled">cancelled</option>
+                  </select>
+                  <select
+                    className="input"
+                    style={{ fontSize: 11, maxWidth: 200, padding: '2px 6px' }}
+                    value={activeTaskTrace?.taskId || ''}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      if (!v || v === '__session__') void refreshTaskTrace();
+                      else void loadTaskTraceById(v);
+                    }}
+                    title="Recent task traces (trace.list)"
+                  >
+                    <option value="__session__">当前 Session</option>
+                    {filteredRecentTraces.map((tr: any) => (
+                      <option key={tr.taskId} value={tr.taskId}>
+                        {String(tr.status || '?')} · {String(tr.taskId).slice(0, 14)} ·{' '}
+                        {String(tr.promptSummary || '').slice(0, 36)}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: '3px 8px', fontSize: 11 }}
+                    disabled={!activeTaskTrace}
+                    title="Copy trace snapshot JSON"
+                    onClick={() => {
+                      if (!activeTaskTrace) return;
+                      const json = JSON.stringify(activeTaskTrace, null, 2);
+                      void navigator.clipboard?.writeText(json).catch(() => undefined);
+                      appendLog('[Trace] snapshot copied to clipboard');
+                    }}
+                  >
+                    复制 JSON
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: '3px 8px', fontSize: 11 }}
+                    disabled={!activeTaskTrace}
+                    title="Write .deepautocode/traces/<taskId>.snapshot.json"
+                    onClick={() =>
+                      void exportTaskTraceSnapshot({
+                        taskId: activeTaskTrace?.taskId,
+                      })
+                    }
+                  >
+                    保存工作区
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ padding: '3px 8px', fontSize: 11 }}
+                    onClick={() => void refreshTaskTrace()}
+                  >
+                    {t('trace.refresh')}
+                  </button>
+                </div>
               </div>
               {!activeTaskTrace ? (
                 <div style={{ fontSize: 11.5, color: 'var(--text-secondary)' }}>
@@ -972,6 +1068,18 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                     <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
                       {activeTaskTrace.promptSummary}
                     </div>
+                    {lastContinuationHint && (
+                      <div
+                        style={{
+                          marginTop: 6,
+                          fontSize: 11,
+                          color: '#fb923c',
+                          fontWeight: 600,
+                        }}
+                      >
+                        最近续跑：{lastContinuationHint.caseId} — {lastContinuationHint.summary}
+                      </div>
+                    )}
                     <div style={{ fontSize: 11, marginTop: 6, color: 'var(--text-secondary)' }}>
                       turns {activeTaskTrace.totalTurns} · tok{' '}
                       {formatCompactTokens(Number(activeTaskTrace.tokensUsed || 0))}/
@@ -980,6 +1088,124 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                       {formatCompactTokens(Number(activeTaskTrace.cacheReadTokens || 0))}
                     </div>
                   </div>
+                  {(() => {
+                    const tierEvents = (Array.isArray(activeTaskTrace.events)
+                      ? activeTaskTrace.events
+                      : []
+                    )
+                      .filter(
+                        (e: { kind?: string; signal?: string }) =>
+                          e.kind === 'agent.signal' && e.signal === 'model_tier'
+                      )
+                      .sort(
+                        (a: { detail?: { turnIndex?: number } }, b: { detail?: { turnIndex?: number } }) =>
+                          Number(a.detail?.turnIndex ?? 0) - Number(b.detail?.turnIndex ?? 0)
+                      );
+                    if (tierEvents.length === 0) return null;
+                    return (
+                      <div className="chat-bubble" style={{ marginBottom: 8 }}>
+                        <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 6 }}>
+                          GLM thinking timeline
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          {tierEvents.map((evt: any, ti: number) => {
+                            const d = evt.detail || {};
+                            const think = Boolean(d.thinkingEnabled);
+                            const fill =
+                              typeof d.contextFillRatio === 'number'
+                                ? Math.round(d.contextFillRatio * 100)
+                                : null;
+                            return (
+                              <div
+                                key={`glm-tier-${d.turnIndex ?? ti}-${evt.ts || ti}`}
+                                style={{
+                                  fontSize: 11,
+                                  display: 'flex',
+                                  gap: 8,
+                                  alignItems: 'center',
+                                  flexWrap: 'wrap',
+                                }}
+                              >
+                                <span style={{ fontWeight: 600 }}>T{d.turnIndex ?? '?'}</span>
+                                <span
+                                  className={`badge ${think ? 'info' : 'success'}`}
+                                  style={{ fontSize: 9 }}
+                                >
+                                  {think ? 'think' : 'fast'}
+                                </span>
+                                {d.glmControlReason ? (
+                                  <span style={{ color: 'var(--text-secondary)' }}>
+                                    GLM·{String(d.glmControlReason)}
+                                  </span>
+                                ) : null}
+                                {fill != null ? (
+                                  <span style={{ opacity: 0.85 }}>ctx {fill}%</span>
+                                ) : null}
+                                {d.compactProfile ? (
+                                  <span style={{ opacity: 0.75 }}>{String(d.compactProfile)}</span>
+                                ) : null}
+                                <span
+                                  style={{
+                                    marginLeft: 'auto',
+                                    color: 'var(--text-secondary)',
+                                  }}
+                                >
+                                  {evt.ts ? String(evt.ts).slice(11, 19) : ''}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                  {(() => {
+                    const contEvents = (Array.isArray(activeTaskTrace.events)
+                      ? activeTaskTrace.events
+                      : []
+                    )
+                      .filter(
+                        (e: { kind?: string; signal?: string }) =>
+                          e.kind === 'agent.signal' && e.signal === 'continuation'
+                      )
+                      .sort(
+                        (a: { ts?: string }, b: { ts?: string }) =>
+                          String(a.ts || '').localeCompare(String(b.ts || ''))
+                      );
+                    if (contEvents.length === 0) return null;
+                    return (
+                      <div className="chat-bubble" style={{ marginBottom: 8 }}>
+                        <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 6 }}>
+                          自愈 / 续跑时间线
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          {contEvents.map((evt: any, ci: number) => {
+                            const d = evt.detail || {};
+                            const caseId = String(d.case || 'unknown');
+                            return (
+                              <div
+                                key={`cont-${caseId}-${evt.ts || ci}`}
+                                style={{ fontSize: 11, color: 'var(--text-secondary)' }}
+                              >
+                                <span style={{ fontWeight: 600, color: 'var(--text-primary)' }}>
+                                  {caseId}
+                                </span>
+                                {' · '}
+                                {evt.summary}
+                                {d.selfHealCount != null ? ` · heal ${d.selfHealCount}` : ''}
+                                {d.compileRemediationContinuationCount != null
+                                  ? ` · compile+#${d.compileRemediationContinuationCount}`
+                                  : ''}
+                                <span style={{ marginLeft: 6, opacity: 0.75 }}>
+                                  {evt.ts ? String(evt.ts).slice(11, 19) : ''}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    );
+                  })()}
                   {(Array.isArray(activeTaskTrace.events) ? activeTaskTrace.events : [])
                     .slice()
                     .reverse()
@@ -1001,6 +1227,13 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                             {formatCompactTokens(evt.inputTokens)} / out{' '}
                             {formatCompactTokens(evt.outputTokens)} · {t('trace.cache')}{' '}
                             {formatCompactTokens(evt.cacheReadTokens)}
+                            {typeof evt.thinkingEnabled === 'boolean'
+                              ? ` · ${evt.thinkingEnabled ? 'think' : 'fast'}`
+                              : ''}
+                            {evt.glmControlReason ? ` · GLM·${evt.glmControlReason}` : ''}
+                            {typeof evt.contextFillRatio === 'number'
+                              ? ` · ctx ${Math.round(evt.contextFillRatio * 100)}%`
+                              : ''}
                           </div>
                         )}
                         {evt.kind === 'tool.call' && (
@@ -1025,6 +1258,28 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                         {evt.kind === 'agent.signal' && (
                           <div style={{ marginTop: 4, color: 'var(--text-secondary)' }}>
                             {evt.signal} · {evt.summary}
+                            {evt.signal === 'model_tier' && evt.detail ? (
+                              <div style={{ marginTop: 2, fontSize: 11 }}>
+                                {typeof evt.detail.thinkingEnabled === 'boolean'
+                                  ? `mode: ${evt.detail.thinkingEnabled ? 'think' : 'fast'}`
+                                  : ''}
+                                {evt.detail.glmControlReason
+                                  ? ` · GLM·${String(evt.detail.glmControlReason)}`
+                                  : ''}
+                                {typeof evt.detail.contextFillRatio === 'number'
+                                  ? ` · ctx ${Math.round(Number(evt.detail.contextFillRatio) * 100)}%`
+                                  : ''}
+                              </div>
+                            ) : null}
+                            {evt.signal === 'continuation' && evt.detail?.case ? (
+                              <div style={{ marginTop: 2, fontSize: 11 }}>
+                                case: {String(evt.detail.case)}
+                                {evt.detail.lastBuildOrTestFailed ? ' · build/test failed' : ''}
+                                {typeof evt.detail.sessionWrites === 'number'
+                                  ? ` · writes ${evt.detail.sessionWrites}`
+                                  : ''}
+                              </div>
+                            ) : null}
                           </div>
                         )}
                         {evt.kind === 'task.start' && (
@@ -1047,6 +1302,66 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
             </div>
           ) : (
             <>
+              {continuationAlert && (
+                <div
+                  style={{
+                    borderBottom: '1px solid var(--border)',
+                    padding: '8px 10px',
+                    fontSize: 11.5,
+                    background:
+                      continuationAlert.level === 'error'
+                        ? 'rgba(248, 113, 113, 0.12)'
+                        : 'rgba(251, 146, 60, 0.12)',
+                    color: continuationAlert.level === 'error' ? '#fca5a5' : '#fdba74',
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    gap: 8,
+                    alignItems: 'flex-start',
+                  }}
+                >
+                  <div>
+                    <strong>Agent 续跑</strong> · {continuationAlert.caseId}
+                    <div style={{ marginTop: 4, opacity: 0.92, whiteSpace: 'pre-wrap' }}>
+                      {continuationAlert.summary}
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap' }}>
+                    {(compileFollowUpPrompt ||
+                      continuationAlert.caseId === 'compile_remediation_exhausted' ||
+                      continuationAlert.caseId === 'compile_lacks_plan' ||
+                      continuationAlert.caseId === 'compile_build_fail_no_edit') && (
+                      <button
+                        type="button"
+                        className="btn primary"
+                        style={{ padding: '2px 8px', fontSize: 10, fontWeight: 700 }}
+                        onClick={() => applyCompileFollowUpToComposer()}
+                      >
+                        填入 Composer
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ padding: '2px 6px', fontSize: 10 }}
+                      onClick={() => {
+                        setAiTab('trace');
+                        void refreshTaskTrace();
+                        void refreshTaskTraceList(16);
+                      }}
+                    >
+                      Trace
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      style={{ padding: '2px 6px', fontSize: 10 }}
+                      onClick={() => setContinuationAlert(null)}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                </div>
+              )}
               {sessionCheckpoints.length > 0 && (
                 <div
                   style={{
@@ -1190,7 +1505,7 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                   </div>
                 </div>
               )}
-              <div className="ai-messages-stream">
+              <div className="ai-messages-stream" ref={aiMessagesStreamRef}>
                 {messages.length === 0 && !isSendingPrompt && !streamingText && (
                   <div className="ai-empty-state">
                     <div className="ai-empty-hero">
@@ -2077,6 +2392,51 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                             );
                           })}
                       </div>
+                    )}
+                  </div>
+                )}
+
+                {streamingReasoningText && (
+                  <div
+                    className="chat-bubble assistant"
+                    style={{
+                      opacity: 0.88,
+                      borderStyle: 'dashed',
+                      borderColor: 'rgba(148, 163, 184, 0.45)',
+                    }}
+                  >
+                    <div className="chat-bubble-header">
+                      <button
+                        type="button"
+                        className="btn"
+                        style={{ padding: '2px 8px', fontSize: 11 }}
+                        onClick={() => {
+                          setShowReasoningPanel((v) => {
+                            const next = !v;
+                            writeGlmThinkingPanelPref(modelInput, next ? 'open' : 'closed');
+                            return next;
+                          });
+                        }}
+                      >
+                        {showReasoningPanel
+                          ? '▴ 收起 GLM Thinking'
+                          : `▾ GLM Thinking (${streamingReasoningText.length} 字)`}
+                      </button>
+                    </div>
+                    {showReasoningPanel && (
+                      <pre
+                        style={{
+                          fontSize: 11,
+                          lineHeight: 1.45,
+                          maxHeight: 200,
+                          overflowY: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          color: '#94a3b8',
+                          margin: 0,
+                        }}
+                      >
+                        {streamingReasoningText.slice(-12_000)}
+                      </pre>
                     )}
                   </div>
                 )}
@@ -3121,6 +3481,8 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                           'deepseek-auto',
                           'deepseek-flash',
                           'deepseek-v4-pro',
+                          'GLM-5.3-Flash',
+                          'glm-5.3-flash',
                           'glm-4-plus',
                           'glm-4-flash',
                           'glm-z1-flash',
@@ -3134,6 +3496,7 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                       <option value="deepseek-auto">⚡ Auto Router (Flash/Pro)</option>
                       <option value="deepseek-flash">Force Flash</option>
                       <option value="deepseek-v4-pro">Force V4-Pro</option>
+                      <option value="GLM-5.3-Flash">GLM-5.3-Flash (Recommended)</option>
                       <option value="glm-4-plus">GLM-4-Plus (Official)</option>
                       <option value="glm-4-flash">GLM-4-Flash (Official)</option>
                       <option value="glm-z1-flash">GLM-Z1-Flash (Official)</option>
@@ -3151,8 +3514,23 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                         {lastModelTier.effectiveModelId}
                         {lastModelTier.thinkingEnabled
                           ? `·think${lastModelTier.reasoningEffort ? `:${lastModelTier.reasoningEffort}` : ''}`
-                          : ''}
+                          : '·fast'}
                         {lastModelTier.peakHour ? '·peak' : ''}
+                      </span>
+                    )}
+                    {lastModelTier &&
+                      (lastModelTier.glmControlReason ||
+                        parseGlmControlReason(lastModelTier)) && (
+                      <span
+                        className="badge"
+                        style={{
+                          fontSize: 10,
+                          background: 'rgba(34, 197, 94, 0.12)',
+                          borderColor: 'rgba(34, 197, 94, 0.35)',
+                        }}
+                        title={lastModelTier.reason || ''}
+                      >
+                        GLM·{lastModelTier.glmControlReason || parseGlmControlReason(lastModelTier)}
                       </span>
                     )}
                     {goalTokenUsage && (
@@ -3175,6 +3553,56 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                           : ''}
                       </span>
                     )}
+                    {(() => {
+                      const tokFill =
+                        goalTokenUsage && goalTokenUsage.tokenBudget > 0
+                          ? goalTokenUsage.tokensUsed / goalTokenUsage.tokenBudget
+                          : 0;
+                      const ctxFill = Math.max(
+                        goalContextPressure?.fillRatio ?? 0,
+                        lastModelTier?.contextFillRatio ?? 0,
+                        tokFill
+                      );
+                      if (ctxFill <= 0.05) return null;
+                      const pct = Math.min(100, Math.round(ctxFill * 100));
+                      const hot = ctxFill >= 0.78 || goalContextPressure?.warn;
+                      return (
+                        <span
+                          className={`badge ${hot ? 'warning' : 'info'}`}
+                          style={{
+                            fontSize: 10,
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 6,
+                          }}
+                          title={`Context fill ~${pct}%${lastModelTier?.compactProfile ? ` · ${lastModelTier.compactProfile}` : ''}${goalContextPressure?.warn ? ' · compaction active' : ''}`}
+                        >
+                          ctx
+                          <span
+                            style={{
+                              display: 'inline-block',
+                              width: 48,
+                              height: 6,
+                              borderRadius: 3,
+                              background: 'rgba(148, 163, 184, 0.25)',
+                              overflow: 'hidden',
+                            }}
+                          >
+                            <span
+                              style={{
+                                display: 'block',
+                                height: '100%',
+                                width: `${pct}%`,
+                                background: hot
+                                  ? 'rgba(251, 191, 36, 0.95)'
+                                  : 'rgba(59, 130, 246, 0.85)',
+                              }}
+                            />
+                          </span>
+                          {pct}%
+                        </span>
+                      );
+                    })()}
                   </div>
 
                   <div className="composer-controls-right">
@@ -3210,6 +3638,7 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
               </div>
             </>
           )}
+          </div>
         </aside>
   );
 }

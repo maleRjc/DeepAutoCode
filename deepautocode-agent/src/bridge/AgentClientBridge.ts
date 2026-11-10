@@ -331,6 +331,9 @@ export class AgentClientBridge {
         const images = Array.isArray(payload.images)
           ? (payload.images as Array<{ name?: string; dataUrl: string; mimeType?: string }>)
           : undefined;
+        const contextPlan = payload.contextPlan as
+          | import('../core/ComposerContextRouter.js').ComposerContextPlan
+          | undefined;
         return this.sessionBridge.sendPrompt({
           sessionId: targetId,
           prompt,
@@ -338,6 +341,7 @@ export class AgentClientBridge {
           executionMode,
           modelId,
           images,
+          contextPlan,
         });
       }
 
@@ -541,6 +545,17 @@ export class AgentClientBridge {
             ? payload.limit
             : 20;
         return this.sessionBridge.listTraces(limit);
+      }
+
+      case 'trace.exportSnapshot': {
+        return this.sessionBridge.exportTraceSnapshot({
+          workspaceRoot: this.workspaceRoot,
+          taskId: typeof payload.taskId === 'string' ? payload.taskId : undefined,
+          sessionId:
+            (typeof payload.sessionId === 'string' ? payload.sessionId : undefined) ||
+            sessionId ||
+            undefined,
+        });
       }
 
       case 'completion.fim': {

@@ -100,9 +100,23 @@ export {
 } from './FileStateCache.js';
 
 export {
+  buildGlmCompactSystemAppendix,
+  buildGlmWorkspaceBrief,
+} from './GlmPromptCompact.js';
+
+export {
+  trimToolDescriptionForGlm,
+  trimToolDescriptionForGlmAggressive,
+  trimToolJsonSchemaForGlm,
+} from './GlmToolSchema.js';
+
+export {
   buildGoalBudgetLimitPrompt,
   buildGoalContinuationPrompt,
   classifyPromptIntent,
+  promptRequestsWorkspaceArtifact,
+  promptRequestsCompileRemediation,
+  assistantLacksRemediationPlan,
   createGoalState,
   formatGoalElapsed,
   resolveTieredModelForTurn,
@@ -274,6 +288,23 @@ export {
 } from './trace/TaskTrace.js';
 
 export {
+  extractLastContinuation,
+  formatContinuationStatusLabel,
+  type ContinuationInsight,
+} from './trace/ContinuationInsight.js';
+
+export {
+  resolveCompileBuildFailContinuation,
+  resolveCompileLacksPlanContinuation,
+  COMPILE_REMEDIATION_CONTINUATION_MAX,
+  AUTO_CONTINUATION_COMPILE_CAP,
+  COMPILE_REMEDIATION_EXHAUSTED_USER_HINTS,
+  shouldEmitCompileRemediationExhausted,
+  buildCompileRemediationFollowUpPrompt,
+  type CompileRemediationContinuationCase,
+} from './CompileRemediationContinuation.js';
+
+export {
   findFileEditingCommand,
   formatPlanModeBlockedCommandError,
   assertCommandAllowedInPlanMode,
@@ -319,6 +350,8 @@ export {
   isGlmModelId,
   resolveGlmRequestControls,
   resolveModelContextBudget,
+  resolveModelMaxOutputTokens,
+  resolveNestedLlmMaxTokens,
   parseToolArgumentsResilient,
   type DeepSeekApiModelId,
   type DeepSeekReasoningEffort,
@@ -402,6 +435,19 @@ export {
   type TranscriptStepInput,
   type TranscriptStepRecord,
 } from './TranscriptLogger.js';
+
+export {
+  buildContextRoutingPromptBlock,
+  classifyComposerSessionTopic,
+  historySliceBounds,
+  inferPriorSessionTopicFromMessages,
+  resolveComposerContextPlan,
+  shouldForkComposerSession,
+  type ComposerContextMode,
+  type ComposerContextPlan,
+  type ComposerSessionTopic,
+  type ContextMessage,
+} from './ComposerContextRouter.js';
 
 
 

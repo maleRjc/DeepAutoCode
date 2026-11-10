@@ -502,8 +502,28 @@ export const DEFAULT_PROVIDERS: Record<string, ProviderConfig> = {
     apiEndpoint: 'https://open.bigmodel.cn/api/paas/v4',
     defaultModelId: 'glm-4-plus',
     secretKeyRef: 'deepautocode.provider.glm.apiKey',
-    timeoutMs: 120000,
+    timeoutMs: 300_000,
     models: [
+      {
+        modelId: 'GLM-5.3-Flash',
+        displayName: 'GLM-5.3-Flash (128K · Tools · Adaptive Thinking)',
+        contextWindow: 131_072,
+        maxOutputTokens: 16_384,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: false,
+        supportsReasoning: true,
+      },
+      {
+        modelId: 'glm-5.3-flash',
+        displayName: 'GLM-5.3-Flash (lowercase id alias)',
+        contextWindow: 131_072,
+        maxOutputTokens: 16_384,
+        supportsToolCalls: true,
+        supportsStreaming: true,
+        supportsVision: false,
+        supportsReasoning: true,
+      },
       {
         modelId: 'glm-4-plus',
         displayName: 'GLM-4-Plus (Official Default)',
@@ -1045,7 +1065,7 @@ export class ProviderManager {
       models: [...existing.models],
       timeoutMs:
         isLocalOrPrivateEndpoint(nextEndpoint) || /^glm/i.test(nextModelId)
-          ? Math.max(existing.timeoutMs ?? 60000, 180000)
+          ? Math.max(existing.timeoutMs ?? 60000, 300_000)
           : existing.timeoutMs ?? 60000,
     };
 

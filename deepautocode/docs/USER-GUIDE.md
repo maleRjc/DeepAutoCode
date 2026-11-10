@@ -21,6 +21,10 @@ Welcome to **DeepAutoCode Desktop IDE (v1.1.0)** — an **Agent-first** coding w
 4. **Optional verification gate (验证门禁)**:
    - Settings → Runtime / Security writes workspace `.deepautocode/verify.json` (`buildCommand` / `testCommand` / `enableEvolveSandbox`).
    - Project rules are also written to `.deepautocode/project-rules.md` and injected into the Agent system prompt each turn.
+5. **Bundled pandoc (教程 / PDF)**:
+   - `npm install` under `deepautocode/` or `start-desktop.bat` downloads **pandoc** into `.tools/pandoc/` (not committed to git).
+   - Agent `run_command` automatically prepends this to `PATH` when your workspace lives inside the DeepAutoCode repo tree.
+   - Re-run manually: `cd deepautocode && npm run ensure:pandoc`. PDF with Chinese still needs a PDF engine (e.g. MiKTeX + `xelatex`); `.md` → `.html` works out of the box.
 
 ---
 
@@ -31,7 +35,7 @@ Welcome to **DeepAutoCode Desktop IDE (v1.1.0)** — an **Agent-first** coding w
   - **Command Center** (`Ctrl+P` / `Ctrl+Shift+P`): jump to files or run IDE/AI/Help commands.
   - Quick toggles: theme (`Alt+T`), left sidebar (`Ctrl+B`), bottom panel (`Ctrl+J`), **🌐 Preview**, **✨ AI** (`Ctrl+L`), **📖 Guide** (`F1`), **⚙️ Settings** (`Ctrl+,`).
 - **Right AI Dock tabs**:
-  - **Composer** — multi-turn Agent chat, live tool cards, model/tier badge, Goal **token used/budget**.
+  - **Composer** — multi-turn Agent chat (Cursor-style **same thread by default**). Each send runs **context routing**: scores relation to prior turns (topics, `@` paths, 继续/新问题 cues). **High relation** → full recent history; **medium** → trimmed history + no tutorial/PDF tool audit; **low** → optional auto **new session** (`dac.autoNewSessionOnIntentSwitch`, default on). Use `@Files` when you know what matters — Agent searches the rest dynamically.
   - **Artifacts** — Plans / Task Lists / Reports; one-click execute.
   - **Sessions** — history + **checkpoints** (Restore).
   - **Changes** — multi-file Diff list; Accept / Reject / Revise; Accept All / Reject All. Stopping the Agent keeps pending Diffs for review.

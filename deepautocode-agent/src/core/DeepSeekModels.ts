@@ -240,6 +240,22 @@ export function isGlmModelId(modelId: string, providerId?: string): boolean {
   );
 }
 
+/** HTTP timeout for OpenAI-compatible chat/completions (tool-calling turns). */
+export function resolveLlmPostTimeoutMs(params: {
+  isReasonerModel: boolean;
+  isGlmModel: boolean;
+  isLocalInference: boolean;
+  isSshMirrorWorkspace?: boolean;
+}): number {
+  if (params.isGlmModel) {
+    return params.isSshMirrorWorkspace ? 360_000 : 300_000;
+  }
+  if (params.isReasonerModel || params.isLocalInference) {
+    return 240_000;
+  }
+  return 120_000;
+}
+
 export interface GlmRequestControls {
   enableThinking: boolean;
   temperature: number;
@@ -264,21 +280,41 @@ export function resolveGlmRequestControls(params: {
   selfHealCount?: number;
   hasFailure?: boolean;
   userPrompt?: string;
+  /** Compile / build-failure fix loop — prefer fast tool turns without CoT. */
+  compileRemediationTurn?: boolean;
+  /** When true, model may emit tool_calls this turn (exec). */
+  toolCallingTurn?: boolean;
 }): GlmRequestControls {
   const phase = params.phase ?? 'exec';
   const hasFailure = Boolean(params.hasFailure || (params.selfHealCount && params.selfHealCount > 0));
+  const userPrompt = String(params.userPrompt || '');
+  const wantsFastImplementation =
+    (/(?:实现|编写|新增|添加|创建|修复|修改|落地|apply|implement)/i.test(userPrompt) ||
+      /\b(?:error:|fatal error:|undeclared|should return a value)\b/i.test(userPrompt)) &&
+    !/根因|架构|为什么|死锁|并发|排查|debug|root\s*cause/i.test(userPrompt);
   const isComplexFirstTurn =
+    !wantsFastImplementation &&
     (params.turnIndex ?? 1) === 1 &&
     /架构|重构|死锁|并发|原因|为什么|根因|排查|debug|root\s*cause|architect|deadlock|race\s*condition/i.test(
-      String(params.userPrompt || '')
+      userPrompt
     );
 
   let enableThinking = false;
   let reason = 'exec-fast-tool-calling';
-  if (phase === 'plan') {
+  if (
+    params.compileRemediationTurn &&
+    phase !== 'plan' &&
+    (params.toolCallingTurn !== false || phase === 'exec')
+  ) {
+    enableThinking = false;
+    reason = 'compile-remediation-fast';
+  } else if (phase === 'plan') {
     enableThinking = true;
     reason = 'plan-phase';
-  } else if (hasFailure || params.reasoningEffort === 'max') {
+  } else if (params.reasoningEffort === 'max') {
+    enableThinking = true;
+    reason = 'reasoning-effort-max';
+  } else if (hasFailure && !wantsFastImplementation) {
     enableThinking = true;
     reason = 'self-heal-diagnosis';
   } else if (isComplexFirstTurn && phase !== 'verify') {
@@ -300,6 +336,68 @@ export function resolveGlmRequestControls(params: {
  * - GLM-5.3-Flash / 128K context models: 96,000 tokens (leaves ~32K headroom for output & system/tools within 131,072 max_model_len)
  * - DeepSeek 1M context models: 180,000 tokens (or configured budget)
  */
+/** OpenAI `max_tokens` for chat completions (tool-calling turns). */
+export function resolveNestedLlmMaxTokens(params: {
+  modelId: string;
+  providerId?: string;
+  catalogMaxOutput?: number | null;
+  role: 'subagent' | 'decompose' | 'synthesize';
+}): number {
+  const main = resolveModelMaxOutputTokens({
+    modelId: params.modelId,
+    providerId: params.providerId,
+    catalogMaxOutput: params.catalogMaxOutput,
+  });
+  const glm = isGlmModelId(params.modelId, params.providerId);
+  const ratio =
+    params.role === 'subagent'
+      ? glm
+        ? 0.5
+        : 0.35
+      : params.role === 'decompose'
+        ? glm
+          ? 0.1
+          : 0.06
+        : glm
+          ? 0.2
+          : 0.12;
+  const floor =
+    params.role === 'subagent'
+      ? glm
+        ? 3_500
+        : 1_500
+      : params.role === 'decompose'
+        ? glm
+          ? 900
+          : 400
+        : glm
+          ? 1_800
+          : 500;
+  return Math.min(main, Math.max(floor, Math.floor(main * ratio)));
+}
+
+export function resolveModelMaxOutputTokens(params: {
+  modelId: string;
+  providerId?: string;
+  catalogMaxOutput?: number | null;
+  fallback?: number;
+}): number {
+  const catalog = Number(params.catalogMaxOutput || 0);
+  if (catalog > 0) {
+    return Math.min(Math.max(catalog, 1024), 65_536);
+  }
+  if (isGlmModelId(params.modelId, params.providerId)) {
+    if (/5\.3|z1/i.test(params.modelId)) {
+      return 16_384;
+    }
+    return 8_192;
+  }
+  if (/reasoner|pro|r1|qwq/i.test(params.modelId)) {
+    return 16_384;
+  }
+  return Number(params.fallback) > 0 ? Number(params.fallback) : 8_192;
+}
+
 export function resolveModelContextBudget(params: {
   modelId: string;
   providerId?: string;

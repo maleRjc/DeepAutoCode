@@ -21,6 +21,8 @@ export interface UIEventMessage {
   | 'runtime.error'
   | 'sandbox.branch.created'
   | 'circuit.breaker.triggered'
+  | 'compile.remediation.exhausted'
+  | 'trace.exported'
   | 'artifact.created'
   | 'model.tier'
   | 'goal.usage'
@@ -28,7 +30,9 @@ export interface UIEventMessage {
   | 'checkpoint.created'
   | 'question.requested'
   | 'question.resolved'
-  | 'task.state.changed';
+  | 'task.state.changed'
+  | 'agent.progress'
+  | 'assistant.reasoning.delta';
   sessionId: string;
   sequence: number;
   timestamp: string;

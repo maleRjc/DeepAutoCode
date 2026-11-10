@@ -9,6 +9,129 @@ export function formatCompactTokens(n: number): string {
   return String(v);
 }
 
+const GLM_THINKING_PREF_KEY = 'dac.glmThinkingPanel';
+
+export function readGlmThinkingPanelPref(modelId: string): 'open' | 'closed' | 'auto' {
+  const key = `${GLM_THINKING_PREF_KEY}.${String(modelId || 'default').toLowerCase()}`;
+  try {
+    const v = localStorage.getItem(key);
+    if (v === 'open' || v === 'closed') return v;
+  } catch {
+    /* ignore */
+  }
+  return 'auto';
+}
+
+export function writeGlmThinkingPanelPref(modelId: string, pref: 'open' | 'closed'): void {
+  const key = `${GLM_THINKING_PREF_KEY}.${String(modelId || 'default').toLowerCase()}`;
+  try {
+    localStorage.setItem(key, pref);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Extract GLM control reason from model.tier payload or composite reason string. */
+export function parseGlmControlReason(payload: {
+  glmControlReason?: string;
+  reason?: string;
+}): string {
+  if (payload.glmControlReason) return String(payload.glmControlReason);
+  const m = String(payload.reason || '').match(/\(([^)]+)\)\s*$/);
+  return m?.[1] || '';
+}
+
+export type ContinuationInsight = {
+  caseId: string;
+  summary: string;
+  ts?: string;
+  selfHealCount?: number;
+  compileRemediationContinuationCount?: number;
+  sessionWrites?: number;
+};
+
+/** Latest continuation signal in trace events (UI mirror of agent ContinuationInsight). */
+export function extractLastContinuation(events: unknown[] | undefined): ContinuationInsight | null {
+  if (!Array.isArray(events) || events.length === 0) return null;
+  let last: ContinuationInsight | null = null;
+  for (const raw of events) {
+    const evt = raw as {
+      kind?: string;
+      signal?: string;
+      summary?: string;
+      ts?: string;
+      detail?: Record<string, unknown>;
+    };
+    if (evt.kind !== 'agent.signal' || evt.signal !== 'continuation') continue;
+    const d = evt.detail || {};
+    last = {
+      caseId: String(d.case || 'unknown'),
+      summary: String(evt.summary || ''),
+      ts: evt.ts,
+      selfHealCount: typeof d.selfHealCount === 'number' ? d.selfHealCount : undefined,
+      compileRemediationContinuationCount:
+        typeof d.compileRemediationContinuationCount === 'number'
+          ? d.compileRemediationContinuationCount
+          : undefined,
+      sessionWrites: typeof d.sessionWrites === 'number' ? d.sessionWrites : undefined,
+    };
+  }
+  return last;
+}
+
+const CONTINUATION_ALERT_CASES = new Set([
+  'compile_build_fail_no_edit',
+  'compile_lacks_plan',
+  'self_heal_build_test',
+  'circuit_breaker',
+  'compile_remediation_exhausted',
+]);
+
+export function shouldShowContinuationAlert(caseId: string): boolean {
+  return CONTINUATION_ALERT_CASES.has(caseId);
+}
+
+export function continuationAlertLevel(caseId: string): 'warn' | 'error' {
+  return caseId === 'circuit_breaker' || caseId === 'compile_remediation_exhausted'
+    ? 'error'
+    : 'warn';
+}
+
+/** Mirror of agent `buildCompileRemediationFollowUpPrompt` for UI-only nudges. */
+export function buildCompileRemediationFollowUpPrompt(options?: {
+  failureSnippet?: string;
+  verifyCommand?: string;
+}): string {
+  const snippet = String(options?.failureSnippet || '').trim().slice(0, 800);
+  const verify = String(options?.verifyCommand || '').trim();
+  const verifyLine = verify ? `（推荐：\`${verify}\`）` : '';
+  return `[FORCE_AUTO_ACTION]
+上一轮自动续跑已达上限，请不要再只分析或重复 run_command 复述错误。必须：
+1) 用 edit_file / apply_patch 按日志 file:line 修改源码；
+2) run_command 重编验证${verifyLine}；
+3) 收尾输出 ## 根因 / ## 修复步骤 / ## 验证命令（含具体删改）。
+${snippet ? `\n最近失败摘要：\n\`\`\`\n${snippet}\n\`\`\`` : ''}`.trim();
+}
+
+export function isCompileContinuationCase(caseId: string): boolean {
+  return (
+    caseId.startsWith('compile_') ||
+    caseId === 'compile_remediation_exhausted' ||
+    caseId === 'self_heal_build_test'
+  );
+}
+
+export function formatContinuationStatusLabel(insight: ContinuationInsight): string {
+  const parts = [`续跑·${insight.caseId}`];
+  if (insight.compileRemediationContinuationCount != null) {
+    parts.push(`compile+#${insight.compileRemediationContinuationCount}`);
+  }
+  if (insight.selfHealCount != null) {
+    parts.push(`heal ${insight.selfHealCount}`);
+  }
+  return parts.join(' ');
+}
+
 export const IMAGE_FILE_EXT_PATTERN = /\.(?:png|ico|jpg|jpeg|gif|webp|svg|bmp|avif)$/i;
 
 export function getImageMimeType(filePath: string): string {
@@ -56,6 +179,16 @@ export function promptWantsWorkspaceArtifact(rawText: string): boolean {
     /(?:pdf|\.md)\s*文档/i.test(cleaned)
   );
 }
+
+export {
+  classifyComposerSessionTopic,
+  inferPriorSessionTopicFromMessages,
+  resolveComposerContextPlan,
+  shouldForkComposerSession,
+  type ComposerContextMode,
+  type ComposerContextPlan,
+  type ComposerSessionTopic,
+} from '@deepautocode/agent-core/ComposerContextRouter.ts';
 
 export function detectUiPromptIntent(
   rawText: string,
@@ -413,7 +546,7 @@ export function parseDiffToSplitRows(diffText: string): SplitDiffRow[] {
 }
 
 export const SOURCE_FILE_EXT_PATTERN =
-  /\.(?:c|cc|cpp|cxx|cu|cuh|h|hh|hpp|hxx|py|ts|tsx|js|jsx|mjs|cjs|json|yaml|yml|toml|md|pdf|txt|csv|sh|bash|zsh|bat|ps1|cmake|mk|go|rs|java|kt|cs|rb|php|sql|html|css|scss|less|vue|svelte|proto|gradle|xml|ini|cfg|conf)$/i;
+  /\.(?:c|cc|cpp|cxx|cu|cuh|h|hh|hpp|hxx|py|ts|tsx|js|jsx|mjs|cjs|json|yaml|yml|toml|md|txt|csv|sh|bash|zsh|bat|ps1|cmake|mk|go|rs|java|kt|cs|rb|php|sql|html|css|scss|less|vue|svelte|proto|gradle|xml|ini|cfg|conf)$/i;
 
 export function parseSourceReferenceToken(
   rawToken: string,
@@ -636,10 +769,12 @@ export function extractCompactExecutiveSummary(
       if (inConclusionSection && conclusionLines.length >= 2) break;
       continue;
     }
-    if (/^(?:#+\s*)?(?:🎯\s*)?(?:结论|核心原因|根因定位|核心结论|总结)\b/.test(t)) {
+    if (
+      /^(?:#+\s*)?(?:🎯\s*)?(?:结论|核心原因|根因定位|核心结论|总结|根因|修复步骤)\b/.test(t)
+    ) {
       inConclusionSection = true;
       const inlineAfterColon = t.replace(
-        /^(?:#+\s*)?(?:🎯\s*)?(?:结论|核心原因|根因定位|核心结论|总结)\s*[:：]?\s*/,
+        /^(?:#+\s*)?(?:🎯\s*)?(?:结论|核心原因|根因定位|核心结论|总结|根因|修复步骤)\s*[:：]?\s*/,
         ''
       );
       if (inlineAfterColon.length >= 8) {
@@ -650,6 +785,12 @@ export function extractCompactExecutiveSummary(
     if (/^(?:\*\*|[-*•]\s*)?(?:决定性因素|核心修复|修改内容|验证结果)\s*[:：]/.test(t)) {
       conclusionLines.push(t.replace(/^[-*•]\s*/, ''));
       if (conclusionLines.length >= 3) break;
+      continue;
+    }
+    if (/^(?:#+\s*)?(?:修复步骤|验证命令)\b/.test(t)) {
+      inConclusionSection = true;
+      conclusionLines.push(t.replace(/^#+\s*/, ''));
+      if (conclusionLines.length >= 4) break;
       continue;
     }
     if (inConclusionSection && !t.startsWith('#')) {

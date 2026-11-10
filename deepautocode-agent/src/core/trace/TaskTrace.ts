@@ -41,6 +41,9 @@ export interface TraceLlmTurn extends TraceEventBase {
   cacheWriteTokens: number;
   tokensUsed: number;
   tokenBudget: number;
+  thinkingEnabled?: boolean;
+  glmControlReason?: string;
+  contextFillRatio?: number;
 }
 
 export interface TraceToolCall extends TraceEventBase {
@@ -62,7 +65,14 @@ export interface TraceVerifyResult extends TraceEventBase {
 
 export interface TraceAgentSignal extends TraceEventBase {
   kind: 'agent.signal';
-  signal: 'mistake' | 'loop' | 'checkpoint' | 'compaction';
+  signal:
+    | 'mistake'
+    | 'loop'
+    | 'checkpoint'
+    | 'compaction'
+    | 'model_tier'
+    | 'continuation'
+    | 'compile_exhausted';
   summary: string;
   detail?: Record<string, unknown>;
 }
@@ -168,6 +178,34 @@ export class TaskTraceStore {
     return this.get(taskId);
   }
 
+  async exportSnapshotToWorkspace(params: {
+    workspaceRoot: string;
+    taskId?: string;
+    sessionId?: string;
+  }): Promise<{ ok: boolean; filePath?: string; taskId?: string; error?: string }> {
+    const snap = params.taskId
+      ? this.get(params.taskId)
+      : params.sessionId
+        ? this.getBySession(params.sessionId)
+        : null;
+    if (!snap) {
+      return { ok: false, error: 'trace_not_found' };
+    }
+    if (!params.workspaceRoot) {
+      return { ok: false, error: 'missing_workspace' };
+    }
+    try {
+      const dir = path.join(params.workspaceRoot, '.deepautocode', 'traces');
+      await fs.mkdir(dir, { recursive: true });
+      const rel = `.deepautocode/traces/${snap.taskId}.snapshot.json`;
+      const abs = path.join(params.workspaceRoot, rel);
+      await fs.writeFile(abs, `${JSON.stringify(snap, null, 2)}\n`, 'utf8');
+      return { ok: true, filePath: rel.replace(/\\/g, '/'), taskId: snap.taskId };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message || String(err) };
+    }
+  }
+
   startTask(params: {
     taskId: string;
     sessionId: string;
@@ -220,6 +258,9 @@ export class TaskTraceStore {
     cacheWriteTokens: number;
     tokensUsed: number;
     tokenBudget: number;
+    thinkingEnabled?: boolean;
+    glmControlReason?: string;
+    contextFillRatio?: number;
   }): TraceLlmTurn | null {
     const taskId = params.taskId || this.sessionToTask.get(params.sessionId);
     if (!taskId) return null;
@@ -239,6 +280,13 @@ export class TaskTraceStore {
       cacheWriteTokens: params.cacheWriteTokens,
       tokensUsed: params.tokensUsed,
       tokenBudget: params.tokenBudget,
+      ...(typeof params.thinkingEnabled === 'boolean'
+        ? { thinkingEnabled: params.thinkingEnabled }
+        : {}),
+      ...(params.glmControlReason ? { glmControlReason: params.glmControlReason } : {}),
+      ...(typeof params.contextFillRatio === 'number'
+        ? { contextFillRatio: params.contextFillRatio }
+        : {}),
     };
     snap.totalTurns = Math.max(snap.totalTurns, params.turnIndex + 1);
     snap.tokensUsed = params.tokensUsed;

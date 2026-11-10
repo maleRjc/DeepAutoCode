@@ -110,6 +110,12 @@ export class SessionBridge {
         case 'circuit_breaker_triggered':
           this.eventBridge.emit(ev.sessionId, 'circuit.breaker.triggered', ev.payload);
           break;
+        case 'compile_remediation_exhausted':
+          this.eventBridge.emit(ev.sessionId, 'compile.remediation.exhausted', ev.payload);
+          break;
+        case 'trace_exported':
+          this.eventBridge.emit(ev.sessionId, 'trace.exported', ev.payload);
+          break;
         case 'artifact_created':
           this.eventBridge.emit(ev.sessionId, 'artifact.created', ev.payload);
           break;
@@ -127,6 +133,12 @@ export class SessionBridge {
           break;
         case 'task_state_changed':
           this.eventBridge.emit(ev.sessionId, 'task.state.changed', ev.payload);
+          break;
+        case 'agent_progress':
+          this.eventBridge.emit(ev.sessionId, 'agent.progress', ev.payload);
+          break;
+        case 'reasoning_delta':
+          this.eventBridge.emit(ev.sessionId, 'assistant.reasoning.delta', ev.payload);
           break;
       }
     });
@@ -183,6 +195,7 @@ export class SessionBridge {
     executionMode?: AgentExecutionMode;
     modelId?: string;
     images?: Array<{ name?: string; dataUrl: string; mimeType?: string }>;
+    contextPlan?: import('../core/ComposerContextRouter.js').ComposerContextPlan;
   }): Promise<SessionMessage> {
     const signal = this.resourceManager.createSessionTaskSignal(input.sessionId);
     try {
@@ -193,6 +206,7 @@ export class SessionBridge {
         executionMode: input.executionMode,
         modelId: input.modelId,
         images: input.images,
+        contextPlan: input.contextPlan,
         signal,
       });
       return message;
@@ -372,6 +386,14 @@ export class SessionBridge {
 
   listTraces(limit = 20) {
     return globalTaskTraceStore.list(limit);
+  }
+
+  exportTraceSnapshot(params: {
+    workspaceRoot: string;
+    taskId?: string;
+    sessionId?: string;
+  }) {
+    return globalTaskTraceStore.exportSnapshotToWorkspace(params);
   }
 }
 

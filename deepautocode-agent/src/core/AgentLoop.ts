@@ -303,7 +303,11 @@ export interface AgentOptions {
    * Optional live token budget for compaction. When provided, older tool
    * outputs are summarized more aggressively as fillRatio rises.
    */
-  getContextBudget?: () => { tokensUsed: number; tokenBudget: number | null };
+  getContextBudget?: () => {
+    tokensUsed: number;
+    tokenBudget: number | null;
+    compactProfile?: 'default' | 'glm128k';
+  };
   /** Optional shared mistake tracker (Runtime wires Trace/circuit). */
   mistakeTracker?: MistakeTracker;
   /** Optional shared loop detector. */
@@ -522,13 +526,16 @@ export class Agent {
       toolResultChars: totalChars,
       tokenBudget: budget.tokenBudget,
       tokensUsed: budget.tokensUsed,
+      compactProfile: budget.compactProfile,
     });
 
     // C1: Run token-budget 3-tier decision ({ keep, summarize, drop })
+    const budgetMult = budget.compactProfile === 'glm128k' ? 0.72 : 0.8;
+    const softCap = budget.compactProfile === 'glm128k' ? 96_000 : 128_000;
     const softTokenBudget =
       typeof budget.tokenBudget === 'number' && budget.tokenBudget > 0
-        ? Math.min(128_000, Math.floor(budget.tokenBudget * 0.8))
-        : 128_000;
+        ? Math.min(softCap, Math.floor(budget.tokenBudget * budgetMult))
+        : softCap;
     const budgetDecision = decideBudgetCompaction(budgetItems, {
       softTokenBudget,
       keepRecentCount: plan.keepRecentMessages,

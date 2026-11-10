@@ -151,7 +151,9 @@ async function postJsonResilient(params: {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
       const isTransientSocketErr =
-        /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|socket hang up|EAI_AGAIN|ENOTFOUND|network/i.test(msg);
+        /ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|socket hang up|EAI_AGAIN|ENOTFOUND|network|Request timed out after/i.test(
+          msg
+        );
       if (isPrivateLan && isTransientSocketErr && !params.signal?.aborted) {
         try {
           const relayed = await postJsonViaSshRelay({
@@ -194,7 +196,10 @@ import {
   isGlmModelId,
   parseToolArgumentsResilient,
   resolveGlmRequestControls,
+  resolveLlmPostTimeoutMs,
   resolveModelContextBudget,
+  resolveModelMaxOutputTokens,
+  resolveNestedLlmMaxTokens,
 } from '../../core/DeepSeekModels.js';
 import { SessionReadCache } from '../../core/AgentLoop.js';
 import type { PermissionRuleset } from '../../core/RulePermission.js';
@@ -205,6 +210,7 @@ import {
   shouldUseSshRelayForLanHost,
 } from '../../../providers/index.js';
 import { createUnifiedDiff } from '../tools/FileEditEngine.js';
+import { requestOpenAiChatCompletion } from '../OpenAiStreamChat.js';
 
 const sessionReadCaches = new Map<string, SessionReadCache>();
 const sshRelayLanHosts = new Set<string>();
@@ -214,10 +220,12 @@ export { postJsonOnce, postJsonResilient };
 export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
   manifest: SessionManifest;
   prompt: string;
+  contextPlan?: import('../../core/ComposerContextRouter.js').ComposerContextPlan;
   apiKey: string;
   signal: AbortSignal;
   chunks: string[];
   streamText: (text: string) => Promise<void>;
+  streamReasoning?: (text: string) => Promise<void>;
   runCapabilityTool: (
     capability: CapabilityName,
     args: Record<string, unknown>,
@@ -240,6 +248,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
     signal,
     chunks,
     streamText,
+    streamReasoning,
     runCapabilityTool,
     diffIds,
     taskId,
@@ -255,6 +264,34 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       : runtimeCtx.providerManager.getActiveProvider().provider;
   const endpoint = resolveChatCompletionsUrl(provider.apiEndpoint);
   const isSshMirrorWorkspace = manifest.workspaceRoot.includes('ssh-mirrors');
+  const sessionModelId = manifest.modelId || provider.defaultModelId;
+  const sessionIsGlm = isGlmModelId(sessionModelId, provider.providerId);
+  const sessionProviderModelMeta = Array.isArray(provider.models)
+    ? provider.models.find((m: { modelId?: string }) => m.modelId === sessionModelId) ??
+      provider.models[0]
+    : undefined;
+  const sessionCatalogMaxOutput = (sessionProviderModelMeta as { maxOutputTokens?: number } | undefined)
+    ?.maxOutputTokens;
+  const nestedLlmMaxTokens = {
+    subagent: resolveNestedLlmMaxTokens({
+      modelId: sessionModelId,
+      providerId: provider.providerId,
+      catalogMaxOutput: sessionCatalogMaxOutput,
+      role: 'subagent',
+    }),
+    decompose: resolveNestedLlmMaxTokens({
+      modelId: sessionModelId,
+      providerId: provider.providerId,
+      catalogMaxOutput: sessionCatalogMaxOutput,
+      role: 'decompose',
+    }),
+    synthesize: resolveNestedLlmMaxTokens({
+      modelId: sessionModelId,
+      providerId: provider.providerId,
+      catalogMaxOutput: sessionCatalogMaxOutput,
+      role: 'synthesize',
+    }),
+  };
 
   // Build top-level workspace file list for context
   let workspaceFilesHint = '';
@@ -291,6 +328,20 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
     DEFAULT_GOAL_TOKEN_BUDGET,
     resolveTieredModelForTurn,
     classifyPromptIntent,
+    promptRequestsWorkspaceArtifact,
+    promptRequestsCompileRemediation,
+    assistantLacksRemediationPlan,
+    resolveCompileBuildFailContinuation,
+    resolveCompileLacksPlanContinuation,
+    shouldEmitCompileRemediationExhausted,
+    COMPILE_REMEDIATION_EXHAUSTED_USER_HINTS,
+    buildCompileRemediationFollowUpPrompt,
+    COMPILE_REMEDIATION_CONTINUATION_MAX,
+    buildGlmCompactSystemAppendix,
+    buildGlmWorkspaceBrief,
+    trimToolDescriptionForGlm,
+    trimToolDescriptionForGlmAggressive,
+    trimToolJsonSchemaForGlm,
     planModeShellBudgetExceeded,
     ensureAgentSandboxBranch,
     rollbackSessionMutations,
@@ -409,10 +460,14 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
   );
   let budgetLimitNotified = false;
   const promptIntent = classifyPromptIntent(basePromptForTurn);
-  const isReadOnlyTurn =
-    slashExpanded.suggestedMode === 'plan' ||
-    manifest.executionMode === 'plan' ||
-    (!promptIntent.allowFileMutations && slashExpanded.suggestedMode !== 'auto');
+  const deliverableArtifactTurn =
+    promptRequestsWorkspaceArtifact(basePromptForTurn) && promptIntent.allowFileMutations;
+  const compileRemediationTurn =
+    typeof promptRequestsCompileRemediation === 'function'
+      ? promptRequestsCompileRemediation(basePromptForTurn)
+      : false;
+  // allowFileMutations (FORCE_AUTO_ACTION / deliverable / fix verbs) overrides UI Plan mode.
+  const isReadOnlyTurn = !promptIntent.allowFileMutations;
   // Hard Plan/readonly: CapabilityRegistry must see executionMode=plan even when
   // manifest stays auto (intent-classified read-only turns).
   if (policyGate && isReadOnlyTurn) {
@@ -542,6 +597,18 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
     planModeShellCallCount += 1;
     return planModeShellBudgetExceeded(true, planModeShellCallCount);
   };
+  const DELIVERABLE_MAX_SHELL_BEFORE_WRITE = 12;
+  let deliverableShellCallsWithoutWrite = 0;
+  const takeDeliverableShellSlot = (): string | undefined => {
+    if (!deliverableArtifactTurn || sessionWrittenFiles.length > 0) return undefined;
+    deliverableShellCallsWithoutWrite += 1;
+    if (deliverableShellCallsWithoutWrite <= DELIVERABLE_MAX_SHELL_BEFORE_WRITE) return undefined;
+    return (
+      `DELIVERABLE_EXPLORATION_CAP: User requires a workspace file (tutorial/PDF). ` +
+      `You already ran ${deliverableShellCallsWithoutWrite} shell commands without write_file. ` +
+      `STOP grep/pandoc probes — call write_file NOW (e.g. docs/tutorials/nccl-ll-vs-simple-tutorial.md with full Chinese content), then at most ONE run_command for pandoc if needed.`
+    );
+  };
   let hasUnverifiedCompiledEdit = false;
   let hasUnverifiedTestAfterEdit = false;
   let lastBuildOrTestFailed = false;
@@ -552,11 +619,13 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
   let selfHealCount = 0;
   let verifyNudgeCount = 0;
   let autoContinuationCount = 0;
+  let compileRemediationContinuationCount = 0;
   let editMismatchCount = 0;
   let lastVerifierPass: boolean | null = null;
   let sandboxBranchEnsured = false;
   let circuitBroken = false;
   let circuitBreakerNotified = false;
+  let compileExhaustedNotified = false;
   const mistakeTracker =
     typeof MistakeTracker === 'function' ? new MistakeTracker() : null;
   const loopDetection =
@@ -699,9 +768,11 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
   const recordCommandOutcome = (cmd: string, res: { exitCode: number; stdout?: string; stderr?: string }) => {
     const combinedOut = `${res.stdout || ''}\n${res.stderr || ''}`;
     const isBuildCmd =
-      /\b(?:make|cmake|ninja|gcc|g\+\+|hipcc|nvcc|cargo\s+build|go\s+build|npm\s+run\s+(?:build|typecheck)|tsc|py_compile|compileall|pyinstaller|dotnet\s+build|javac|mvn|gradle)\b/i.test(
+      /\b(?:make|cmake|ninja|gcc|g\+\+|hipcc|nvcc|cargo\s+build|go\s+build|npm\s+run\s+(?:build|typecheck)|tsc|py_compile|compileall|pyinstaller|dotnet\s+build|javac|mvn|gradle|hipify)\b/i.test(
         cmd
-      );
+      ) ||
+      /\bcmake\s+--build\b/i.test(cmd) ||
+      /\b(?:build|compile|hipify)[^\s;|&]*\.sh\b/i.test(cmd);
     const isTestCmd =
       /(?:_perf\b|\bctest\b|\bpytest\b|\bvitest\b|\bnpm\s+test\b|\bcargo\s+test\b|\bgo\s+test\b|\bdotnet\s+test\b|\bpython3?\s+(?:-m\s+unittest\b|[^\s;|&]*test[^\s;|&]*\.py\b)|\bverify-[a-z0-9_.-]+|\.\/(?:build\/)?[a-z0-9_]+_perf\b)/i.test(
         cmd
@@ -785,6 +856,47 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       summary: `${isBuildCmd ? 'build' : 'test'} exit=${res.exitCode} · ${cmd}`,
     });
     if (verifyEvt) emitTraceUpdated?.(verifyEvt);
+  };
+
+  const recordContinuationTrace = (
+    continuationCase: string,
+    summary: string,
+    extra?: Record<string, unknown>
+  ) => {
+    if (!taskId) return;
+    const evt = globalTaskTraceStore.recordSignal?.({
+      workspaceRoot: manifest.workspaceRoot,
+      sessionId,
+      taskId,
+      signal: 'continuation',
+      summary,
+      detail: {
+        case: continuationCase,
+        compileRemediationTurn,
+        compileRemediationContinuationCount,
+        selfHealCount,
+        verifyNudgeCount,
+        autoContinuationCount,
+        lastBuildOrTestFailed,
+        lastSemanticFailed,
+        sessionWrites: sessionWrittenFiles.length,
+        ...extra,
+      },
+    });
+    if (evt) emitTraceUpdated?.(evt);
+  };
+
+  const continueAgentLoop = (
+    continuationCase: string,
+    traceSummary: string,
+    promptBody: string,
+    extra?: Record<string, unknown>
+  ) => {
+    recordContinuationTrace(continuationCase, traceSummary, extra);
+    return {
+      shouldContinue: true as const,
+      prompt: buildGoalContinuationPrompt(activeGoal, promptBody),
+    };
   };
 
   const runPostEditDiagnostics = async (
@@ -1185,8 +1297,10 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           executedCommandCounts.set(normCmd, prevCmdCount + 1);
         }
         const planShellBlock = takePlanModeShellSlot();
-        if (planShellBlock) {
-          return planShellBlock;
+        const deliverableShellBlock = takeDeliverableShellSlot();
+        const shellBlock = planShellBlock || deliverableShellBlock;
+        if (shellBlock) {
+          return shellBlock;
         }
         const res = (await runCapabilityTool('run-build', { command: cmd }, 'high')) as {
           exitCode: number;
@@ -2244,14 +2358,17 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       execute: async (rawArgs: Record<string, unknown>) => {
         const command = String(rawArgs?.command || '');
         const planShellBlock = takePlanModeShellSlot();
-        if (planShellBlock) {
+        const deliverableShellBlock = takeDeliverableShellSlot();
+        const shellBlock = planShellBlock || deliverableShellBlock;
+        if (shellBlock) {
           return {
             command,
             exitCode: 1,
             stdout: '',
-            stderr: planShellBlock,
+            stderr: shellBlock,
             durationMs: 0,
-            planShellBudgetExceeded: true,
+            planShellBudgetExceeded: Boolean(planShellBlock),
+            deliverableExplorationCap: Boolean(deliverableShellBlock),
           };
         }
         const isDaemon = Boolean(rawArgs?.isDaemon);
@@ -2421,13 +2538,17 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       },
       execute: async (rawArgs: Record<string, unknown>) => {
         const planShellBlock = takePlanModeShellSlot();
-        if (planShellBlock) {
+        const deliverableShellBlock = takeDeliverableShellSlot();
+        const shellBlock = planShellBlock || deliverableShellBlock;
+        if (shellBlock) {
           return {
             command: '',
             exitCode: 1,
             stdout: '',
-            stderr: planShellBlock,
-            planShellBudgetExceeded: true,
+            stderr: shellBlock,
+            durationMs: 0,
+            planShellBudgetExceeded: Boolean(planShellBlock),
+            deliverableExplorationCap: Boolean(deliverableShellBlock),
           };
         }
         let cmd = String(rawArgs?.customBuildCommand || '').trim();
@@ -2750,11 +2871,17 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
                       : manifest.modelId || provider.defaultModelId,
                     messages: subMessages,
                     tools: openAiTools,
-                    max_tokens: 1500,
+                    max_tokens: nestedLlmMaxTokens.subagent,
                     temperature: 0.15,
+                    ...(sessionIsGlm
+                      ? {
+                          chat_template_kwargs: { enable_thinking: false },
+                          parallel_tool_calls: false,
+                        }
+                      : {}),
                   },
                   signal: subSignal,
-                  timeoutMs: 25_000,
+                  timeoutMs: sessionIsGlm ? 45_000 : 25_000,
                 });
                 if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const data = JSON.parse(resp.text || '{}');
@@ -3138,11 +3265,14 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
                         },
                         { role: 'user', content: researchTask.slice(0, 1200) },
                       ],
-                      max_tokens: 400,
+                      max_tokens: nestedLlmMaxTokens.decompose,
                       temperature: 0.1,
+                      ...(sessionIsGlm
+                        ? { chat_template_kwargs: { enable_thinking: false } }
+                        : {}),
                     },
                     signal,
-                    timeoutMs: 8000,
+                    timeoutMs: sessionIsGlm ? 20_000 : 8000,
                   });
                   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                   const data = JSON.parse(resp.text || '{}');
@@ -3177,11 +3307,14 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
                           content: `Task: ${researchTask.slice(0, 800)}\n\nEvidence:\n${evidence.slice(0, 4500)}`,
                         },
                       ],
-                      max_tokens: 500,
+                      max_tokens: nestedLlmMaxTokens.synthesize,
                       temperature: 0.15,
+                      ...(sessionIsGlm
+                        ? { chat_template_kwargs: { enable_thinking: false } }
+                        : {}),
                     },
                     signal,
-                    timeoutMs: 12_000,
+                    timeoutMs: sessionIsGlm ? 30_000 : 12_000,
                   });
                   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                   const data = JSON.parse(resp.text || '{}');
@@ -4012,9 +4145,29 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
 
   // Convert prior session history into AgentMessage format, ensuring no assistant/user message ever has empty content
   const history: any[] = await runtimeCtx.readMessages(sessionId);
+  const {
+    buildContextRoutingPromptBlock,
+    historySliceBounds,
+    resolveComposerContextPlan,
+  } = await import('../../core/ComposerContextRouter.js');
+  const priorMessagesForPlan = history
+    .slice(0, Math.max(0, history.length - 1))
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .map((m) => ({
+      role: m.role as string,
+      content: typeof m.content === 'string' ? m.content : '',
+    }));
+  const contextPlan =
+    params.contextPlan ??
+    resolveComposerContextPlan({
+      newPrompt: basePromptForTurn,
+      messages: priorMessagesForPlan,
+      allowFork: false,
+    });
+  const histBounds = historySliceBounds(history.length, contextPlan);
   const priorToolAuditLines: string[] = [];
   const initialMessages = history
-    .slice(-5, -1)
+    .slice(histBounds.start, histBounds.end)
     .filter((m) => m.role === 'user' || m.role === 'assistant')
     .map((m, idx) => {
       let text = typeof m.content === 'string' ? m.content.trim() : '';
@@ -4054,13 +4207,38 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
 
   // Prefix-Cache Boundary Optimization (ported from Claude Code src/context.ts):
   // Keep systemPrompt 100% static across session turns and place dynamic prior-turn audit context in the user turn tail.
-  if (priorToolAuditLines.length > 0) {
-    effectivePrompt = `${effectivePrompt}\n\n[Prior Session Executed Tools Audit (do NOT repeat this tag in output): ${priorToolAuditLines.join(' | ')}]`;
+  if (priorToolAuditLines.length > 0 && contextPlan.includeToolAudit) {
+    let auditLines = priorToolAuditLines;
+    if (contextPlan.stripDeliverableFromAudit) {
+      auditLines = auditLines.filter(
+        (line) =>
+          !/docs\/tutorials|pandoc|\.pdf|write[-_]file.*tutorial|read[-_]file.*\.pdf/i.test(
+            line
+          )
+      );
+    }
+    if (auditLines.length > 0) {
+      effectivePrompt = `${effectivePrompt}\n\n[Prior Session Executed Tools Audit (do NOT repeat this tag in output): ${auditLines.join(' | ')}]`;
+    }
   }
+  effectivePrompt = `${effectivePrompt}\n\n${buildContextRoutingPromptBlock(contextPlan)}`;
   if (isReadOnlyTurn) {
     effectivePrompt = `${effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '')}\n\n[Smart Intent Router: READ-ONLY QUERY & ANALYSIS MODE — Use read_file / outline_file / search_codebase / explore_codebase, and investigation shells (ls/cat/git status/npm test). Mutating shells (rm/mv/git commit/npm install/redirects) are blocked by CommandGuard. Shell commands are capped per turn (after ~14 calls, use search_codebase instead of more rg/grep loops). To write docs/PDF, the user must switch Composer to Auto (not Plan). Do NOT edit files in this turn.]`;
   } else {
     effectivePrompt = effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '');
+    if (deliverableArtifactTurn) {
+      effectivePrompt = `${effectivePrompt}\n\n[DELIVERABLE_ARTIFACT_MANDATE]
+User requires a workspace deliverable (tutorial / PDF / report), NOT chat-only text.
+1. After at most ~12 lightweight read_file/search calls, call write_file to save the full Chinese tutorial under docs/tutorials/ (e.g. docs/tutorials/nccl-ll-vs-simple-tutorial.md). Minimum ~2500 words, with diagrams (Mermaid or ASCII).
+2. Optionally run ONE run_command to convert Markdown to PDF if pandoc is installed; otherwise deliver the .md path clearly.
+3. Do NOT burn turns on repeated rg/grep/pandoc probes without writing the file first.`;
+    } else if (compileRemediationTurn) {
+      effectivePrompt = `${effectivePrompt}\n\n[COMPILE_FIX_REMEDIATION_MANDATE]
+User expects a fix (edit + re-build), NOT English chain-of-thought only.
+1. Prefer edit_file/apply_patch on the failing sources, then run_command to re-build/verify.
+2. If you must answer in chat, use Chinese Markdown with required sections: ## 根因, ## 修复步骤 (numbered, each with \`file:line\` + what to delete/change/add + optional fenced patch), ## 验证命令.
+3. Do NOT stop after only repeating compiler errors from run_command — deliver actionable steps or land the patch.`;
+    }
   }
 
   // 3. Convert AgentModelRequest into OpenAI-Compatible / DeepSeek HTTP stream
@@ -4126,6 +4304,18 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         })
         : null;
       const isReasonerModel = Boolean(dsControls?.isThinking);
+      const staticToolCount = Array.isArray(request.tools) ? request.tools.length : 0;
+      const toolCallingTurn = allowToolsThisTurn && staticToolCount > 0;
+      const providerModelMeta = Array.isArray(provider.models)
+        ? provider.models.find((m: { modelId?: string }) => m.modelId === activeModelId) ??
+          provider.models[0]
+        : undefined;
+      const llmMaxTokens = resolveModelMaxOutputTokens({
+        modelId: activeModelId,
+        providerId: provider.providerId,
+        catalogMaxOutput: (providerModelMeta as { maxOutputTokens?: number } | undefined)
+          ?.maxOutputTokens,
+      });
       const isGlmModel = isGlmModelId(activeModelId, provider.providerId);
       const glmControls = isGlmModel
         ? resolveGlmRequestControls({
@@ -4136,7 +4326,9 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             turnIndex: modelTurnIndex,
             selfHealCount,
             hasFailure: lastBuildOrTestFailed || lastSemanticFailed || editMismatchCount > 0,
-            userPrompt: prompt,
+            userPrompt: basePromptForTurn,
+            compileRemediationTurn,
+            toolCallingTurn,
           })
         : null;
       const effectiveTokenBudget = resolveModelContextBudget({
@@ -4159,9 +4351,34 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           tokenBudget: effectiveTokenBudget,
           tier: tierDecision.tier,
           reason: glmControls ? `${tierDecision.reason} (${glmControls.reason})` : tierDecision.reason,
+          glmControlReason: glmControls?.reason,
+          contextFillRatio:
+            effectiveTokenBudget > 0 ? activeGoal.tokensUsed / effectiveTokenBudget : 0,
+          compactProfile: sessionIsGlm ? 'glm128k' : 'default',
           turnIndex: modelTurnIndex,
         },
       });
+      if (taskId && isGlmModel) {
+        const tierTrace = globalTaskTraceStore.recordSignal?.({
+          workspaceRoot: manifest.workspaceRoot,
+          sessionId,
+          taskId,
+          signal: 'model_tier',
+          summary: `T${modelTurnIndex} ${activeModelId} ${
+            glmControls?.enableThinking ? 'think:on' : 'think:off'
+          } · ${glmControls?.reason ?? tierDecision.reason}`,
+          detail: {
+            turnIndex: modelTurnIndex,
+            modelId: activeModelId,
+            thinkingEnabled: Boolean(glmControls?.enableThinking),
+            glmControlReason: glmControls?.reason,
+            contextFillRatio:
+              effectiveTokenBudget > 0 ? activeGoal.tokensUsed / effectiveTokenBudget : 0,
+            compactProfile: sessionIsGlm ? 'glm128k' : 'default',
+          },
+        });
+        if (tierTrace) emitTraceUpdated?.(tierTrace);
+      }
       activeGoal.turnsExecuted = modelTurnIndex;
 
       const openAiMessages: Array<Record<string, any>> = [];
@@ -4289,14 +4506,19 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       if (isFinishingStage) {
         openAiMessages.push({
           role: 'system',
-          content:
-            'You have completed sufficient workspace exploration. Do NOT ask the user for confirmation. In your remaining turns, immediately call edit_file / write_file to apply your code fixes and call run_command to compile and run verification tests!',
+          content: deliverableArtifactTurn && sessionWrittenFiles.length === 0
+            ? 'Deliverable turn: exploration budget exhausted. STOP shell probes. In remaining turns you MUST call write_file NOW (docs/tutorials/*.md with full Chinese tutorial). Then at most ONE pandoc run_command if needed. Do NOT output only chat Markdown.'
+            : 'You have completed sufficient workspace exploration. Do NOT ask the user for confirmation. In your remaining turns, immediately call edit_file / write_file to apply your code fixes and call run_command to compile and run verification tests!',
         });
       } else if (!allowToolsThisTurn) {
         openAiMessages.push({
           role: 'system',
           content:
-            'You have completed enough workspace file/tool inspections. Do NOT call any more tools. Immediately synthesize all information gathered above into a comprehensive, well-structured Markdown response in Chinese.',
+            deliverableArtifactTurn && sessionWrittenFiles.length === 0
+              ? 'Tool turn limit reached but no workspace file was written. Summarize briefly in Chinese AND list the exact write_file path/content the user should save — but prefer having called write_file earlier.'
+              : compileRemediationTurn
+                ? 'Tool turn limit reached. Output Chinese Markdown ONLY (not English chain-of-thought) with mandatory sections: ## 根因, ## 修复步骤 (numbered file:line edits + fenced patches), ## 验证命令. If edits were not applied, every step must be copy-paste actionable.'
+                : 'You have completed enough workspace file/tool inspections. Do NOT call any more tools. Immediately synthesize all information gathered above into a comprehensive, well-structured Markdown response in Chinese.',
         });
       }
 
@@ -4306,52 +4528,99 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       // never invalidates the systemPrompt + tools KV cache block.
       const staticTools = request.tools ?? [];
 
+      const glmToolTrimAggressive =
+        isGlmModel &&
+        Number(activeGoal.tokenBudget) > 0 &&
+        activeGoal.tokensUsed / Number(activeGoal.tokenBudget) >= 0.62;
+      const trimGlmDesc =
+        typeof trimToolDescriptionForGlm === 'function'
+          ? glmToolTrimAggressive
+            ? trimToolDescriptionForGlmAggressive
+            : trimToolDescriptionForGlm
+          : (d: unknown) => String(d ?? '');
       const openAiTools = allowToolsThisTurn
         ? staticTools.map((t: any) => ({
           type: 'function',
           function: {
             name: t.name,
-            description: t.description,
-            parameters: t.inputSchema ?? { type: 'object', properties: {} },
+            description: isGlmModel ? trimGlmDesc(t.description) : t.description,
+            parameters: isGlmModel
+              ? typeof trimToolJsonSchemaForGlm === 'function'
+                ? trimToolJsonSchemaForGlm(t.inputSchema)
+                : (t.inputSchema ?? { type: 'object', properties: {} })
+              : (t.inputSchema ?? { type: 'object', properties: {} }),
           },
         }))
         : [];
 
       const isLocalInference = isLocalOrPrivateEndpoint(provider.apiEndpoint);
+      const llmTimeoutMs = resolveLlmPostTimeoutMs({
+        isReasonerModel,
+        isGlmModel,
+        isLocalInference,
+        isSshMirrorWorkspace,
+      });
 
-      const response = await postJsonResilient({
+      emitRuntimeEvent({
+        type: 'agent_progress',
+        sessionId,
+        payload: {
+          turn: modelTurnIndex,
+          modelId: activeModelId,
+          phase: 'llm',
+          message: `模型推理中（第 ${modelTurnIndex} 轮）…`,
+        },
+      });
+
+      const chatBody = {
+        model: activeModelId,
+        messages: openAiMessages,
+        tools: openAiTools.length > 0 ? openAiTools : undefined,
+        tool_choice: openAiTools.length > 0 ? 'auto' : undefined,
+        max_tokens: llmMaxTokens,
+        ...(isReasonerModel
+          ? {}
+          : glmControls
+            ? { temperature: glmControls.temperature, top_p: glmControls.topP }
+            : { temperature: 0.2 }),
+        ...(dsControls ? deepSeekChatBodyExtras(dsControls) : {}),
+        ...(glmControls
+          ? { chat_template_kwargs: glmControls.chatTemplateKwargs }
+          : {}),
+        ...(isGlmModel && openAiTools.length > 0 ? { parallel_tool_calls: false } : {}),
+      };
+
+      const useStream = !isReasonerModel;
+      let streamedAssistantContent = false;
+      const llmRes = await requestOpenAiChatCompletion({
         url: endpoint,
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
         },
-        body: {
-          model: activeModelId,
-          messages: openAiMessages,
-          tools: openAiTools.length > 0 ? openAiTools : undefined,
-          tool_choice: openAiTools.length > 0 ? 'auto' : undefined,
-          max_tokens: 8192,
-          ...(isReasonerModel
-            ? {}
-            : glmControls
-              ? { temperature: glmControls.temperature, top_p: glmControls.topP }
-              : { temperature: 0.2 }),
-          ...(dsControls ? deepSeekChatBodyExtras(dsControls) : {}),
-          ...(glmControls
-            ? { chat_template_kwargs: glmControls.chatTemplateKwargs }
-            : {}),
-        },
+        body: chatBody,
         signal: request.signal ?? signal,
-        timeoutMs: isReasonerModel || isGlmModel || isLocalInference ? 180000 : 90000,
+        timeoutMs: llmTimeoutMs,
+        streamPreferred: useStream,
+        onReasoningDelta: (t) => {
+          if (t && typeof streamReasoning === 'function') {
+            void streamReasoning(t);
+          }
+        },
+        onContentDelta: (t) => {
+          if (t && openAiTools.length === 0) {
+            streamedAssistantContent = true;
+            void streamText(t);
+          }
+        },
       });
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.text.slice(0, 240)}`);
+      if (!llmRes.ok) {
+        throw new Error(`HTTP ${llmRes.status}: chat completion failed`);
       }
 
-      const data = JSON.parse(response.text || '{}') as any;
-      const choice = data?.choices?.[0];
-      const msg = choice?.message;
+      const data = { usage: llmRes.usage, choices: [{ message: llmRes.message }] } as any;
+      const msg = llmRes.message;
       if (!msg) {
         throw new Error('Empty response from LLM provider');
       }
@@ -4424,11 +4693,15 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             ? cleanedMsgContent
             : sessionWrittenFiles.length > 0
               ? `## 项目构建与文件生成完成\n- **已生成/更新文件 (${sessionWrittenFiles.length})**: ${Array.from(new Set(sessionWrittenFiles)).map((f) => `\`${f}\``).join('、')}\n- **状态**: 所有文件已写入工作区并生成 Diff 预览。`
-              : '已完成当前请求分析与处理。';
-        yield {
-          type: 'text-delta' as const,
-          text: finalContent,
-        };
+              : compileRemediationTurn
+                ? '## 状态\n本轮仅完成错误分析，未写入修复方案或补丁。请让 Agent 继续，或重试并明确要求输出 **## 根因 / ## 修复步骤 / ## 验证命令** 或直接 edit_file。'
+                : '已完成当前请求分析与处理。';
+        if (!streamedAssistantContent) {
+          yield {
+            type: 'text-delta' as const,
+            text: finalContent,
+          };
+        }
       }
 
       for (let i = 0; i < validToolCalls.length; i++) {
@@ -4465,6 +4738,9 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           cacheWriteTokens: cacheMissTok,
           tokensUsed: activeGoal.tokensUsed,
           tokenBudget: budget,
+          thinkingEnabled: isGlmModel ? Boolean(glmControls?.enableThinking) : thinkingEnabled,
+          glmControlReason: glmControls?.reason,
+          contextFillRatio: budget > 0 ? activeGoal.tokensUsed / budget : 0,
         });
         const snap = taskId
           ? globalTaskTraceStore.get(taskId)
@@ -4498,6 +4774,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             thinkingEnabled,
             turnIndex: modelTurnIndex,
             remaining: Math.max(0, budget - activeGoal.tokensUsed),
+            fillRatio: budget > 0 ? activeGoal.tokensUsed / budget : 0,
             latencyMs,
             taskId,
           },
@@ -4558,6 +4835,24 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
   const officialClinePromptWithMemory = memorySection
     ? `${officialClinePrompt}\n\n${memorySection}`
     : officialClinePrompt;
+  const glmSystemBase =
+    sessionIsGlm && typeof buildGlmWorkspaceBrief === 'function'
+      ? buildGlmWorkspaceBrief({
+          workspaceRoot: manifest.workspaceRoot,
+          workspaceFilesHint,
+          memorySection,
+        })
+      : officialClinePromptWithMemory;
+  const glmCompactGuidelines =
+    sessionIsGlm && typeof buildGlmCompactSystemAppendix === 'function'
+      ? buildGlmCompactSystemAppendix({
+          workspaceRoot: manifest.workspaceRoot,
+          executionMode: manifest.executionMode,
+          verifyCommand: preferredVerifyCommand,
+          isSshMirror: isSshMirrorWorkspace,
+          compileRemediation: compileRemediationTurn,
+        })
+      : '';
 
   const baseToolPolicies =
     typeof createToolPoliciesWithPreset === 'function'
@@ -4577,8 +4872,10 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       ? applyStandardToolAliases([...deepAutoCodeTools, ...builtinTools])
       : [...deepAutoCodeTools, ...builtinTools];
   // Plan/read-only: keep investigation shells (CommandGuard blocks mutators); drop editors.
+  const planBlocksEditorTools =
+    manifest.executionMode === 'plan' && promptIntent.intent !== 'auto-action';
   const activeTurnTools = mergedTools.filter((t) =>
-    isReadOnlyTurn || manifest.executionMode === 'plan'
+    isReadOnlyTurn || planBlocksEditorTools
       ? ![
         'edit_file',
         'str_replace',
@@ -4594,7 +4891,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
   const asksUserOrDefersExecutionPattern =
     /(?:请确认|需要你确认|需要您确认|需确认|我未读到|需要我直接|要我直接|是否现在执行|确认后我会|请问是否|直接授权我|我会立即修改|是否继续执行|请告诉我是否|需要我现在执行吗|请执行[:：]?|请先执行|请在远程服务器执行)/;
   const proposesCodeChangesInTextPattern =
-    /(?:###?\s*(?:改动|修改|步骤)\s*\d|####\s*(?:改动|修改|步骤)\s*\d|##\s*✅?\s*Kernel\s*侧修复方案|##\s*修复方案)/;
+    /(?:###?\s*(?:改动|修改|步骤)\s*\d|####\s*(?:改动|修改|步骤)\s*\d|##\s*✅?\s*Kernel\s*侧修复方案|##\s*修复方案|##\s*修复步骤|##\s*根因\b)/;
 
   let sharedReadCache = sessionReadCaches.get(sessionId);
   if (!sharedReadCache) {
@@ -4616,6 +4913,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
     getContextBudget: () => ({
       tokensUsed: activeGoal.tokensUsed,
       tokenBudget: activeGoal.tokenBudget,
+      compactProfile: sessionIsGlm ? ('glm128k' as const) : ('default' as const),
     }),
     requestToolApproval: async ({ toolName, args, summary }) => {
       const filePath =
@@ -4636,8 +4934,9 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       });
       return { approved: decision.approved, reason: decision.reason };
     },
-    systemPrompt:
-      `${officialClinePromptWithMemory}\n\n` +
+    systemPrompt: sessionIsGlm
+      ? `${glmSystemBase}\n\n${glmCompactGuidelines}`
+      : `${officialClinePromptWithMemory}\n\n` +
       `# DeepAutoCode Desktop IDE Environment & Guidelines\n` +
       `- Current Workspace Root: ${manifest.workspaceRoot}\n` +
       `- Top-level Workspace Entries: ${workspaceFilesHint || '(empty or unknown)'}\n` +
@@ -4673,7 +4972,10 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       `- CRITICAL SAFETY RULE: NEVER run 'taskkill /F /IM node.exe', 'Stop-Process -Name node', or kill all node/electron processes globally, because the DeepAutoCode IDE backend itself runs on Node.js (port 3840). When asked to compile & run ("编译运行" / "启动服务"), run syntax checks (e.g. 'node --check server/server.js') and start the server via 'run_command' (e.g. 'node server/server.js'). If the target port is already in use, the server is already running in the background — simply verify it with 'curl.exe -s -I http://localhost:3000'.\n` +
       `- Do NOT output raw file contents or narrate your file-reading process in text; the IDE automatically displays a real-time progress indicator for all file/tool operations.\n` +
       `- In 'plan' mode, only use read-only tools.\n` +
-      `- Respond clearly and concisely in the user's language (Chinese by default).`,
+      `- Respond clearly and concisely in the user's language (Chinese by default).\n` +
+      (isGlmModelId(manifest.modelId || provider.defaultModelId, provider.providerId)
+        ? `- GLM: Put the user-visible answer in \`content\` (Chinese Markdown). When thinking is off, never end a turn with analysis-only English in lieu of ## 根因 / ## 修复步骤.\n`
+        : ''),
     tools: activeTurnTools,
     initialMessages,
     maxIterations: 105,
@@ -4735,6 +5037,45 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         }
       },
       onBeforeFinish: async ({ assistantText, iterations, consecutiveMistakes }) => {
+        if (
+          deliverableArtifactTurn &&
+          sessionWrittenFiles.length === 0 &&
+          !isReadOnlyTurn &&
+          autoContinuationCount < 4
+        ) {
+          autoContinuationCount += 1;
+          return continueAgentLoop(
+            'deliverable_missing',
+            '续跑：交付物未写入工作区',
+            `交付物仍未写入工作区！用户要的是可打开的 tutorial/PDF，不是聊天记录。请立即 write_file 写入 docs/tutorials/nccl-ll-vs-simple-tutorial.md（完整中文小白教程：NCCL LL 与 Simple 协议、kernel 执行流程、图示、与常见问题）。写完后如需 PDF 再 run_command 一次 pandoc。禁止继续 grep/rg 循环。`
+          );
+        }
+
+        const compileContinuationInput = {
+          compileRemediationTurn,
+          isReadOnlyTurn,
+          executionMode: manifest.executionMode || 'auto',
+          sessionWriteCount: sessionWrittenFiles.length,
+          lastBuildOrTestFailed,
+          assistantText,
+          compileRemediationContinuationCount,
+          autoContinuationCount,
+        };
+        const compileBuildFailCase =
+          typeof resolveCompileBuildFailContinuation === 'function'
+            ? resolveCompileBuildFailContinuation(compileContinuationInput)
+            : null;
+        if (compileBuildFailCase === 'compile_build_fail_no_edit') {
+          compileRemediationContinuationCount += 1;
+          autoContinuationCount += 1;
+          return continueAgentLoop(
+            'compile_build_fail_no_edit',
+            `续跑：编译失败且未改文件 (#${compileRemediationContinuationCount})`,
+            `编译/测试仍然失败，且工作区源码尚未被 edit_file/write_file 修改！禁止再只跑 run_command 复述错误。请立即对相关源文件 edit_file/apply_patch 修复（参考失败日志中的 file:line），然后 run_command 重编验证：\`${preferredVerifyCommand}\`。若本轮必须收尾，则输出中文 ## 根因 / ## 修复步骤 / ## 验证命令（每步含 file:line 与具体删改）。失败摘要：\n\`\`\`\n${(lastFailureOutputSnippet || '').slice(0, 900)}\n\`\`\``,
+            { preferredVerifyCommand }
+          );
+        }
+
         if (isReadOnlyTurn || manifest.executionMode !== 'auto' || iterations >= maxToolCallingTurns - 2) {
           return { shouldContinue: false };
         }
@@ -4748,13 +5089,12 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           selfHealCount += 1;
           autoContinuationCount += 1;
           mistakeTracker?.recordSuccess();
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              `检测到连续失误/循环（MistakeTracker consecutive=${consecutiveMistakes}）。请停止重复同一工具调用：换参数、换工具，或先 summarize 失败原因再 edit_file。自愈进度 ${selfHealCount}/${selfHealBudget}。`
-            ),
-          };
+          return continueAgentLoop(
+            'mistake_loop',
+            `续跑：连续失误 consecutive=${consecutiveMistakes}`,
+            `检测到连续失误/循环（MistakeTracker consecutive=${consecutiveMistakes}）。请停止重复同一工具调用：换参数、换工具，或先 summarize 失败原因再 edit_file。自愈进度 ${selfHealCount}/${selfHealBudget}。`,
+            { consecutiveMistakes }
+          );
         }
 
         // Token budget exceeded → ask model to summarize and stop expanding exploration
@@ -4765,6 +5105,10 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         ) {
           budgetLimitNotified = true;
           autoContinuationCount += 1;
+          recordContinuationTrace(
+            'token_budget',
+            `续跑：token budget ${activeGoal.tokensUsed}/${activeGoal.tokenBudget}`
+          );
           return {
             shouldContinue: true,
             prompt:
@@ -4790,15 +5134,13 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
               ? await loadWorkspaceProblemsText(manifest.workspaceRoot, 30)
               : '';
           lastSemanticFailed = false;
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              `编辑后语言服务诊断失败（无需用户 @problems）：\n\`\`\`\n${lastSemanticDiagSnippet || '(semantic diagnostics)'
-              }\n\`\`\`\n${problemsExtra ? `Persisted Problems:\n${problemsExtra}\n` : ''
-              }${todoBlock}请立即 edit_file/apply_patch 修复上述诊断，必要时再 run_command：\`${preferredVerifyCommand}\`。自愈进度 ${selfHealCount}/${selfHealBudget}。`
-            ),
-          };
+          return continueAgentLoop(
+            'semantic_heal',
+            `续跑：语义诊断失败 (#${selfHealCount})`,
+            `编辑后语言服务诊断失败（无需用户 @problems）：\n\`\`\`\n${lastSemanticDiagSnippet || '(semantic diagnostics)'
+            }\n\`\`\`\n${problemsExtra ? `Persisted Problems:\n${problemsExtra}\n` : ''
+            }${todoBlock}请立即 edit_file/apply_patch 修复上述诊断，必要时再 run_command：\`${preferredVerifyCommand}\`。自愈进度 ${selfHealCount}/${selfHealBudget}。`
+          );
         }
 
         // Case 1: Source was edited but build/verify not run yet (verify-nudge budget)
@@ -4806,13 +5148,11 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           verifyNudgeCount += 1;
           autoContinuationCount += 1;
           hasUnverifiedCompiledEdit = false;
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              `你刚刚修改了需要验证的源码，但尚未执行工作区验证门禁！请立即调用 run_command 执行：\n${verifyPromptBlock}\n推荐一条命令：\`${preferredVerifyCommand}\`\n确认构建与测试通过后再输出最终报告。`
-            ),
-          };
+          return continueAgentLoop(
+            'verify_nudge_build',
+            `续跑：已编辑未验证 (#${verifyNudgeCount})`,
+            `你刚刚修改了需要验证的源码，但尚未执行工作区验证门禁！请立即调用 run_command 执行：\n${verifyPromptBlock}\n推荐一条命令：\`${preferredVerifyCommand}\`\n确认构建与测试通过后再输出最终报告。`
+          );
         }
 
         // Case 2: Build done-ish but dedicated test command still pending
@@ -4824,13 +5164,11 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           verifyNudgeCount += 1;
           autoContinuationCount += 1;
           hasUnverifiedTestAfterEdit = false;
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              `代码可能已构建，但仍需运行测试验证！请立即调用 run_command 执行：\`${verifyConfig.testCommand}\`（或组合命令 \`${preferredVerifyCommand}\`），确认测试真实通过后再总结。`
-            ),
-          };
+          return continueAgentLoop(
+            'verify_nudge_test',
+            `续跑：待跑测试 (#${verifyNudgeCount})`,
+            `代码可能已构建，但仍需运行测试验证！请立即调用 run_command 执行：\`${verifyConfig.testCommand}\`（或组合命令 \`${preferredVerifyCommand}\`），确认测试真实通过后再总结。`
+          );
         }
 
         // Case 2b: Verifier subagent reported FAIL
@@ -4838,13 +5176,11 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           selfHealCount += 1;
           autoContinuationCount += 1;
           lastVerifierPass = null;
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              `invoke_subagent(verifier) 判定未通过。请根据其报告修复代码，再重新验证（可再次 invoke_subagent role=verifier 或 run_command \`${preferredVerifyCommand}\`）。自愈进度 ${selfHealCount}/${selfHealBudget}。`
-            ),
-          };
+          return continueAgentLoop(
+            'verifier_fail',
+            `续跑：verifier 未通过 (#${selfHealCount})`,
+            `invoke_subagent(verifier) 判定未通过。请根据其报告修复代码，再重新验证（可再次 invoke_subagent role=verifier 或 run_command \`${preferredVerifyCommand}\`）。自愈进度 ${selfHealCount}/${selfHealBudget}。`
+          );
         }
 
         // Case 3: Build/test failed — independent self-heal budget
@@ -4861,17 +5197,15 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
               : '';
           lastBuildOrTestFailed = false;
           lastSemanticFailed = false;
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              `上一步编译/测试或语义检查未通过（自愈 ${selfHealCount}/${selfHealBudget}，与 verify 催促计数独立）：\n\`\`\`\n${lastFailureOutputSnippet ||
-              lastSemanticDiagSnippet ||
-              '命令返回非零退出码或测试输出包含 FAILED'
-              }\n\`\`\`${failedTests}${problemsExtra ? `\nProblems:\n${problemsExtra}\n` : ''
-              }\n${todoBlock}请立即 edit_file/apply_patch 修复，再 run_command 聚焦重测/验证直到通过。可用 manage_todo 更新任务状态。`
-            ),
-          };
+          return continueAgentLoop(
+            'self_heal_build_test',
+            `续跑：编译/测试失败自愈 ${selfHealCount}/${selfHealBudget}`,
+            `上一步编译/测试或语义检查未通过（自愈 ${selfHealCount}/${selfHealBudget}，与 verify 催促计数独立）：\n\`\`\`\n${lastFailureOutputSnippet ||
+            lastSemanticDiagSnippet ||
+            '命令返回非零退出码或测试输出包含 FAILED'
+            }\n\`\`\`${failedTests}${problemsExtra ? `\nProblems:\n${problemsExtra}\n` : ''
+            }\n${todoBlock}请立即 edit_file/apply_patch 修复，再 run_command 聚焦重测/验证直到通过。可用 manage_todo 更新任务状态。`
+          );
         }
 
         // Case 3c: Incomplete session todos after verify passed — nudge to finish checklist
@@ -4885,13 +5219,11 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         ) {
           verifyNudgeCount += 1;
           autoContinuationCount += 1;
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              `验证已通过，但仍有未完成 session todos：\n${sessionTodos.formatForPrompt()}\n请继续完成剩余项，或用 manage_todo 将已完成的标记 complete 后再总结。`
-            ),
-          };
+          return continueAgentLoop(
+            'session_todos',
+            '续跑：验证通过但 todos 未完成',
+            `验证已通过，但仍有未完成 session todos：\n${sessionTodos.formatForPrompt()}\n请继续完成剩余项，或用 manage_todo 将已完成的标记 complete 后再总结。`
+          );
         }
 
         // Case 3b: Circuit breaker — self-heal budget exhausted → roll back
@@ -4924,6 +5256,9 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             });
           }
           onCircuitTriggered?.();
+          recordContinuationTrace('circuit_breaker', `续跑：熔断 rollback · ${selfHealCount} heals`, {
+            rollbackMsg,
+          });
           return {
             shouldContinue: true,
             prompt:
@@ -4946,13 +5281,93 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         ) {
           verifyNudgeCount += 1;
           autoContinuationCount += 1;
-          return {
-            shouldContinue: true,
-            prompt: buildGoalContinuationPrompt(
-              activeGoal,
-              '已全部授权你直接落地执行！当前处于 auto 全自动执行模式：若目标文件尚未修改，请立即调用 edit_file / write_file 直接修改源码文件并调用 run_command 编译与测试验证；若通过检查发现目标文件在之前轮次已经修改到位，请直接调用 run_command 验证编译/测试并给出最终总结，切勿重复调用 read_file 读取同一文件！'
-            ),
-          };
+          return continueAgentLoop(
+            'defer_without_edit',
+            '续跑：口头方案未落地',
+            '已全部授权你直接落地执行！当前处于 auto 全自动执行模式：若目标文件尚未修改，请立即调用 edit_file / write_file 直接修改源码文件并调用 run_command 编译与测试验证；若通过检查发现目标文件在之前轮次已经修改到位，请直接调用 run_command 验证编译/测试并给出最终总结，切勿重复调用 read_file 读取同一文件！'
+          );
+        }
+
+        const compileLacksPlanCase =
+          typeof resolveCompileLacksPlanContinuation === 'function'
+            ? resolveCompileLacksPlanContinuation({
+                ...compileContinuationInput,
+                lastBuildOrTestFailed,
+                assistantText,
+                compileRemediationContinuationCount,
+                autoContinuationCount,
+              })
+            : null;
+        if (compileLacksPlanCase === 'compile_lacks_plan') {
+          compileRemediationContinuationCount += 1;
+          autoContinuationCount += 1;
+          return continueAgentLoop(
+            'compile_lacks_plan',
+            `续跑：缺少修复方案 (#${compileRemediationContinuationCount})`,
+            `你已分析编译/代码问题，但回复缺少可执行的中文修复方案（需要 ## 根因、## 修复步骤、## 验证命令）。请优先 edit_file 落地；若无法改文件，逐步写出 file:line 级删改说明与代码块补丁，禁止仅用英文 thinking 结束。`,
+            { assistantChars: assistantText.length }
+          );
+        }
+
+        const stillNeedsRemediation =
+          lastBuildOrTestFailed ||
+          (typeof assistantLacksRemediationPlan === 'function'
+            ? assistantLacksRemediationPlan(assistantText)
+            : false);
+        if (
+          !compileExhaustedNotified &&
+          typeof shouldEmitCompileRemediationExhausted === 'function' &&
+          shouldEmitCompileRemediationExhausted({
+            ...compileContinuationInput,
+            lastBuildOrTestFailed,
+            assistantText,
+            compileRemediationContinuationCount,
+            autoContinuationCount,
+            stillNeedsRemediation,
+          })
+        ) {
+          compileExhaustedNotified = true;
+          const hints = Array.isArray(COMPILE_REMEDIATION_EXHAUSTED_USER_HINTS)
+            ? COMPILE_REMEDIATION_EXHAUSTED_USER_HINTS
+            : [];
+          recordContinuationTrace(
+            'compile_remediation_exhausted',
+            `编译续跑已达上限 (${compileRemediationContinuationCount}/${COMPILE_REMEDIATION_CONTINUATION_MAX ?? 4})`,
+            { hints, stillNeedsRemediation }
+          );
+          const exhaustedSig = globalTaskTraceStore.recordSignal?.({
+            workspaceRoot: manifest.workspaceRoot,
+            sessionId,
+            taskId,
+            signal: 'compile_exhausted',
+            summary: '编译自愈续跑预算已用尽',
+            detail: {
+              compileRemediationContinuationCount,
+              hints,
+              stillNeedsRemediation,
+            },
+          });
+          if (exhaustedSig) emitTraceUpdated?.(exhaustedSig);
+          const followUpPrompt =
+            typeof buildCompileRemediationFollowUpPrompt === 'function'
+              ? buildCompileRemediationFollowUpPrompt({
+                  failureSnippet: lastFailureOutputSnippet,
+                  verifyCommand: preferredVerifyCommand,
+                })
+              : '';
+          runtimeCtx.emit({
+            type: 'compile_remediation_exhausted',
+            sessionId,
+            payload: {
+              message:
+                '编译/修复续跑次数已达上限，Agent 将停止自动催促。请按下方建议手动引导下一轮。',
+              compileRemediationContinuationCount,
+              maxCompileRemediations: COMPILE_REMEDIATION_CONTINUATION_MAX ?? 4,
+              hints,
+              stillNeedsRemediation,
+              followUpPrompt,
+            },
+          });
         }
 
         return { shouldContinue: false };
@@ -4990,7 +5405,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             {
               role: 'user',
               content:
-                '请基于以上已读取的工作区文件与目录信息，立即直接输出完整、结构化的 Markdown 总结分析回答（不要再调用任何工具）。',
+                '请基于以上已读取的工作区文件与目录信息，立即直接输出完整、结构化的中文 Markdown（不要再调用任何工具）。必须包含：## 根因、## 修复步骤（逐步 file:line + 改什么 + 可选代码块）、## 验证命令。',
             },
           ],
           temperature: 0.2,

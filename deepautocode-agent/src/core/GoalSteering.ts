@@ -293,6 +293,37 @@ export interface PromptIntentClassification {
 }
 
 /** User wants a file artifact in the workspace (md/pdf/report), not chat-only analysis. */
+/** Compile / test failure remediation: user expects edits or an actionable fix plan, not analysis-only. */
+export function promptRequestsCompileRemediation(rawPrompt: string): boolean {
+  const cleaned = String(rawPrompt || '')
+    .replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION|INLINE_QUERY|INLINE_EDIT)\]\s*/i, '')
+    .trim();
+  if (!cleaned || promptRequestsWorkspaceArtifact(rawPrompt)) return false;
+  const intent = classifyPromptIntent(rawPrompt);
+  if (!intent.allowFileMutations) return false;
+  const hasCompileOrErrorContext =
+    /\b(?:编译|构建|build|make|cmake|ninja|hipcc|hipify|nvcc|clang|gcc|g\+\+)\b/i.test(cleaned) ||
+    /\b(?:error:|fatal error:|undefined reference|undeclared identifier|should return a value)\b/i.test(
+      cleaned
+    );
+  return intent.reason === 'action-verb-or-error-log' || (intent.intent === 'auto-action' && hasCompileOrErrorContext);
+}
+
+export function assistantLacksRemediationPlan(text: string): boolean {
+  const t = String(text || '').trim();
+  if (!t) return true;
+  const hasStructuredFix =
+    /(?:^|\n)#+\s*修复步骤|(?:^|\n)#+\s*根因\b|(?:^|\n)#+\s*验证(?:命令)?\b|###\s*(?:改动|修改|步骤)\s*\d|##\s*Fix\s*Steps|##\s*Root\s*Cause|##\s*Verification/i.test(
+      t
+    );
+  if (hasStructuredFix) return false;
+  const hasFileLinePatch =
+    /(?:`[^`]+\.(?:c|cpp|h|hpp|cu|cc|cxx):\d+`|\.(?:c|cpp|h|hpp)\s*:\d+\s*[:：])/i.test(t) &&
+    /(?:edit_file|apply_patch|删除|改为|替换|添加|remove|replace|patch)/i.test(t);
+  if (hasFileLinePatch) return false;
+  return true;
+}
+
 export function promptRequestsWorkspaceArtifact(rawPrompt: string): boolean {
   const cleaned = String(rawPrompt || '')
     .replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION|INLINE_QUERY|INLINE_EDIT)\]\s*/i, '')

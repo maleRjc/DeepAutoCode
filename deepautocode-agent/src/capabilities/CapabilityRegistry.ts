@@ -15,6 +15,11 @@ import type {
   CapabilityName,
   RiskLevel,
 } from '../types.js';
+import { augmentEnvWithBundledTools } from '../core/BundledTools.js';
+import {
+  buildBlockedBinaryReadMessage,
+  isBlockedBinaryReadPath,
+} from '../core/WorkspaceBinaryRead.js';
 
 const execAsync = promisify(exec);
 
@@ -232,6 +237,17 @@ export class CapabilityRegistry {
 
     this.executors.set('read-file', async (input: z.infer<typeof ReadFileInputSchema>, ctx) => {
       const canonicalPath = ctx.canonicalPath!;
+      const relForMsg = String(input.filePath || canonicalPath);
+      if (isBlockedBinaryReadPath(relForMsg) || isBlockedBinaryReadPath(canonicalPath)) {
+        const guidance = buildBlockedBinaryReadMessage(relForMsg);
+        return {
+          canonicalPath,
+          content: guidance,
+          byteLength: 0,
+          truncated: false,
+          binaryReadBlocked: true,
+        };
+      }
       const buffer = await fs.readFile(canonicalPath);
       const truncated = buffer.byteLength > input.maxBytes;
       const slice = truncated ? buffer.subarray(0, input.maxBytes) : buffer;
@@ -328,7 +344,7 @@ export class CapabilityRegistry {
           cwd,
           shell: true,
           windowsHide: true,
-          env: { ...process.env, ...extraEnv },
+          env: augmentEnvWithBundledTools(ctx.workspaceRoot, { ...process.env, ...extraEnv }),
           stdio: ['ignore', 'pipe', 'pipe'],
         });
 
