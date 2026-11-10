@@ -292,6 +292,22 @@ export interface PromptIntentClassification {
   reason: string;
 }
 
+/** User wants a file artifact in the workspace (md/pdf/report), not chat-only analysis. */
+export function promptRequestsWorkspaceArtifact(rawPrompt: string): boolean {
+  const cleaned = String(rawPrompt || '')
+    .replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION|INLINE_QUERY|INLINE_EDIT)\]\s*/i, '')
+    .trim();
+  if (!cleaned) return false;
+  return (
+    /(?:生成|导出|输出|制作|撰写|写一份|写个|写成|保存为|落地为|生成一份|做成).{0,32}(?:pdf|文档|教程|手册|报告|markdown|\.md|docx|html|slides?)/i.test(
+      cleaned
+    ) ||
+    /(?:完整的|详细的).{0,20}(?:pdf|教程|文档|手册|报告)/i.test(cleaned) ||
+    /(?:pdf|\.md)\s*文档/i.test(cleaned) ||
+    /\bwrite_file\b/i.test(cleaned)
+  );
+}
+
 /**
  * Smart User Intent Classifier (`classifyPromptIntent`).
  * Automatically distinguishes between:
@@ -338,9 +354,19 @@ export function classifyPromptIntent(rawPrompt: string): PromptIntentClassificat
     };
   }
 
-  // 2. Explicit code modification / bug fix / feature implementation / build-test verbs
+  // 2. Deliverables (docs/pdf/tutorials) always require write_file / run-build — never Plan-only.
+  if (promptRequestsWorkspaceArtifact(cleaned)) {
+    return {
+      intent: 'auto-action',
+      allowFileMutations: true,
+      label: '📄 智能识别：生成文档/产物（写入工作区）',
+      reason: 'workspace-artifact-deliverable',
+    };
+  }
+
+  // 3. Explicit code modification / bug fix / feature implementation / build-test verbs
   const hasExplicitActionVerb =
-    /(?:修复|修改|改一下|帮我改|直接改|改好|解决|处理|实现|新增|添加|创建|编写|写一个|重构|优化|升级|替换|删除|编译|构建|运行测试|跑一下|按你的建议|按你说的|按此方案|落地|继续改|还是不对|仍然不对|依然不对|一键自动)/i.test(
+    /(?:修复|修改|改一下|帮我改|直接改|改好|解决|处理|实现|新增|添加|创建|编写|写一个|写一份|生成|导出|制作|重构|优化|升级|替换|删除|编译|构建|运行测试|跑一下|按你的建议|按你说的|按此方案|落地|继续改|还是不对|仍然不对|依然不对|一键自动)/i.test(
       cleaned
     );
 
@@ -374,7 +400,7 @@ export function classifyPromptIntent(rawPrompt: string): PromptIntentClassificat
     };
   }
 
-  // Question mark at the end without action verbs -> treat as read-only query
+  // Polite questions ("...吗？") without action verbs -> read-only; deliverables handled above.
   if (/[?？]\s*$/.test(cleaned)) {
     return {
       intent: 'query-only',

@@ -14,22 +14,45 @@ if not exist "%~dp0deepautocode-agent\dist" (
   cd /d "%~dp0deepautocode-agent"
   call npm.cmd run build
 )
-if not exist "%~dp0deepautocode\node_modules\.bin\tsx.cmd" (
+set "DEPS_OK=1"
+if not exist "%~dp0deepautocode\node_modules\tsx\dist\cli.mjs" set "DEPS_OK=0"
+if not exist "%~dp0deepautocode\node_modules\vite\bin\vite.js" set "DEPS_OK=0"
+if not exist "%~dp0deepautocode\node_modules\typescript\bin\tsc" set "DEPS_OK=0"
+if "%DEPS_OK%"=="0" (
   echo Installing deepautocode dependencies...
   cd /d "%~dp0deepautocode"
-  call npm.cmd install
+  call npm.cmd install --ignore-scripts
+  if errorlevel 1 (
+    echo npm install failed — try closing programs that lock node_modules, then run again.
+    pause
+    exit /b 1
+  )
 )
 if not exist "%~dp0deepautocode\node_modules\electron\dist\electron.exe" (
   echo Downloading Electron binary via mirror...
-  cd /d "%~dp0deepautocode"
-  node node_modules\electron\install.js
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0deepautocode\scripts\ensure-electron-binary.ps1"
+  if errorlevel 1 (
+    echo Electron download failed — check proxy/VPN or run ensure-electron-binary.ps1 manually.
+    pause
+    exit /b 1
+  )
 )
 echo Building deepautocode webview (so UI fixes are always fresh)...
 cd /d "%~dp0deepautocode"
 call npm.cmd run build:webview
+if errorlevel 1 (
+  echo build:webview failed.
+  pause
+  exit /b 1
+)
 if not exist "%~dp0deepautocode\dist\src" (
   echo Building deepautocode host...
   call npm.cmd run build:host
+  if errorlevel 1 (
+    echo build:host failed.
+    pause
+    exit /b 1
+  )
 )
 
 echo Starting DeepAutoCode v1.1 Desktop IDE...

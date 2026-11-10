@@ -277,6 +277,8 @@ export {
   findFileEditingCommand,
   formatPlanModeBlockedCommandError,
   assertCommandAllowedInPlanMode,
+  planModeShellBudgetExceeded,
+  PLAN_MODE_MAX_SHELL_CALLS_PER_TURN,
 } from './CommandGuard.js';
 
 export {

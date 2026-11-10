@@ -45,6 +45,18 @@ export function wordAtCursor(content: string, line: number, col: number): string
   return left + right;
 }
 
+export function promptWantsWorkspaceArtifact(rawText: string): boolean {
+  const cleaned = String(rawText || '').trim();
+  if (!cleaned) return false;
+  return (
+    /(?:生成|导出|输出|制作|撰写|写一份|写个|写成|保存为|落地为|生成一份|做成).{0,32}(?:pdf|文档|教程|手册|报告|markdown|\.md|docx|html)/i.test(
+      cleaned
+    ) ||
+    /(?:完整的|详细的).{0,20}(?:pdf|教程|文档|手册|报告)/i.test(cleaned) ||
+    /(?:pdf|\.md)\s*文档/i.test(cleaned)
+  );
+}
+
 export function detectUiPromptIntent(
   rawText: string,
   executionMode: 'plan' | 'auto' | 'manual'
@@ -67,8 +79,12 @@ export function detectUiPromptIntent(
   ) {
     return { isQueryOnly: true, badgeText: '🔍 Detected: Read-Only Analysis (No Edits)' };
   }
+  const wantsArtifact = promptWantsWorkspaceArtifact(cleaned);
+  if (wantsArtifact) {
+    return { isQueryOnly: false, badgeText: '📄 Detected: Generate doc/PDF in workspace (Auto)' };
+  }
   const hasActionVerb =
-    /(?:修复|修改|改一下|帮我改|直接改|改好|解决|处理|实现|新增|添加|创建|编写|写一个|重构|优化|升级|替换|删除|编译|构建|运行测试|跑一下|按你的建议|按你说的|按此方案|落地|继续改|还是不对|仍然不对|依然不对|一键自动)/i.test(
+    /(?:修复|修改|改一下|帮我改|直接改|改好|解决|处理|实现|新增|添加|创建|编写|写一个|写一份|生成|导出|制作|重构|优化|升级|替换|删除|编译|构建|运行测试|跑一下|按你的建议|按你说的|按此方案|落地|继续改|还是不对|仍然不对|依然不对|一键自动)/i.test(
       cleaned
     );
   const hasErrorLog =
@@ -79,8 +95,12 @@ export function detectUiPromptIntent(
     /(?:是什么|是干嘛的|干什么用|在哪里|在哪儿|怎么理解|为什么|为何|如何理解|帮我看看|帮我查|查一下|查询|分析一下|解释一下|介绍一下|讲讲|有哪些|区别是|流程是|调用链|逻辑是)/i.test(
       cleaned
     );
-  if (hasQueryPattern && !hasActionVerb && !hasErrorLog) {
+  const endsWithQuestion = /[?？]\s*$/.test(cleaned);
+  if (hasQueryPattern && !hasActionVerb && !hasErrorLog && !wantsArtifact) {
     return { isQueryOnly: true, badgeText: '🔍 Smart Route: Read-Only Analysis (No Edits)' };
+  }
+  if (endsWithQuestion && !hasActionVerb && !hasErrorLog && !wantsArtifact) {
+    return { isQueryOnly: true, badgeText: '🔍 Smart Route: Question → Read-Only (No Edits)' };
   }
   if (hasActionVerb || hasErrorLog) {
     return { isQueryOnly: false, badgeText: '🛠️ Smart Route: Auto-Edit + Build & Verify' };
@@ -133,7 +153,7 @@ export function buildCheckpointContentDiff(
 
 export function formatToolStepLabel(tc: any): string {
   const name = String(tc?.toolName || '');
-  const input = tc?.input || {};
+  const input = tc?.input ?? tc?.args ?? {};
   const targetPath = input.path || input.filePath || input.directory || input.dirPath || '';
   const shortPath = targetPath
     ? String(targetPath).split(/[\\/]/).slice(-2).join('/')
@@ -182,6 +202,149 @@ export function formatToolStepLabel(tc: any): string {
   if (name === 'search_marketplace') return 'Search Marketplace catalog';
   if (name === 'list_plugin_accounts') return 'Check plugin accounts';
   return name;
+}
+
+function toolCallArgs(tc: any): Record<string, unknown> {
+  const raw = tc?.input ?? tc?.args;
+  return raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+}
+
+function stringifyClipboardChunk(value: unknown, maxChars: number): string {
+  if (value == null) return '';
+  let text: string;
+  if (typeof value === 'string') {
+    text = value;
+  } else if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.stdout === 'string' || typeof obj.stderr === 'string') {
+      const chunks: string[] = [];
+      if (obj.exitCode != null) chunks.push(`exitCode: ${obj.exitCode}`);
+      if (typeof obj.stdout === 'string' && obj.stdout) {
+        chunks.push(`--- stdout ---\n${obj.stdout}`);
+      }
+      if (typeof obj.stderr === 'string' && obj.stderr) {
+        chunks.push(`--- stderr ---\n${obj.stderr}`);
+      }
+      if (typeof obj.content === 'string' && obj.content && !obj.stdout) {
+        chunks.push(obj.content);
+      }
+      if (chunks.length > 0) {
+        text = chunks.join('\n');
+      } else {
+        try {
+          text = JSON.stringify(value, null, 2);
+        } catch {
+          text = String(value);
+        }
+      }
+    } else {
+      try {
+        text = JSON.stringify(value, null, 2);
+      } catch {
+        text = String(value);
+      }
+    }
+  } else {
+    text = String(value);
+  }
+  return text.length > maxChars ? `${text.slice(0, maxChars)}\n… [truncated ${text.length - maxChars} chars]` : text;
+}
+
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  const payload = String(text ?? '');
+  if (!payload) return false;
+  try {
+    await navigator.clipboard.writeText(payload);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = payload;
+      ta.setAttribute('readonly', 'true');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/** Full turn text for clipboard: assistant reply + tool args, results, and errors. */
+export function formatComposerMessageForClipboard(message: {
+  role?: string;
+  sequence?: number;
+  content?: string;
+  toolCalls?: any[];
+}): string {
+  const role = String(message.role || 'assistant').toUpperCase();
+  const header =
+    message.sequence != null ? `=== ${role} #${message.sequence} ===` : `=== ${role} ===`;
+  const parts: string[] = [header, ''];
+  const body = String(message.content ?? '').trim();
+  if (body) {
+    parts.push(body, '');
+  }
+  const toolCalls = Array.isArray(message.toolCalls) ? message.toolCalls : [];
+  toolCalls.forEach((tc, idx) => {
+    const name = String(tc?.toolName || 'tool');
+    const status = String(tc?.status || 'unknown');
+    parts.push(`--- Tool ${idx + 1}: ${name} (${status}) ---`);
+    const input = toolCallArgs(tc);
+    if (Object.keys(input).length > 0) {
+      parts.push('Arguments:', stringifyClipboardChunk(input, 80_000), '');
+    }
+    if (tc?.error) {
+      parts.push('Error:', String(tc.error), '');
+    }
+    if (tc?.result !== undefined && tc?.result !== null) {
+      parts.push('Result:', stringifyClipboardChunk(tc.result, 400_000), '');
+    }
+    if (typeof tc?.durationMs === 'number') {
+      parts.push(`Duration: ${tc.durationMs}ms`);
+    }
+    parts.push('');
+  });
+  return parts.join('\n').trimEnd();
+}
+
+export function formatComposerSessionForClipboard(messages: any[]): string {
+  const divider = `\n\n${'─'.repeat(52)}\n\n`;
+  return (Array.isArray(messages) ? messages : [])
+    .map((m) => formatComposerMessageForClipboard(m))
+    .filter((block) => block.replace(/^===.*===\s*/m, '').trim().length > 0)
+    .join(divider);
+}
+
+export function formatLiveComposerSnapshotForClipboard(
+  streamingText: string,
+  liveToolCalls: any[]
+): string {
+  const parts: string[] = ['=== LIVE OUTPUT (in progress) ===', ''];
+  const stream = String(streamingText ?? '').trim();
+  if (stream) {
+    parts.push(stream, '');
+  }
+  const tools = Array.isArray(liveToolCalls) ? liveToolCalls : [];
+  tools.forEach((tc, idx) => {
+    parts.push(`--- Live tool ${idx + 1}: ${tc?.toolName || 'tool'} (${tc?.status || 'running'}) ---`);
+    const input = toolCallArgs(tc);
+    if (Object.keys(input).length > 0) {
+      parts.push('Arguments:', stringifyClipboardChunk(input, 80_000), '');
+    }
+    if (tc?.error) {
+      parts.push('Error:', String(tc.error), '');
+    }
+    if (tc?.result !== undefined && tc?.result !== null) {
+      parts.push('Result:', stringifyClipboardChunk(tc.result, 200_000), '');
+    }
+    parts.push('');
+  });
+  return parts.join('\n').trimEnd();
 }
 
 export function parseDiffToSplitRows(diffText: string): SplitDiffRow[] {

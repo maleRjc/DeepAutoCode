@@ -933,11 +933,19 @@ class PersistentClineCoreRuntime implements IClineCoreInstance {
               .filter((tc) => tc.toolName === 'write-file' && tc.status === 'completed')
               .map((tc) => `\`${String(tc.args?.filePath || '')}\``)
               .filter(Boolean);
+            const wantedArtifact =
+              /(?:生成|导出|pdf|文档|教程|markdown|\.md|write_file|写一份)/i.test(prompt) ||
+              /\[FORCE_AUTO_ACTION\]/i.test(prompt);
             const summaryLines = [
               `## 任务执行完成摘要`,
               writtenFiles.length > 0
                 ? `- **已生成/更新文件 (${writtenFiles.length})**: ${writtenFiles.join('、')}`
                 : `- **已完成工具调用**: 共执行 ${toolCalls.length} 步工作区操作`,
+              writtenFiles.length === 0 && wantedArtifact
+                ? `- **⚠️ 未写入任何文件**：若目标是生成 PDF/文档，请确认 Composer 为 **Auto** 模式（非 Plan/只读），并避免使用「仅查询」；只读模式下只能调查源码，无法 write_file。`
+                : writtenFiles.length === 0 && toolCalls.length >= 15
+                  ? `- **⚠️ 工具步骤较多 (${toolCalls.length}) 但无文件产出**：可能卡在 Plan 只读或命令被 CommandGuard 拦截；请展开工具详情查看 POLICY_DENIED，并切换到 Auto 后重试。`
+                  : '',
               diffIds.length > 0
                 ? `- **代码变更审查**: 已生成 ${diffIds.length} 项文件变更记录，可在下方卡片或编辑器中点击 **Accept** / **Reject**`
                 : '',

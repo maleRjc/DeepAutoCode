@@ -8,6 +8,11 @@ import {
   wordAtCursor,
   buildCheckpointContentDiff,
   formatToolStepLabel,
+  promptWantsWorkspaceArtifact,
+  copyTextToClipboard,
+  formatComposerMessageForClipboard,
+  formatComposerSessionForClipboard,
+  formatLiveComposerSnapshotForClipboard,
   parseDiffToSplitRows,
   parseSourceReferenceToken,
   findBestLineMatchInContent,
@@ -244,6 +249,26 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
               </button>
             </div>
             <div className="ai-dock-actions">
+              {aiTab === 'composer' && messages.length > 0 && (
+                <button
+                  type="button"
+                  className="btn"
+                  style={{ padding: '3px 8px', fontSize: 11 }}
+                  title="复制本会话全部对话（含工具步骤、stderr 与错误）"
+                  onClick={() => {
+                    const text = formatComposerSessionForClipboard(messages);
+                    void copyTextToClipboard(text).then((ok) =>
+                      setStatusNotice(
+                        ok
+                          ? `已复制完整会话（${messages.length} 条消息）`
+                          : '复制失败，请用单条消息的「复制完整」重试'
+                      )
+                    );
+                  }}
+                >
+                  📋 复制会话
+                </button>
+              )}
               <button
                 className="icon-btn"
                 title="AI Agent & Model Settings"
@@ -1318,15 +1343,33 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                           <button
+                            type="button"
                             className="btn"
                             style={{ padding: '1px 6px', fontSize: 10 }}
-                            title="Copy message content to clipboard"
+                            title="复制本条全部内容：正文 + 工具参数 + 结果/错误（推荐）"
                             onClick={() => {
-                              void navigator.clipboard.writeText(String(m.content ?? ''));
-                              setStatusNotice('Copied AI message to clipboard');
+                              const text = formatComposerMessageForClipboard(m);
+                              void copyTextToClipboard(text).then((ok) =>
+                                setStatusNotice(
+                                  ok ? '已复制完整输出（含工具步骤与错误）' : '复制失败'
+                                )
+                              );
                             }}
                           >
-                            📋 Copy
+                            📋 复制完整
+                          </button>
+                          <button
+                            type="button"
+                            className="btn"
+                            style={{ padding: '1px 6px', fontSize: 10 }}
+                            title="仅复制 AI 正文 Markdown"
+                            onClick={() => {
+                              void copyTextToClipboard(String(m.content ?? '')).then((ok) =>
+                                setStatusNotice(ok ? '已复制正文' : '复制失败')
+                              );
+                            }}
+                          >
+                            仅正文
                           </button>
                           <span>#{m.sequence}</span>
                         </div>
@@ -1431,23 +1474,23 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                               }}
                             >
                               {(m.toolCalls || []).map((tc: any, stepIdx: number) => {
+                                const tcInput = tc?.input ?? tc?.args ?? {};
                                 const targetArg =
-                                  tc?.input?.filePath ||
-                                  tc?.input?.path ||
-                                  tc?.input?.command ||
-                                  tc?.input?.query ||
-                                  tc?.input?.directory ||
+                                  tcInput.filePath ||
+                                  tcInput.path ||
+                                  tcInput.command ||
+                                  tcInput.query ||
+                                  tcInput.directory ||
                                   '';
-                                const fileArg = tc?.input?.filePath || tc?.input?.path || '';
+                                const fileArg = tcInput.filePath || tcInput.path || '';
                                 const diff = findPendingDiffForTool(tc);
                                 return (
                                   <div
                                     key={tc.toolCallId || `${m.id}-step-${stepIdx}`}
                                     style={{
                                       display: 'flex',
-                                      alignItems: 'center',
-                                      justifyContent: 'space-between',
-                                      gap: 8,
+                                      flexDirection: 'column',
+                                      gap: 4,
                                       padding: '4px 8px',
                                       borderRadius: 5,
                                       background: 'rgba(15, 23, 42, 0.45)',
@@ -1455,6 +1498,14 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                                       fontSize: 11,
                                     }}
                                   >
+                                    <div
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'space-between',
+                                        gap: 8,
+                                      }}
+                                    >
                                     <div
                                       style={{
                                         display: 'flex',
@@ -1521,6 +1572,29 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                                         </button>
                                       )}
                                     </div>
+                                    </div>
+                                    {tc?.error ? (
+                                      <pre
+                                        style={{
+                                          margin: 0,
+                                          padding: '6px 8px',
+                                          borderRadius: 4,
+                                          background: 'rgba(127, 29, 29, 0.35)',
+                                          border: '1px solid rgba(248, 113, 113, 0.35)',
+                                          color: '#fecaca',
+                                          fontSize: 10.5,
+                                          lineHeight: 1.45,
+                                          whiteSpace: 'pre-wrap',
+                                          wordBreak: 'break-word',
+                                          userSelect: 'text',
+                                          WebkitUserSelect: 'text',
+                                          maxHeight: 160,
+                                          overflowY: 'auto',
+                                        }}
+                                      >
+                                        {String(tc.error)}
+                                      </pre>
+                                    ) : null}
                                   </div>
                                 );
                               })}
@@ -1632,6 +1706,24 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                             ? `✍️ 正在流式生成回复 (${streamingText.length} 字)...`
                             : `⏳ 正在分析工作区并推理 (${lastModelTier?.effectiveModelId || modelInput})...`}
                       </span>
+                      <button
+                        type="button"
+                        className="btn"
+                        style={{ padding: '3px 8px', fontSize: 10, flexShrink: 0 }}
+                        title="复制当前进行中的输出与工具错误"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const text = formatLiveComposerSnapshotForClipboard(
+                            streamingText,
+                            liveToolCalls
+                          );
+                          void copyTextToClipboard(text).then((ok) =>
+                            setStatusNotice(ok ? '已复制当前实时输出（含错误）' : '复制失败')
+                          );
+                        }}
+                      >
+                        📋 复制实时
+                      </button>
                       <button
                         type="button"
                         className="btn primary"
@@ -2004,8 +2096,27 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                         <BrandMark size={14} radius={3} />
                         <span>DEEPAUTOCODE AI (Generating...)</span>
                       </span>
+                      <button
+                        type="button"
+                        className="btn"
+                        style={{ padding: '1px 6px', fontSize: 10 }}
+                        title="复制当前已生成内容与工具错误"
+                        onClick={() => {
+                          const text = formatLiveComposerSnapshotForClipboard(
+                            streamingText,
+                            liveToolCalls
+                          );
+                          void copyTextToClipboard(text).then((ok) =>
+                            setStatusNotice(ok ? '已复制当前生成内容' : '复制失败')
+                          );
+                        }}
+                      >
+                        📋 复制完整
+                      </button>
                     </div>
-                    <div>{renderFormattedMarkdown(streamingText)}</div>
+                    <div style={{ userSelect: 'text', WebkitUserSelect: 'text' }}>
+                      {renderFormattedMarkdown(streamingText)}
+                    </div>
                   </div>
                 )}
 
@@ -2228,13 +2339,19 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
               <div className="composer-box">
                 <div className="context-pills">
                   {(() => {
-                    const uiIntent = detectUiPromptIntent(promptInput);
+                    const uiIntent = detectUiPromptIntent(promptInput, executionMode);
                     const activeChoice: 'query-only' | 'auto-action' =
-                      manualIntentChoice === 'query-only' || manualIntentChoice === 'auto-action'
-                        ? manualIntentChoice
-                        : uiIntent.isQueryOnly
+                      manualIntentChoice === 'auto-action'
+                        ? 'auto-action'
+                        : manualIntentChoice === 'query-only' && uiIntent.isQueryOnly
                           ? 'query-only'
-                          : 'auto-action';
+                          : uiIntent.isQueryOnly
+                            ? 'query-only'
+                            : 'auto-action';
+                    const planBlocksDeliverable =
+                      promptInput.trim().length > 0 &&
+                      !uiIntent.isQueryOnly &&
+                      (executionMode === 'plan' || activeChoice === 'query-only');
                     const isQueryActive = activeChoice === 'query-only';
                     const isAutoActionActive = activeChoice === 'auto-action';
 
@@ -2307,6 +2424,26 @@ export function AiComposerDock({ ctx }: { ctx: any }) {
                           <span>/</span>
                           <span>Workflows</span>
                         </span>
+
+                        {planBlocksDeliverable && (
+                          <span
+                            style={{
+                              width: '100%',
+                              flexBasis: '100%',
+                              fontSize: 11,
+                              lineHeight: 1.45,
+                              padding: '6px 10px',
+                              borderRadius: 6,
+                              background: 'rgba(234, 179, 8, 0.12)',
+                              border: '1px solid rgba(234, 179, 8, 0.45)',
+                              color: '#fde68a',
+                            }}
+                          >
+                            {promptWantsWorkspaceArtifact(promptInput)
+                              ? '📄 当前为 Plan/只读：无法写入 PDF 或 Markdown。发送时将自动切换为 Auto；或点击右侧 🛠️ Auto-Edit。'
+                              : '⚠️ 当前为 Plan/只读：无法修改文件。若要改代码或写文档，请切换 Auto 或关闭 🔍 Query Only。'}
+                          </span>
+                        )}
 
                         <span
                           className="intent-mode-chip"

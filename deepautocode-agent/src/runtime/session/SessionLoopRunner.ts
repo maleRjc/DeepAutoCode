@@ -291,6 +291,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
     DEFAULT_GOAL_TOKEN_BUDGET,
     resolveTieredModelForTurn,
     classifyPromptIntent,
+    planModeShellBudgetExceeded,
     ensureAgentSandboxBranch,
     rollbackSessionMutations,
     loadVerifyConfig,
@@ -535,6 +536,12 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
   const sessionCreatedFiles = new Set<string>();
   const readCountsByRange = new Map<string, number>();
   const executedCommandCounts = new Map<string, number>();
+  let planModeShellCallCount = 0;
+  const takePlanModeShellSlot = (): string | undefined => {
+    if (!isReadOnlyTurn) return undefined;
+    planModeShellCallCount += 1;
+    return planModeShellBudgetExceeded(true, planModeShellCallCount);
+  };
   let hasUnverifiedCompiledEdit = false;
   let hasUnverifiedTestAfterEdit = false;
   let lastBuildOrTestFailed = false;
@@ -1176,6 +1183,10 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         }
         if (normCmd) {
           executedCommandCounts.set(normCmd, prevCmdCount + 1);
+        }
+        const planShellBlock = takePlanModeShellSlot();
+        if (planShellBlock) {
+          return planShellBlock;
         }
         const res = (await runCapabilityTool('run-build', { command: cmd }, 'high')) as {
           exitCode: number;
@@ -2232,6 +2243,17 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
       },
       execute: async (rawArgs: Record<string, unknown>) => {
         const command = String(rawArgs?.command || '');
+        const planShellBlock = takePlanModeShellSlot();
+        if (planShellBlock) {
+          return {
+            command,
+            exitCode: 1,
+            stdout: '',
+            stderr: planShellBlock,
+            durationMs: 0,
+            planShellBudgetExceeded: true,
+          };
+        }
         const isDaemon = Boolean(rawArgs?.isDaemon);
         const waitMsBeforeAsync =
           typeof rawArgs?.waitMsBeforeAsync === 'number'
@@ -2398,6 +2420,16 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         },
       },
       execute: async (rawArgs: Record<string, unknown>) => {
+        const planShellBlock = takePlanModeShellSlot();
+        if (planShellBlock) {
+          return {
+            command: '',
+            exitCode: 1,
+            stdout: '',
+            stderr: planShellBlock,
+            planShellBudgetExceeded: true,
+          };
+        }
         let cmd = String(rawArgs?.customBuildCommand || '').trim();
         if (!cmd) {
           cmd = preferredVerifyCommand;
@@ -4026,7 +4058,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
     effectivePrompt = `${effectivePrompt}\n\n[Prior Session Executed Tools Audit (do NOT repeat this tag in output): ${priorToolAuditLines.join(' | ')}]`;
   }
   if (isReadOnlyTurn) {
-    effectivePrompt = `${effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '')}\n\n[Smart Intent Router: READ-ONLY QUERY & ANALYSIS MODE — Use read_file / outline_file / search_codebase / explore_codebase, and investigation shells (ls/cat/git status/npm test). Mutating shells (rm/mv/git commit/npm install/redirects) are blocked by CommandGuard. Do NOT edit files in this turn.]`;
+    effectivePrompt = `${effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '')}\n\n[Smart Intent Router: READ-ONLY QUERY & ANALYSIS MODE — Use read_file / outline_file / search_codebase / explore_codebase, and investigation shells (ls/cat/git status/npm test). Mutating shells (rm/mv/git commit/npm install/redirects) are blocked by CommandGuard. Shell commands are capped per turn (after ~14 calls, use search_codebase instead of more rg/grep loops). To write docs/PDF, the user must switch Composer to Auto (not Plan). Do NOT edit files in this turn.]`;
   } else {
     effectivePrompt = effectivePrompt.replace(/^\[(?:READ_ONLY_ANALYSIS|FORCE_AUTO_ACTION)\]\s*/i, '');
   }

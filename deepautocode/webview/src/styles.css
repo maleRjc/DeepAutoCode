@@ -162,9 +162,21 @@ input,
 textarea,
 pre,
 code,
+.ai-dock,
+.ai-dock .ai-messages-stream,
+.ai-dock .ai-messages-stream *,
+.ai-dock .chat-bubble,
+.ai-dock .chat-bubble *,
+.ai-dock .md-body,
+.ai-dock .md-body *,
+.ai-dock .approval-banner,
+.ai-dock .approval-banner *,
 .chat-bubble,
 .chat-bubble *,
 .ai-messages-stream,
+.ai-messages-stream *,
+.md-body,
+.md-body *,
 .terminal-body,
 .terminal-body *,
 .diff-line,
@@ -1870,14 +1882,18 @@ body {
   line-height: 1.55;
   color: var(--text-primary);
   white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .md-code-line {
   display: flex;
   align-items: baseline;
   padding: 1px 12px 1px 8px;
-  cursor: pointer;
+  cursor: text;
   transition: background 0.1s ease;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .md-code-line:hover {
@@ -1898,6 +1914,8 @@ body {
 .md-code-line-text {
   flex: 1;
   white-space: pre;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .md-table-wrap {

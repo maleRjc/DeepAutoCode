@@ -916,6 +916,13 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
     const fixIntent = classifyPromptIntent('帮我修复 sendrecv_perf 单卡 #wrong=1 的问题并编译验证');
     expect(fixIntent.intent).toBe('auto-action');
     expect(fixIntent.allowFileMutations).toBe(true);
+
+    const pdfTutorialIntent = classifyPromptIntent(
+      '能帮我把LL和Simple协议的kernel执行过程的详细解说生成一份完整的pdf文档吗 ？ 就是针对小白的入门教程'
+    );
+    expect(pdfTutorialIntent.intent).toBe('auto-action');
+    expect(pdfTutorialIntent.allowFileMutations).toBe(true);
+    expect(pdfTutorialIntent.reason).toBe('workspace-artifact-deliverable');
   });
 
   it('Verifies autonomous browser_action tool execution and /browser workflow expansion', async () => {

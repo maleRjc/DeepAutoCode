@@ -514,8 +514,8 @@ export function createMarkdownRenderer(ctx: any) {
                         <div
                           key={cIdx}
                           className="md-code-line"
-                          title="Click this line to locate in code editor"
-                          onClick={() =>
+                          title="双击此行可在编辑器中定位；拖选可复制"
+                          onDoubleClick={() =>
                             void navigateToAiCodeSnippet(
                               compactSummary.primaryCodeBlock!.codeBody,
                               compactSummary.primaryCodeBlock!.lang,
@@ -812,8 +812,8 @@ export function createMarkdownRenderer(ctx: any) {
                       <div
                         key={cIdx}
                         className="md-code-line"
-                        title="Click this line to locate corresponding file and line in editor"
-                        onClick={() =>
+                        title="双击此行可在编辑器中定位；拖选可复制"
+                        onDoubleClick={() =>
                           void navigateToAiCodeSnippet(
                             codeBody,
                             lang,

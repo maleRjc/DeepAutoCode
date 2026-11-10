@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   findFileEditingCommand,
   formatPlanModeBlockedCommandError,
+  planModeShellBudgetExceeded,
+  PLAN_MODE_MAX_SHELL_CALLS_PER_TURN,
 } from '../src/core/CommandGuard.js';
 import { MistakeTracker } from '../src/core/MistakeTracker.js';
 import { LoopDetection } from '../src/core/LoopDetection.js';
@@ -16,6 +18,12 @@ describe('CommandGuard', () => {
     expect(findFileEditingCommand('git stash list')).toBeUndefined();
     expect(findFileEditingCommand('npm test')).toBeUndefined();
     expect(findFileEditingCommand('cat README.md')).toBeUndefined();
+    expect(
+      findFileEditingCommand(
+        "(command -v rg >/dev/null 2>&1 && rg -n -F 'ncclProtoGraphProperties' src 2>/dev/null || grep -rn 'ncclProtoGraphProperties' src)"
+      )
+    ).toBeUndefined();
+    expect(findFileEditingCommand('rg -n pattern src 2>/dev/null')).toBeUndefined();
   });
 
   it('blocks mutating shells', () => {
@@ -46,6 +54,14 @@ describe('CommandGuard', () => {
     expect(blocked.allowedToProceed).toBe(false);
     expect(blocked.reason).toContain('PLAN_MODE_COMMAND_BLOCKED');
     expect(formatPlanModeBlockedCommandError('x')).toMatch(/PLAN_MODE/);
+  });
+
+  it('caps plan-mode shell spam per turn', () => {
+    expect(planModeShellBudgetExceeded(true, PLAN_MODE_MAX_SHELL_CALLS_PER_TURN)).toBeUndefined();
+    expect(planModeShellBudgetExceeded(true, PLAN_MODE_MAX_SHELL_CALLS_PER_TURN + 1)).toMatch(
+      /PLAN_SHELL_BUDGET_EXCEEDED/
+    );
+    expect(planModeShellBudgetExceeded(false, 100)).toBeUndefined();
   });
 
   it('plan preset keeps shell tools available for investigation', () => {

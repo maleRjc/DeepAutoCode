@@ -176,8 +176,15 @@ function maskNonCommandText(command: string): string {
     .replace(/(?:^|\s)#.*$/gm, ' ');
 }
 
+function normalizeRedirectTarget(rawTarget: string): string {
+  return rawTarget
+    .replace(/["']/g, '')
+    .replace(/[)\]}>,;]+$/g, '')
+    .trim();
+}
+
 function isAllowedRedirectTarget(rawTarget: string): boolean {
-  const target = rawTarget.replace(/["']/g, '');
+  const target = normalizeRedirectTarget(rawTarget);
   if (/^(\/dev\/(null|stdout|stderr|tty)|nul:?)$/i.test(target)) return true;
   if (target.includes('..')) return false;
   return (
@@ -271,6 +278,23 @@ export function formatPlanModeBlockedCommandError(reason: string): string {
     `PLAN_MODE_COMMAND_BLOCKED: ${reason}. ` +
     `Plan/read-only mode allows investigation shells (ls/cat/git status/npm test) but not file mutations. ` +
     `Switch to Auto/Manual, or use edit_file / apply_patch after leaving Plan.`
+  );
+}
+
+/** Cap shell churn in Plan/read-only turns (stops 50+ rg/grep loops with no deliverable). */
+export const PLAN_MODE_MAX_SHELL_CALLS_PER_TURN = 14;
+
+export function planModeShellBudgetExceeded(
+  isPlanOrReadOnly: boolean,
+  shellCallCount: number
+): string | undefined {
+  if (!isPlanOrReadOnly) return undefined;
+  if (shellCallCount <= PLAN_MODE_MAX_SHELL_CALLS_PER_TURN) return undefined;
+  return (
+    `PLAN_SHELL_BUDGET_EXCEEDED: Plan/read-only allows at most ${PLAN_MODE_MAX_SHELL_CALLS_PER_TURN} ` +
+    `shell commands per user message (current: ${shellCallCount}). ` +
+    `Use search_codebase / read_file with line ranges instead of more grep loops. ` +
+    `To generate PDF/Markdown in the workspace, switch Composer to Auto (not Plan).`
   );
 }
 

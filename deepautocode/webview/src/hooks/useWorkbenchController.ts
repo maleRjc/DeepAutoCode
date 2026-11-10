@@ -30,6 +30,7 @@ import {
   getImageMimeType,
   wordAtCursor,
   detectUiPromptIntent as detectUiPromptIntentUtil,
+  promptWantsWorkspaceArtifact,
   buildCheckpointContentDiff,
   formatToolStepLabel,
   parseDiffToSplitRows,
@@ -2230,17 +2231,27 @@ export function useWorkbenchController() {
     }
 
     const autoIntent = detectUiPromptIntent(raw);
-    const resolvedChoice =
-      manualIntentChoice === 'query-only' || manualIntentChoice === 'auto-action'
-        ? manualIntentChoice
-        : autoIntent.isQueryOnly
+    // Sticky "query-only" must not block deliverable prompts (PDF/md/tutorials).
+    const resolvedChoice: 'query-only' | 'auto-action' =
+      manualIntentChoice === 'auto-action'
+        ? 'auto-action'
+        : manualIntentChoice === 'query-only' && autoIntent.isQueryOnly
           ? 'query-only'
-          : 'auto-action';
+          : autoIntent.isQueryOnly
+            ? 'query-only'
+            : 'auto-action';
 
     const effectiveMode =
       overrideMode ?? (resolvedChoice === 'query-only' ? 'plan' : 'auto');
     if (effectiveMode !== executionMode) {
       setExecutionMode(effectiveMode);
+      if (effectiveMode === 'auto' && executionMode === 'plan') {
+        setStatusNotice(
+          promptWantsWorkspaceArtifact(raw)
+            ? '检测到需要生成文档/PDF，已从 Plan 自动切换为 Auto'
+            : '已从 Plan 自动切换为 Auto（允许写入工作区）'
+        );
+      }
     }
     const imagesToSend = attachedImages.map((img) => ({
       name: img.name,
@@ -2260,11 +2271,12 @@ export function useWorkbenchController() {
 
     let finalPrompt = raw;
     if (!overridePrompt) {
-      if (manualIntentChoice === 'query-only' && !/^\[READ_ONLY_ANALYSIS\]/i.test(finalPrompt)) {
+      if (resolvedChoice === 'query-only' && !/^\[READ_ONLY_ANALYSIS\]/i.test(finalPrompt)) {
         finalPrompt = `[READ_ONLY_ANALYSIS] ${finalPrompt}`;
       } else if (
-        manualIntentChoice === 'auto-action' &&
-        !/^\[FORCE_AUTO_ACTION\]/i.test(finalPrompt)
+        resolvedChoice === 'auto-action' &&
+        !/^\[FORCE_AUTO_ACTION\]/i.test(finalPrompt) &&
+        !/^\[READ_ONLY_ANALYSIS\]/i.test(finalPrompt)
       ) {
         finalPrompt = `[FORCE_AUTO_ACTION] ${finalPrompt}`;
       }
