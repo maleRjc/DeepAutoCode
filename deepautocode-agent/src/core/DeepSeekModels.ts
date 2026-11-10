@@ -232,3 +232,144 @@ export function extractDeepSeekCacheUsage(usageRaw: unknown): NormalizedDeepSeek
     cacheHitRatio,
   };
 }
+
+export function isGlmModelId(modelId: string, providerId?: string): boolean {
+  return (
+    providerId === 'glm' ||
+    /\bglm[-_0-9a-z.]*/i.test(String(modelId || ''))
+  );
+}
+
+export interface GlmRequestControls {
+  enableThinking: boolean;
+  temperature: number;
+  topP: number;
+  chatTemplateKwargs: { enable_thinking: boolean };
+  reason: string;
+}
+
+/**
+ * Adaptive Thinking Gating & NVFP4 Sampling Controls for GLM-5.3-Flash / GLM models.
+ * - Enables CoT thinking on PLAN phase, self-heal retries (`hasFailure` / `selfHealCount > 0`),
+ *   `max` reasoning effort, or turn 1 with complex architectural/debugging prompts.
+ * - Disables thinking on standard EXEC tool-calling turns and VERIFY turns for 5-10x faster execution
+ *   with deterministic sampling (`temperature: 0.1, top_p: 0.85`).
+ */
+export function resolveGlmRequestControls(params: {
+  modelId: string;
+  providerId?: string;
+  phase?: AgentLoopPhase | string;
+  reasoningEffort?: DeepSeekReasoningEffort | null;
+  turnIndex?: number;
+  selfHealCount?: number;
+  hasFailure?: boolean;
+  userPrompt?: string;
+}): GlmRequestControls {
+  const phase = params.phase ?? 'exec';
+  const hasFailure = Boolean(params.hasFailure || (params.selfHealCount && params.selfHealCount > 0));
+  const isComplexFirstTurn =
+    (params.turnIndex ?? 1) === 1 &&
+    /架构|重构|死锁|并发|原因|为什么|根因|排查|debug|root\s*cause|architect|deadlock|race\s*condition/i.test(
+      String(params.userPrompt || '')
+    );
+
+  let enableThinking = false;
+  let reason = 'exec-fast-tool-calling';
+  if (phase === 'plan') {
+    enableThinking = true;
+    reason = 'plan-phase';
+  } else if (hasFailure || params.reasoningEffort === 'max') {
+    enableThinking = true;
+    reason = 'self-heal-diagnosis';
+  } else if (isComplexFirstTurn && phase !== 'verify') {
+    enableThinking = true;
+    reason = 'complex-first-turn';
+  }
+
+  return {
+    enableThinking,
+    temperature: enableThinking ? 0.6 : 0.1,
+    topP: enableThinking ? 0.95 : 0.85,
+    chatTemplateKwargs: { enable_thinking: enableThinking },
+    reason,
+  };
+}
+
+/**
+ * Dynamic context token budget based on model family:
+ * - GLM-5.3-Flash / 128K context models: 96,000 tokens (leaves ~32K headroom for output & system/tools within 131,072 max_model_len)
+ * - DeepSeek 1M context models: 180,000 tokens (or configured budget)
+ */
+export function resolveModelContextBudget(params: {
+  modelId: string;
+  providerId?: string;
+  configuredBudget?: number | null;
+}): number {
+  if (isGlmModelId(params.modelId, params.providerId)) {
+    const cfg = Number(params.configuredBudget || 0);
+    return cfg > 0 && cfg <= 110_000 ? cfg : 96_000;
+  }
+  return Number(params.configuredBudget ?? 180_000) || 180_000;
+}
+
+/**
+ * Resilient JSON parser for LLM tool-call arguments (handles 4-bit NVFP4 quantization glitches
+ * such as markdown code fences, trailing commas before `}`/`]`, or missing closing `}`).
+ */
+export function parseToolArgumentsResilient(rawArgs: string): {
+  ok: boolean;
+  parsed: Record<string, unknown>;
+  repairedText: string;
+} {
+  const trimmed = String(rawArgs || '').trim();
+  if (!trimmed) {
+    return { ok: true, parsed: {}, repairedText: '{}' };
+  }
+  try {
+    const direct = JSON.parse(trimmed);
+    if (direct && typeof direct === 'object' && !Array.isArray(direct)) {
+      return { ok: true, parsed: direct as Record<string, unknown>, repairedText: trimmed };
+    }
+  } catch {
+    // try lightweight repairs below
+  }
+
+  let candidate = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
+
+  // Remove trailing commas before closing brace/bracket: `,"}` -> `"}`
+  candidate = candidate.replace(/,\s*([}\]])/g, '$1');
+
+  try {
+    const obj = JSON.parse(candidate);
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      return {
+        ok: true,
+        parsed: obj as Record<string, unknown>,
+        repairedText: JSON.stringify(obj),
+      };
+    }
+  } catch {
+    // If missing a single closing `}` at the end, try appending `}`
+    if (candidate.startsWith('{') && !candidate.endsWith('}')) {
+      for (const suffix of ['}', '"}', '"\n}']) {
+        try {
+          const obj = JSON.parse(candidate + suffix);
+          if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+            return {
+              ok: true,
+              parsed: obj as Record<string, unknown>,
+              repairedText: JSON.stringify(obj),
+            };
+          }
+        } catch {
+          // continue
+        }
+      }
+    }
+  }
+
+  return { ok: false, parsed: {}, repairedText: trimmed };
+}

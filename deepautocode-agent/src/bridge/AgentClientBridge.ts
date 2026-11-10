@@ -544,21 +544,33 @@ export class AgentClientBridge {
       }
 
       case 'completion.fim': {
-        const { completeDeepSeekFim, DEEPSEEK_FLASH } = await import('../core/index.js');
-        const apiKey = await this.providerManager.resolveApiKey();
+        const { completeDeepSeekFim, DEEPSEEK_FLASH, isDeepSeekModelId } = await import(
+          '../core/index.js'
+        );
+        const activeSnap = await this.providerManager.getActiveProviderWithKeyStatus();
+        const activeProvider = activeSnap.provider;
+        const activeModelId =
+          typeof payload.model === 'string' && payload.model.trim()
+            ? payload.model.trim()
+            : isDeepSeekModelId(activeSnap.model.modelId)
+              ? DEEPSEEK_FLASH
+              : activeSnap.model.modelId;
+        const apiKey = await this.providerManager.resolveApiKey(activeProvider.providerId);
         if (!apiKey) {
-          return { ok: false, text: '', model: DEEPSEEK_FLASH, error: 'missing_api_key' };
+          return { ok: false, text: '', model: activeModelId, error: 'missing_api_key' };
         }
         const prompt = String(payload.prompt ?? payload.prefix ?? '');
         const suffix = String(payload.suffix ?? '');
         if (!prompt.trim()) {
-          return { ok: false, text: '', model: DEEPSEEK_FLASH, error: 'empty_prompt' };
+          return { ok: false, text: '', model: activeModelId, error: 'empty_prompt' };
         }
         return completeDeepSeekFim({
           apiKey,
           prompt: prompt.slice(-4000),
           suffix: suffix.slice(0, 1500),
-          model: DEEPSEEK_FLASH,
+          model: activeModelId,
+          apiEndpoint: activeProvider.apiEndpoint,
+          providerId: activeProvider.providerId,
           maxTokens: Math.max(16, Math.min(256, Number(payload.maxTokens ?? 128))),
           temperature: 0,
           timeoutMs: 8_000,

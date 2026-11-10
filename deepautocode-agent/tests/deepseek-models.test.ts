@@ -6,7 +6,11 @@ import {
   deepSeekChatBodyExtras,
   estimateDeepSeekTurnCostCny,
   isDeepSeekPeakHour,
+  isGlmModelId,
   normalizeDeepSeekApiModelId,
+  parseToolArgumentsResilient,
+  resolveGlmRequestControls,
+  resolveModelContextBudget,
 } from '../src/core/DeepSeekModels.js';
 import { resolveTieredModelForTurn } from '../src/core/GoalSteering.js';
 import { completeDeepSeekFim } from '../src/core/DeepSeekFim.js';
@@ -195,5 +199,75 @@ describe('DeepSeek FIM client', () => {
     expect(restored.provider.apiEndpoint).toBe('http://10.0.0.1:8000');
     expect(restored.model.modelId).toBe('Custom-Local-Model');
     expect(restored.hasApiKeyConfigured).toBe(true);
+  });
+
+  it('optimizes GLM-5.3-Flash adaptive thinking gating, NVFP4 sampling, 96K context budget, JSON repair, and local FIM', async () => {
+    expect(isGlmModelId('GLM-5.3-Flash')).toBe(true);
+    expect(isGlmModelId('glm-4-plus')).toBe(true);
+    expect(isGlmModelId('deepseek-flash')).toBe(false);
+
+    // 1. Adaptive Thinking Gating & NVFP4 Sampling
+    const execCtrl = resolveGlmRequestControls({
+      modelId: 'GLM-5.3-Flash',
+      phase: 'exec',
+      turnIndex: 2,
+      userPrompt: '继续编写代码',
+    });
+    expect(execCtrl.enableThinking).toBe(false);
+    expect(execCtrl.temperature).toBe(0.1);
+    expect(execCtrl.topP).toBe(0.85);
+    expect(execCtrl.chatTemplateKwargs).toEqual({ enable_thinking: false });
+
+    const healCtrl = resolveGlmRequestControls({
+      modelId: 'GLM-5.3-Flash',
+      phase: 'exec',
+      turnIndex: 3,
+      hasFailure: true,
+      userPrompt: '继续',
+    });
+    expect(healCtrl.enableThinking).toBe(true);
+    expect(healCtrl.temperature).toBe(0.6);
+    expect(healCtrl.topP).toBe(0.95);
+    expect(healCtrl.chatTemplateKwargs).toEqual({ enable_thinking: true });
+
+    // 2. 128K Context Budget Binding (96K safe budget for GLM vs 180K for DeepSeek)
+    expect(resolveModelContextBudget({ modelId: 'GLM-5.3-Flash', configuredBudget: 180_000 })).toBe(
+      96_000
+    );
+    expect(resolveModelContextBudget({ modelId: 'deepseek-flash', configuredBudget: 180_000 })).toBe(
+      180_000
+    );
+
+    // 3. Resilient Tool Argument JSON Repair (trailing comma + unclosed brace)
+    const repairedComma = parseToolArgumentsResilient('{"filePath": "calc.py", "content": "x=1",}');
+    expect(repairedComma.ok).toBe(true);
+    expect(repairedComma.parsed.filePath).toBe('calc.py');
+
+    const repairedBrace = parseToolArgumentsResilient('{"filePath": "calc.py", "content": "x=1"');
+    expect(repairedBrace.ok).toBe(true);
+    expect(repairedBrace.parsed.content).toBe('x=1');
+
+    // 4. Local vLLM / GLM FIM Completion with enable_thinking: false
+    let capturedBody: any = null;
+    const fimRes = await completeDeepSeekFim({
+      apiKey: 'EMPTY',
+      model: 'GLM-5.3-Flash',
+      apiEndpoint: 'http://127.0.0.1:8000',
+      prompt: 'def add(a, b):\n    ',
+      suffix: '\n',
+      fetchImpl: async (_url, init) => {
+        capturedBody = JSON.parse(String(init.body || '{}'));
+        return {
+          ok: true,
+          status: 200,
+          text: JSON.stringify({
+            choices: [{ message: { content: 'return a + b' } }],
+          }),
+        };
+      },
+    });
+    expect(fimRes.ok).toBe(true);
+    expect(fimRes.text).toBe('return a + b');
+    expect(capturedBody.chat_template_kwargs).toEqual({ enable_thinking: false });
   });
 });

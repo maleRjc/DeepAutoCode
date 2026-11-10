@@ -104,6 +104,7 @@ export const EventMessageSchema = z.object({
   ]),
   sessionId: z.string(),
   sequence: z.number().int().nonnegative(),
+
   timestamp: z.string(),
   payload: z.record(z.unknown()),
 });

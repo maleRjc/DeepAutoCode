@@ -191,6 +191,10 @@ import {
   extractDeepSeekCacheUsage,
   isDeepSeekPeakHour,
   isDeepSeekModelId,
+  isGlmModelId,
+  parseToolArgumentsResilient,
+  resolveGlmRequestControls,
+  resolveModelContextBudget,
 } from '../../core/DeepSeekModels.js';
 import { SessionReadCache } from '../../core/AgentLoop.js';
 import type { PermissionRuleset } from '../../core/RulePermission.js';
@@ -1831,7 +1835,16 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         }
         let existingContent: string | null = null;
         try {
-          const existing = (await runCapabilityTool('read-file', { filePath }, 'low')) as {
+          const existing = (await runtimeCtx.capabilityRegistry.invoke(
+            'read-file',
+            { filePath },
+            {
+              sessionId,
+              workspaceRoot: manifest.workspaceRoot,
+              executionMode: 'plan',
+              signal,
+            }
+          )) as {
             content: string;
           };
           if (existing?.content != null) {
@@ -1839,7 +1852,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
             fileStateCache.makeSnapshot(filePath, existing.content);
           }
         } catch {
-          // new file
+          // new file — do not emit a failed read-file tool call to UI/trace
         }
         if (existingContent != null && !appendMode && !overwriteAllowed) {
           return {
@@ -4081,6 +4094,25 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         })
         : null;
       const isReasonerModel = Boolean(dsControls?.isThinking);
+      const isGlmModel = isGlmModelId(activeModelId, provider.providerId);
+      const glmControls = isGlmModel
+        ? resolveGlmRequestControls({
+            modelId: activeModelId,
+            providerId: provider.providerId,
+            phase: request.phase,
+            reasoningEffort,
+            turnIndex: modelTurnIndex,
+            selfHealCount,
+            hasFailure: lastBuildOrTestFailed || lastSemanticFailed || editMismatchCount > 0,
+            userPrompt: prompt,
+          })
+        : null;
+      const effectiveTokenBudget = resolveModelContextBudget({
+        modelId: activeModelId,
+        providerId: provider.providerId,
+        configuredBudget: activeGoal.tokenBudget,
+      });
+      activeGoal.tokenBudget = effectiveTokenBudget;
       const peakHour = isDeepSeekPeakHour();
       emitRuntimeEvent({
         type: 'model_tier',
@@ -4088,13 +4120,13 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         payload: {
           configuredModelId,
           effectiveModelId: activeModelId,
-          thinkingEnabled,
+          thinkingEnabled: isGlmModel ? Boolean(glmControls?.enableThinking) : thinkingEnabled,
           reasoningEffort,
           peakHour,
           tokensUsed: activeGoal.tokensUsed,
-          tokenBudget: Number(activeGoal.tokenBudget ?? 180000),
+          tokenBudget: effectiveTokenBudget,
           tier: tierDecision.tier,
-          reason: tierDecision.reason,
+          reason: glmControls ? `${tierDecision.reason} (${glmControls.reason})` : tierDecision.reason,
           turnIndex: modelTurnIndex,
         },
       });
@@ -4159,11 +4191,17 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
               p.toolCallId.trim().length > 0
           );
           if (toolCallParts.length > 0) {
+            const isRecentAssistantTurn = msgIdx >= reqMessages.length - 2;
+            const shouldEchoReasoning =
+              isReasonerModel ||
+              (!isGlmModel &&
+                isRecentAssistantTurn &&
+                typeof (msg as any).reasoningContent === 'string');
             const assistantObj: Record<string, any> = {
               role: 'assistant',
               content: textParts || '',
-              // DeepSeek tool-calling requires prior reasoning_content to be echoed back.
-              ...(typeof (msg as any).reasoningContent === 'string' || isReasonerModel
+              // DeepSeek reasoner requires prior reasoning_content; for 128K GLM models, strip old CoT to save 40-60% context.
+              ...(shouldEchoReasoning
                 ? { reasoning_content: (msg as any).reasoningContent ?? '' }
                 : {}),
               tool_calls: toolCallParts.map((tc: any) => {
@@ -4232,16 +4270,12 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
 
       lastOpenAiMessages = openAiMessages;
 
-      const filteredTools = isFinishingStage
-        ? (request.tools ?? []).filter((t: any) =>
-          ['edit_file', 'write_file', 'apply_patch', 'editor', 'run_command', 'run_commands', 'read_file'].includes(
-            t.name
-          )
-        )
-        : (request.tools ?? []);
+      // Preserve 100% static tools array across turns so vLLM Automatic Prefix Caching (APC)
+      // never invalidates the systemPrompt + tools KV cache block.
+      const staticTools = request.tools ?? [];
 
       const openAiTools = allowToolsThisTurn
-        ? filteredTools.map((t: any) => ({
+        ? staticTools.map((t: any) => ({
           type: 'function',
           function: {
             name: t.name,
@@ -4251,11 +4285,7 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         }))
         : [];
 
-      const isGlmModel =
-        provider.providerId === 'glm' || /^glm/i.test(activeModelId);
       const isLocalInference = isLocalOrPrivateEndpoint(provider.apiEndpoint);
-      const glmEnableThinking =
-        isGlmModel && (request.phase === 'plan' || reasoningEffort === 'max');
 
       const response = await postJsonResilient({
         url: endpoint,
@@ -4269,10 +4299,14 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
           tools: openAiTools.length > 0 ? openAiTools : undefined,
           tool_choice: openAiTools.length > 0 ? 'auto' : undefined,
           max_tokens: 8192,
-          ...(isReasonerModel ? {} : { temperature: 0.2 }),
+          ...(isReasonerModel
+            ? {}
+            : glmControls
+              ? { temperature: glmControls.temperature, top_p: glmControls.topP }
+              : { temperature: 0.2 }),
           ...(dsControls ? deepSeekChatBodyExtras(dsControls) : {}),
-          ...(isGlmModel
-            ? { chat_template_kwargs: { enable_thinking: glmEnableThinking } }
+          ...(glmControls
+            ? { chat_template_kwargs: glmControls.chatTemplateKwargs }
             : {}),
         },
         signal: request.signal ?? signal,
@@ -4313,12 +4347,14 @@ export async function executeLiveLlmAgentLoop(runtimeCtx: any, params: {
         const rawArgs = typeof tc?.function?.arguments === 'string' ? tc.function.arguments : '{}';
         let parsedArgs: Record<string, unknown> = {};
         let inputText = rawArgs;
-        try {
-          parsedArgs = JSON.parse(rawArgs);
+        const repaired = parseToolArgumentsResilient(rawArgs);
+        if (repaired.ok) {
+          parsedArgs = repaired.parsed;
+          inputText = repaired.repairedText;
           if (fnName === 'write_file' && parsedArgs?.filePath) {
             sessionWrittenFiles.push(String(parsedArgs.filePath));
           }
-        } catch {
+        } else {
           // Tool call JSON arguments were truncated at max_tokens
           if (validToolCalls.length > 0) {
             // Execute the already-complete tool calls in this turn; the model will do the truncated one next turn

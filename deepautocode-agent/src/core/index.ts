@@ -314,11 +314,16 @@ export {
   formatCostCny,
   resolvePhaseReasoningEffort,
   extractDeepSeekCacheUsage,
+  isGlmModelId,
+  resolveGlmRequestControls,
+  resolveModelContextBudget,
+  parseToolArgumentsResilient,
   type DeepSeekApiModelId,
   type DeepSeekReasoningEffort,
   type DeepSeekRequestControls,
   type AgentLoopPhase,
   type NormalizedDeepSeekCacheUsage,
+  type GlmRequestControls,
 } from './DeepSeekModels.js';
 
 export {
