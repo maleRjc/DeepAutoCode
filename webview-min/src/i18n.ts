@@ -459,3 +459,16 @@ Object.assign(DICTS.en, {
   'stage.tool': 'Running tools…',
   'stage.writing': 'Writing answer…',
 });
+
+Object.assign(DICTS['zh-CN'], {
+  'chat.you': '你', 'chat.ai': 'DeepSeek Harness', 'chat.copyAnswer': '复制回答',
+  'chat.copy': '复制', 'chat.copied': '已复制',
+});
+Object.assign(DICTS['zh-TW'], {
+  'chat.you': '你', 'chat.ai': 'DeepSeek Harness', 'chat.copyAnswer': '複製回答',
+  'chat.copy': '複製', 'chat.copied': '已複製',
+});
+Object.assign(DICTS.en, {
+  'chat.you': 'You', 'chat.ai': 'DeepSeek Harness', 'chat.copyAnswer': 'Copy',
+  'chat.copy': 'Copy', 'chat.copied': 'Copied',
+});

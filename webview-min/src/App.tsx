@@ -12,6 +12,7 @@ import {
   type WorkspaceInfo,
 } from './api';
 import { LOCALES, createTranslator, detectLocale, type Locale, type Translate } from './i18n';
+import { ChatMessage as ChatMessageView, ToolCallCard } from './ChatMessage';
 
 type AgentState = 'idle' | 'running' | 'error';
 type Theme = 'dark' | 'light';
@@ -89,50 +90,6 @@ function DiffText({ diff }: { diff: DiffRecord }) {
         );
       })}
     </pre>
-  );
-}
-
-function RichText({ text }: { text: string }) {
-  const parts = text.split(/```/);
-  return (
-    <>
-      {parts.map((part, index) =>
-        index % 2 === 1 ? (
-          <pre className="code-block" key={index}>
-            <code>{part.replace(/^[a-zA-Z0-9+#-]*\n/, '')}</code>
-          </pre>
-        ) : (
-          <div className="plain-text" key={index}>
-            {part}
-          </div>
-        )
-      )}
-    </>
-  );
-}
-
-function ToolCard({ call }: { call: ToolCall }) {
-  const [open, setOpen] = React.useState(false);
-  const args = call.args ? JSON.stringify(call.args) : '';
-  const result =
-    call.result == null ? '' : typeof call.result === 'string' ? call.result : JSON.stringify(call.result);
-  const failed = call.status === 'failed' || call.status === 'rejected';
-  return (
-    <div className={`tool-card ${failed ? 'failed' : ''}`}>
-      <button className="tool-head" onClick={() => setOpen((v) => !v)}>
-        <span className="tool-dot" />
-        <span className="tool-name">{call.toolName}</span>
-        <span className="tool-status">{call.status}</span>
-        <span className="tool-caret">{open ? '▾' : '▸'}</span>
-      </button>
-      {open && (
-        <div className="tool-detail">
-          {args && <pre>{args}</pre>}
-          {result && <pre>{result.slice(0, 4000)}</pre>}
-          {call.error && <pre className="err">{call.error}</pre>}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -1162,32 +1119,34 @@ export default function App() {
 
           <div className="messages">
             {messages.map((m) => (
-              <div key={m.id} className={`msg ${m.role}`}>
-                {m.role === 'assistant' && m.thinking && (
-                  <details className="thinking">
-                    <summary>{t('chat.thinking')}</summary>
-                    <div>{m.thinking}</div>
-                  </details>
-                )}
-                {m.role === 'error' ? <div className="error-text">{m.content}</div> : <RichText text={m.content} />}
-                {m.toolCalls?.map((call) => <ToolCard key={call.toolCallId} call={call} />)}
-              </div>
+              <ChatMessageView
+                key={m.id}
+                message={{
+                  id: m.id,
+                  role: m.role,
+                  content: m.content,
+                  thinking: m.thinking,
+                  toolCalls: m.toolCalls,
+                  timestamp: m.timestamp,
+                }}
+                t={t}
+              />
             ))}
 
-            {streamThinking && (
-              <div className="msg assistant streaming">
-                <details className="thinking" open>
-                  <summary>{t('chat.thinkingNow')}</summary>
-                  <div>{streamThinking}</div>
-                </details>
-              </div>
+            {(streamThinking || streamText) && (
+              <ChatMessageView
+                streaming
+                t={t}
+                message={{
+                  id: 'streaming',
+                  role: 'assistant',
+                  content: streamText,
+                  thinking: streamThinking || undefined,
+                  timestamp: new Date().toISOString(),
+                }}
+              />
             )}
-            {streamText && (
-              <div className="msg assistant streaming">
-                <RichText text={streamText} />
-              </div>
-            )}
-            {toolCalls.map((call) => <ToolCard key={call.toolCallId} call={call} />)}
+            {toolCalls.map((call) => <ToolCallCard key={call.toolCallId} call={call} />)}
 
             {approvals.map((approval) => (
               <div className="card approval" key={approval.approvalId}>
@@ -1253,27 +1212,40 @@ export default function App() {
           )}
 
           <div className="composer">
-            <textarea
-              value={input}
-              placeholder={t('chat.placeholder')}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey && !(e.nativeEvent as any).isComposing) {
-                  e.preventDefault();
-                  void handleSend();
-                }
-              }}
-              rows={3}
-            />
-            <div className="composer-actions">
-              <span className="hint">{busy ? t('chat.sending') : t('chat.enterHint')}</span>
-              <button
-                className="btn primary"
-                onClick={() => void handleSend()}
-                disabled={busy || !input.trim() || !workspace.workspaceRoot}
-              >
-                {t('chat.send')}
-              </button>
+            <div className="composer-box">
+              <textarea
+                value={input}
+                placeholder={t('chat.placeholder')}
+                rows={2}
+                onInput={(e) => {
+                  const el = e.currentTarget;
+                  el.style.height = 'auto';
+                  el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
+                }}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey && !(e.nativeEvent as any).isComposing) {
+                    e.preventDefault();
+                    void handleSend();
+                  }
+                }}
+              />
+              <div className="composer-actions">
+                <span className="composer-chip">{model || activeProviderId || 'model'}</span>
+                <span className="hint">{busy ? t('chat.sending') : t('chat.enterHint')}</span>
+                <span className="spacer" />
+                {busy ? (
+                  <button className="btn small danger" onClick={handleStop}>{t('chat.stop')}</button>
+                ) : (
+                  <button
+                    className="btn primary send-btn"
+                    onClick={() => void handleSend()}
+                    disabled={!input.trim() || !workspace.workspaceRoot}
+                  >
+                    {t('chat.send')}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </section>
