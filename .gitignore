@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.deepautocode-data/
+.dsh-home/
+.npm-cache/
+*.log
+
+.electron-probe/
+*.bak
+# Windows junction kept locally so the legacy webview build can import host/*.ts
+src/
+# Screenshots may contain local paths / gateway endpoints; kept out of the public repo
+docs/*.png

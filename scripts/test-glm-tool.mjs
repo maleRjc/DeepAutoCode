@@ -1,0 +1,43 @@
+import WebSocket from 'ws';
+
+const base = 'http://127.0.0.1:3840';
+const bridge = async (type, payload = {}, sessionId) => {
+  const res = await fetch(`${base}/api/bridge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ category: 'request', type, requestId: `t_${Math.random()}`, payload, sessionId }),
+  });
+  return res.json();
+};
+
+const created = await bridge('session.create', {
+  title: 'glm tool test',
+  workspaceRoot: 'E:\\AutoCode\\DeepAutoCode-New',
+  executionMode: 'auto',
+});
+const sessionId = created?.data?.sessionId;
+if (!sessionId) process.exit(1);
+
+const events = [];
+const ws = new WebSocket('ws://127.0.0.1:3840/ws');
+ws.on('message', (raw) => {
+  try {
+    const msg = JSON.parse(String(raw));
+    if (msg.category === 'event' && msg.sessionId === sessionId) {
+      events.push(`${((Date.now() - t0) / 1000).toFixed(0)}s ${msg.type} ${JSON.stringify(msg.payload).slice(0, 200)}`);
+    }
+  } catch {}
+});
+await new Promise((r) => ws.on('open', r));
+
+const t0 = Date.now();
+await bridge('session.send', { prompt: '用 read 工具读取 package.json，只回答其中的 name 字段值。' }, sessionId);
+
+while (Date.now() - t0 < 300000) {
+  await new Promise((r) => setTimeout(r, 2000));
+  if (events.some((e) => e.includes('assistant.text.done') || e.includes('runtime.error'))) break;
+}
+console.log('EVENTS:');
+for (const e of events) console.log('  ' + e);
+ws.close();
+process.exit(0);
