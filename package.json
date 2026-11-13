@@ -15,7 +15,7 @@
     "build:host": "tsc -p tsconfig.json",
     "build": "npm run build:ui && npm run build:host",
     "start": "node scripts/start.cjs",
-    "dev": "tsx host/main.ts",
+    "dev": "tsx src/main.ts",
     "desktop": "electron electron/main.cjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

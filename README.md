@@ -42,9 +42,9 @@
 ```
 DeepAutoCode 精简界面 (webview-min/, React + Vite)
         │  WS /ws + HTTP /api/bridge        │ REST /api/workspace/*
-Workbench Host (host/workbench-server, 沿用 DAC)
+Workbench Host (src/workbench-server, 沿用 DAC)
         │  IClineCoreInstance（RuntimeFactory 一处接缝）
-DSH 内核适配层 (host/kernel/dsh-runtime.ts)
+DSH 内核适配层 (src/kernel/dsh-runtime.ts)
         │  SDK JSON-RPC over stdio
 DeepSeek Harness 运行时 dsh --profile sdk (Node ≥ 24)
 ```
@@ -175,8 +175,8 @@ relay-host 只是路由（其上容器已停用多时），模型服务在 `10.0
 |---|---|
 | `webview-min/` | **新**精简界面源码（`npm run build:ui` 构建到 `dist/webview`） |
 | `webview/` | 原 DeepAutoCode 完整界面（保留作参考，`npm run build:ui-legacy`） |
-| `host/kernel/` | DSH 内核适配层 |
-| `host/workbench-server/` | 工作台服务（文件树/编辑/会话 REST + WS） |
+| `src/kernel/` | DSH 内核适配层 |
+| `src/workbench-server/` | 工作台服务（文件树/编辑/会话 REST + WS） |
 | `electron/` | 桌面壳 |
 | `start-desktop.bat` | 一键桌面启动（GBK 编码，别用 UTF-8 覆盖保存） |
 
