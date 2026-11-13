@@ -1,7 +1,7 @@
-const url = 'http://10.0.0.10:8000/v1/chat/completions';
+const url = process.env.DAC_GATEWAY_URL ? process.env.DAC_GATEWAY_URL.replace(/\/$/, '') + '/v1/chat/completions' : 'http://10.0.0.10:8000/v1/chat/completions';
 const body = (stream) =>
   JSON.stringify({
-    model: 'your-model',
+    model: process.env.DAC_MODEL || 'your-model',
     messages: [{ role: 'user', content: '请直接回复四个字：连接正常' }],
     max_tokens: 64,
     stream,

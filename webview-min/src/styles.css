@@ -417,3 +417,69 @@ html[data-theme='light'] .tool-section pre { background: #f4f6fa; }
   text-overflow: ellipsis; white-space: nowrap;
 }
 .send-btn { border-radius: 8px; padding: 4px 14px; }
+
+/* ---------------------------------------------------------------- layout: right panel */
+.body.with-right { grid-template-columns: 250px minmax(0, 1fr) 400px 280px; }
+.right-pane {
+  border-left: 1px solid var(--border); background: var(--panel);
+  display: flex; flex-direction: column; overflow: auto; min-height: 0;
+}
+.right-section { padding: 8px 10px 12px; border-bottom: 1px solid var(--border); }
+.right-section-title { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+.usage-row { display: flex; align-items: baseline; gap: 6px; font-size: 13px; }
+.usage-bar { height: 5px; border-radius: 999px; background: var(--panel-2); overflow: hidden; margin: 6px 0; }
+.usage-fill { height: 100%; background: var(--accent); border-radius: 999px; }
+.right-diff { padding: 6px 0; border-bottom: 1px dashed var(--border); }
+.right-diff:last-child { border-bottom: none; }
+.right-diff-path { font-size: 12px; word-break: break-all; }
+.right-diff-actions { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+.right-diff-actions .link { font-size: 11px; }
+.link.danger { color: var(--danger); }
+.right-tool { display: flex; align-items: center; gap: 6px; padding: 3px 0; font-size: 12px; }
+.right-tool-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 150px; }
+
+/* ---------------------------------------------------------------- sidebar tabs */
+.side-tabs { display: flex; border-bottom: 1px solid var(--border); flex: none; }
+.side-tabs button {
+  flex: 1; background: none; border: none; color: var(--muted); padding: 7px 6px;
+  cursor: pointer; font-size: 11.5px; border-bottom: 2px solid transparent;
+}
+.side-tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+.sessions-list { overflow: auto; flex: 1; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+.session-item {
+  text-align: left; background: none; border: 1px solid transparent; border-radius: 7px;
+  padding: 7px 8px; cursor: pointer; color: var(--text); display: flex; flex-direction: column; gap: 2px;
+}
+.session-item:hover { background: var(--panel-2); }
+.session-item.active { background: var(--panel-2); border-color: var(--accent); }
+.session-title { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-meta { color: var(--muted); font-size: 10.5px; }
+
+/* ---------------------------------------------------------------- attachments & mentions */
+.mention-pop {
+  position: absolute; left: 8px; right: 8px; bottom: calc(100% + 6px); z-index: 25;
+  max-height: 220px; overflow: auto; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 10px 24px rgba(0,0,0,.28); padding: 4px;
+}
+.mention-pop button {
+  display: block; width: 100%; text-align: left; background: none; border: none;
+  color: var(--text); padding: 5px 8px; border-radius: 5px; cursor: pointer; font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mention-pop button:hover { background: var(--panel-2); }
+.attach-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.attach-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 6px 2px 2px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--panel);
+  font-size: 11px; color: var(--muted); max-width: 180px;
+}
+.attach-chip img { width: 26px; height: 26px; object-fit: cover; border-radius: 4px; }
+.attach-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attach-chip button { background: none; border: none; color: var(--muted); cursor: pointer; }
+.composer-box { position: relative; }
+.composer-model { max-width: 170px; padding: 2px 6px; }
+
+.btn { white-space: nowrap; }
+.composer-actions { flex-wrap: nowrap; }
+.composer-actions .hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.send-btn { flex: none; }

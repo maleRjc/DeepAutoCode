@@ -12,8 +12,8 @@ const bridge = async (type, payload = {}, sessionId) => {
 
 await bridge('provider.update', {
   providerId: 'openai-compatible',
-  apiEndpoint: 'http://10.0.0.10:8000',
-  modelId: 'your-model',
+  apiEndpoint: process.env.DAC_GATEWAY_URL || 'http://10.0.0.10:8000',
+  modelId: process.env.DAC_MODEL || 'your-model',
 });
 
 const created = await bridge('session.create', {

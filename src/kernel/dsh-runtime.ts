@@ -933,6 +933,13 @@ export class DshRuntime implements IClineCoreInstance {
     }
   }
 
+  private contextWindowFor(state: SessionState): number {
+    const profile = this.providerManager?.getProviderById?.(state.manifest.providerId);
+    const model = profile?.models?.find((m) => m.modelId === state.manifest.modelId);
+    if (model?.contextWindow) return model.contextWindow;
+    return state.manifest.providerId === 'deepseek' ? 1_000_000 : 131_072;
+  }
+
   private forwardGatewayDelta(clientKey: string, delta: GatewayDelta): void {
     const state = this.activeTurns.get(clientKey);
     if (!state) return;
@@ -976,6 +983,18 @@ export class DshRuntime implements IClineCoreInstance {
       case 'assistant/message': {
         if (process.env.DSH_KERNEL_DEBUG === '1' && data.usage) {
           console.log('[dsh-kernel] usage', JSON.stringify(data.usage));
+        }
+        const usage = data.usage as Record<string, number> | undefined;
+        if (usage) {
+          const used = Number(usage.totalTokens ?? 0);
+          const budget = this.contextWindowFor(state);
+          this.emit(state, 'goal_usage', {
+            tokensUsed: used,
+            tokenBudget: budget,
+            cacheReadTokens: Number(usage.cacheReadTokens ?? 0),
+            cacheWriteTokens: Number(usage.cacheWriteTokens ?? 0),
+            remaining: Math.max(0, budget - used),
+          });
         }
         // The gateway proxy already streamed these deltas for this turn.
         if (state.streamedThisTurn) break;

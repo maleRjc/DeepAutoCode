@@ -11,6 +11,7 @@ export interface ChatToolCall {
   result?: unknown;
   error?: string;
   durationMs?: number;
+  startedAt?: string;
 }
 
 export interface ChatMessageModel {
@@ -43,6 +44,16 @@ export function toolIcon(name: string): string {
 
 export function ToolCallCard({ call }: { call: ChatToolCall }) {
   const [open, setOpen] = React.useState(call.status === 'running');
+  const [now, setNow] = React.useState(Date.now());
+  React.useEffect(() => {
+    if (call.status !== 'running') return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [call.status]);
+  const liveElapsed =
+    call.status === 'running' && call.startedAt
+      ? Math.max(0, Math.round((now - new Date(call.startedAt).getTime()) / 1000))
+      : undefined;
   const failed = call.status === 'failed' || call.status === 'rejected';
   const done = call.status === 'completed';
   const args = call.args ? JSON.stringify(call.args, null, 2) : '';
@@ -57,9 +68,11 @@ export function ToolCallCard({ call }: { call: ChatToolCall }) {
         <span className={`tool-status ${failed ? 'failed' : done ? 'done' : 'running'}`}>
           {call.status}
         </span>
-        {typeof call.durationMs === 'number' && (
+        {typeof call.durationMs === 'number' ? (
           <span className="tool-duration">{call.durationMs}ms</span>
-        )}
+        ) : liveElapsed !== undefined ? (
+          <span className="tool-duration">{liveElapsed}s</span>
+        ) : null}
         <span className="tool-caret">{open ? '▾' : '▸'}</span>
       </button>
       {open && (

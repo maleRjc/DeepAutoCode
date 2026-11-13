@@ -12,7 +12,7 @@ import {
   type WorkspaceInfo,
 } from './api';
 import { LOCALES, createTranslator, detectLocale, type Locale, type Translate } from './i18n';
-import { ChatMessage as ChatMessageView, ToolCallCard } from './ChatMessage';
+import { ChatMessage as ChatMessageView, ToolCallCard, toolIcon } from './ChatMessage';
 
 type AgentState = 'idle' | 'running' | 'error';
 type Theme = 'dark' | 'light';
@@ -225,6 +225,18 @@ export default function App() {
   const [busy, setBusy] = React.useState(false);
   const [elapsed, setElapsed] = React.useState(0);
   const [stage, setStage] = React.useState<'idle' | 'starting' | 'waiting' | 'tool' | 'writing'>('idle');
+  const [sessions, setSessions] = React.useState<any[]>([]);
+  const [leftTab, setLeftTab] = React.useState<'files' | 'sessions'>('files');
+  const [rightOpen, setRightOpen] = React.useState(true);
+  const [usage, setUsage] = React.useState<{
+    tokensUsed: number;
+    tokenBudget: number;
+    cacheReadTokens: number;
+  } | null>(null);
+  const [attachedImages, setAttachedImages] = React.useState<
+    Array<{ id: string; name: string; dataUrl: string; mimeType: string }>
+  >([]);
+  const [mention, setMention] = React.useState<{ query: string; start: number } | null>(null);
 
   const messageEndRef = React.useRef<HTMLDivElement | null>(null);
   const sessionRef = React.useRef('');
@@ -310,9 +322,19 @@ export default function App() {
     }
   }, []);
 
+  const loadSessions = React.useCallback(async () => {
+    try {
+      const list = await bridge<any[]>('session.list');
+      setSessions(Array.isArray(list) ? list : []);
+    } catch {
+      // ignore
+    }
+  }, []);
+
   React.useEffect(() => {
     void loadWorkspace();
     void loadProviders();
+    void loadSessions();
     void loadSshProfiles();
     const disconnect = connectEvents((event) => handleEvent(event));
     setSocketState('open');
@@ -372,6 +394,7 @@ export default function App() {
         setBusy(false);
         void refreshMessages(sid || sessionRef.current);
         void loadWorkspace();
+        void loadSessions();
         void refreshOpenTabs();
         break;
       case 'session.state.changed': {
@@ -389,6 +412,15 @@ export default function App() {
           setStage('idle');
           setBusy(false);
         }
+        break;
+      }
+      case 'goal_usage':
+      case 'goal.usage': {
+        setUsage({
+          tokensUsed: Number(payload.tokensUsed ?? 0),
+          tokenBudget: Number(payload.tokenBudget ?? 0),
+          cacheReadTokens: Number(payload.cacheReadTokens ?? 0),
+        });
         break;
       }
       case 'tool.call.started': {
@@ -495,11 +527,19 @@ export default function App() {
 
     try {
       const sid = await ensureSession(text);
+      const imagesToSend = attachedImages.map((img) => ({
+        name: img.name,
+        dataUrl: img.dataUrl,
+        mimeType: img.mimeType,
+      }));
+      setAttachedImages([]);
+      setMention(null);
       await bridge('session.send', {
         sessionId: sid,
         prompt: text,
         workspaceRoot: workspace.workspaceRoot || undefined,
         executionMode: 'auto',
+        images: imagesToSend.length > 0 ? imagesToSend : undefined,
       }, sid);
     } catch (err) {
       setMessages((prev) => [...prev, errorMessage((err as Error).message)]);
@@ -526,7 +566,80 @@ export default function App() {
     setApprovals([]);
     setDiffs([]);
     setAgentState('idle');
+    setUsage(null);
+    setAttachedImages([]);
+    setMention(null);
     setNotice(t('notice.newSession'));
+  }
+
+  async function handleSelectSession(id: string) {
+    if (busy || !id) return;
+    setSessionId(id);
+    sessionRef.current = id;
+    setStreamText('');
+    setStreamThinking('');
+    setToolCalls([]);
+    setApprovals([]);
+    setUsage(null);
+    setAgentState('idle');
+    await refreshMessages(id);
+  }
+
+  async function handleModelChange(nextModel: string) {
+    if (!nextModel || nextModel === model) return;
+    try {
+      await bridge('provider.update', {
+        providerId: activeProviderId,
+        apiEndpoint: endpoint,
+        modelId: nextModel,
+      });
+      setModel(nextModel);
+      await loadProviders();
+      await handleNewSession();
+      setNotice(t('chat.modelChanged', { model: nextModel }));
+    } catch (err) {
+      setNotice(t('settings.saveFailed', { msg: (err as Error).message }));
+    }
+  }
+
+  function handlePaste(event: React.ClipboardEvent) {
+    const items = Array.from(event.clipboardData?.items ?? []);
+    const imageItem = items.find((item) => item.type.startsWith('image/'));
+    if (!imageItem) return;
+    const file = imageItem.getAsFile();
+    if (!file) return;
+    event.preventDefault();
+    const reader = new FileReader();
+    reader.onload = () => {
+      setAttachedImages((prev) => [
+        ...prev.slice(-3),
+        {
+          id: `img_${Date.now()}`,
+          name: file.name || 'pasted.png',
+          dataUrl: String(reader.result || ''),
+          mimeType: file.type || 'image/png',
+        },
+      ]);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handleInputChange(event: React.ChangeEvent<HTMLTextAreaElement>) {
+    const value = event.target.value;
+    setInput(value);
+    const caret = event.target.selectionStart ?? value.length;
+    const before = value.slice(0, caret);
+    const match = /@([^\s@]*)$/.exec(before);
+    if (match) setMention({ query: match[1], start: caret - match[0].length });
+    else setMention(null);
+  }
+
+  function applyMention(path: string) {
+    if (!mention) return;
+    const token = `@${mention.query}`;
+    const next = `${input.slice(0, mention.start)}@${path} ${input.slice(mention.start + token.length)}`;
+    setInput(next);
+    setMention(null);
   }
 
   async function handleAnswerApproval(approvalId: string, approved: boolean) {
@@ -848,6 +961,11 @@ export default function App() {
     return Array.from(new Set([...base, ...fetchedModels]));
   }, [activeProvider, fetchedModels]);
   const modelIsCustom = Boolean(model) && !modelIds.includes(model);
+  const mentionOptions = React.useMemo(() => {
+    if (!mention) return [];
+    const q = mention.query.toLowerCase();
+    return workspace.files.filter((f) => f.toLowerCase().includes(q)).slice(0, 8);
+  }, [mention, workspace.files]);
   const langLabel = LOCALES.find((l) => l.id === locale)?.label ?? locale;
 
   function closeMenus() {
@@ -1010,8 +1128,25 @@ export default function App() {
         </div>
       )}
 
-      <div className="body" style={{ display: workspace.workspaceRoot ? 'grid' : 'none' }}>
+      <div className={`body ${rightOpen ? 'with-right' : ''}`} style={{ display: workspace.workspaceRoot ? 'grid' : 'none' }}>
         <aside className="tree-pane">
+          <div className="side-tabs">
+            <button className={leftTab === 'files' ? 'active' : ''} onClick={() => setLeftTab('files')}>
+              {t('tree.title')}
+            </button>
+            <button
+              className={leftTab === 'sessions' ? 'active' : ''}
+              onClick={() => {
+                setLeftTab('sessions');
+                void loadSessions();
+              }}
+            >
+              {t('sessions.title')}
+            </button>
+          </div>
+
+          {leftTab === 'files' ? (
+            <>
           <div className="pane-title tree-head">
             <span>{remote ? `${t('tree.title')} · ${t('status.remote')}` : t('tree.title')}</span>
             {!remote && (
@@ -1035,6 +1170,25 @@ export default function App() {
             ))}
             {workspace.tree.length === 0 && <div className="empty">{t('tree.empty')}</div>}
           </div>
+            </>
+          ) : (
+            <div className="sessions-list">
+              {sessions.map((item) => (
+                <button
+                  key={item.sessionId}
+                  className={`session-item ${item.sessionId === sessionId ? 'active' : ''}`}
+                  onClick={() => void handleSelectSession(item.sessionId)}
+                  title={item.sessionId}
+                >
+                  <div className="session-title">{item.title || item.sessionId}</div>
+                  <div className="session-meta">
+                    {item.modelId} · {new Date(item.updatedAt).toLocaleString()}
+                  </div>
+                </button>
+              ))}
+              {sessions.length === 0 && <div className="empty">{t('sessions.empty')}</div>}
+            </div>
+          )}
         </aside>
 
         <main className="editor-pane">
@@ -1115,6 +1269,9 @@ export default function App() {
             <span className="chat-title">{t('chat.title')}</span>
             <span className="spacer" />
             {busy && <button className="btn small danger" onClick={handleStop}>{t('chat.stop')}</button>}
+            <button className="btn small" onClick={() => setRightOpen((v) => !v)} title={t('panel.title')}>
+              {rightOpen ? t('panel.hide') : t('panel.show')}
+            </button>
           </div>
 
           <div className="messages">
@@ -1213,6 +1370,36 @@ export default function App() {
 
           <div className="composer">
             <div className="composer-box">
+              {mentionOptions.length > 0 && (
+                <div className="mention-pop">
+                  {mentionOptions.map((file) => (
+                    <button
+                      key={file}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        applyMention(file);
+                      }}
+                    >
+                      {file}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {attachedImages.length > 0 && (
+                <div className="attach-row">
+                  {attachedImages.map((img) => (
+                    <span key={img.id} className="attach-chip">
+                      <img src={img.dataUrl} alt={img.name} />
+                      <span title={img.name}>{img.name}</span>
+                      <button
+                        onClick={() => setAttachedImages((prev) => prev.filter((item) => item.id !== img.id))}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
               <textarea
                 value={input}
                 placeholder={t('chat.placeholder')}
@@ -1222,8 +1409,13 @@ export default function App() {
                   el.style.height = 'auto';
                   el.style.height = `${Math.min(el.scrollHeight, 180)}px`;
                 }}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={handleInputChange}
+                onPaste={handlePaste}
                 onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    setMention(null);
+                    return;
+                  }
                   if (e.key === 'Enter' && !e.shiftKey && !(e.nativeEvent as any).isComposing) {
                     e.preventDefault();
                     void handleSend();
@@ -1231,8 +1423,21 @@ export default function App() {
                 }}
               />
               <div className="composer-actions">
-                <span className="composer-chip">{model || activeProviderId || 'model'}</span>
-                <span className="hint">{busy ? t('chat.sending') : t('chat.enterHint')}</span>
+                <select
+                  className="composer-chip composer-model"
+                  value={modelIds.includes(model) ? model : ''}
+                  onChange={(e) => void handleModelChange(e.target.value)}
+                >
+                  {!modelIds.includes(model) && model && <option value="">{model}</option>}
+                  {modelIds.map((id) => (
+                    <option key={id} value={id}>{id}</option>
+                  ))}
+                </select>
+                <span className="hint">
+                  {busy
+                    ? t('chat.sending')
+                    : t('chat.enterHint') + ' · @文件 · 可粘贴图片'}
+                </span>
                 <span className="spacer" />
                 {busy ? (
                   <button className="btn small danger" onClick={handleStop}>{t('chat.stop')}</button>
@@ -1249,6 +1454,84 @@ export default function App() {
             </div>
           </div>
         </section>
+
+        {rightOpen && (
+          <aside className="right-pane">
+            <div className="pane-title">{t('panel.title')}</div>
+
+            <div className="right-section">
+              <div className="right-section-title">{t('panel.context')}</div>
+              {usage ? (
+                <>
+                  <div className="usage-row">
+                    <span>{usage.tokensUsed.toLocaleString()}</span>
+                    <span className="hint">/ {usage.tokenBudget.toLocaleString()}</span>
+                  </div>
+                  <div className="usage-bar">
+                    <div
+                      className="usage-fill"
+                      style={{ width: `${Math.min(100, Math.round((usage.tokensUsed / Math.max(1, usage.tokenBudget)) * 100))}%` }}
+                    />
+                  </div>
+                  <div className="hint">
+                    {t('panel.cacheRead')}: {usage.cacheReadTokens.toLocaleString()}
+                  </div>
+                </>
+              ) : (
+                <div className="hint">{t('panel.noUsage')}</div>
+              )}
+              <div className="hint" style={{ marginTop: 6 }}>
+                {activeProviderId} / {model || '—'}
+              </div>
+            </div>
+
+            <div className="right-section">
+              <div className="right-section-title">
+                {t('panel.changes')} · {diffs.length}
+              </div>
+              {diffs.length === 0 && <div className="hint">{t('panel.noChanges')}</div>}
+              {diffs.map((diff) => (
+                <div key={diff.diffId} className="right-diff">
+                  <div className="right-diff-path" title={diff.filePath}>
+                    {diff.operation === 'create' ? '＋' : '✎'} {diff.filePath}
+                  </div>
+                  <div className="right-diff-actions">
+                    <span className="badge">{diff.status}</span>
+                    {diff.status === 'pending' && (
+                      <>
+                        <button className="link" onClick={() => void handleDiffAction(diff, 'accept')}>
+                          {t('diff.accept')}
+                        </button>
+                        <button className="link danger" onClick={() => void handleDiffAction(diff, 'reject')}>
+                          {t('diff.reject')}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="right-section">
+              <div className="right-section-title">
+                {t('panel.tools')} · {toolCalls.length}
+              </div>
+              {toolCalls.length === 0 && <div className="hint">{t('panel.noTools')}</div>}
+              {toolCalls
+                .slice(-8)
+                .reverse()
+                .map((call) => (
+                  <div key={call.toolCallId} className="right-tool">
+                    <span>{toolIcon(call.toolName)}</span>
+                    <span className="right-tool-name">{call.toolName}</span>
+                    <span className={`tool-status ${call.status === 'failed' ? 'failed' : call.status === 'completed' ? 'done' : 'running'}`}>
+                      {call.status}
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </aside>
+        )}
       </div>
 
       <footer className="statusbar">

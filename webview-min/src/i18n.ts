@@ -472,3 +472,28 @@ Object.assign(DICTS.en, {
   'chat.you': 'You', 'chat.ai': 'DeepSeek Harness', 'chat.copyAnswer': 'Copy',
   'chat.copy': 'Copy', 'chat.copied': 'Copied',
 });
+
+Object.assign(DICTS['zh-CN'], {
+  'sessions.title': '会话', 'sessions.empty': '暂无会话',
+  'panel.title': '产物与上下文', 'panel.show': '面板', 'panel.hide': '收起',
+  'panel.context': '上下文用量', 'panel.cacheRead': '缓存命中', 'panel.noUsage': '本轮还没有用量数据',
+  'panel.changes': '改动', 'panel.noChanges': '暂无文件改动',
+  'panel.tools': '工具', 'panel.noTools': '暂无工具调用',
+  'chat.modelChanged': '已切换到 {model}，并新建会话',
+});
+Object.assign(DICTS['zh-TW'], {
+  'sessions.title': '工作階段', 'sessions.empty': '尚無工作階段',
+  'panel.title': '產物與上下文', 'panel.show': '面板', 'panel.hide': '收合',
+  'panel.context': '上下文用量', 'panel.cacheRead': '快取命中', 'panel.noUsage': '本輪尚無用量資料',
+  'panel.changes': '變更', 'panel.noChanges': '尚無檔案變更',
+  'panel.tools': '工具', 'panel.noTools': '尚無工具呼叫',
+  'chat.modelChanged': '已切換到 {model}，並新增工作階段',
+});
+Object.assign(DICTS.en, {
+  'sessions.title': 'Sessions', 'sessions.empty': 'No sessions yet',
+  'panel.title': 'Artifacts & Context', 'panel.show': 'Panel', 'panel.hide': 'Hide',
+  'panel.context': 'Context usage', 'panel.cacheRead': 'Cache read', 'panel.noUsage': 'No usage yet',
+  'panel.changes': 'Changes', 'panel.noChanges': 'No file changes',
+  'panel.tools': 'Tools', 'panel.noTools': 'No tool calls',
+  'chat.modelChanged': 'Switched to {model} and started a new session',
+});
