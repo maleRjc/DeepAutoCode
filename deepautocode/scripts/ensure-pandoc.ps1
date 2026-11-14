@@ -36,12 +36,41 @@ $zipName = "pandoc-$version-windows-$arch.zip"
 $zipPath = Join-Path $env:TEMP $zipName
 $url = "https://github.com/jgm/pandoc/releases/download/$version/$zipName"
 
-Write-Host "Downloading pandoc $version from $url ..."
 New-Item -ItemType Directory -Force -Path $destDir | Out-Null
 
-& curl.exe --ssl-no-revoke -fL $url -o $zipPath
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $zipPath)) {
-  Write-Error "curl failed to download pandoc (exit $LASTEXITCODE). Check proxy or set HTTPS_PROXY."
+$zipValid = (Test-Path $zipPath) -and ((Get-Item $zipPath).Length -gt 10000000)
+if (-not $zipValid) {
+  Write-Host "Downloading pandoc $version from $url ..."
+
+  $proxyArgs = @()
+  if ($env:HTTPS_PROXY -or $env:HTTP_PROXY) {
+    # Handled natively by curl via env
+  } elseif (Test-NetConnection -ComputerName 127.0.0.1 -Port 7890 -InformationLevel Quiet) {
+    $proxyArgs = @('-x', 'http://127.0.0.1:7890')
+  }
+
+  $mirrors = @(
+    $url,
+    "https://ghfast.top/$url",
+    "https://ghproxy.net/$url"
+  )
+
+  $downloaded = $false
+  foreach ($targetUrl in $mirrors) {
+    Write-Host "Fetching via $targetUrl ..."
+    & curl.exe -k --ssl-no-revoke -fL @proxyArgs $targetUrl -o $zipPath
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $zipPath) -and ((Get-Item $zipPath).Length -gt 10000000)) {
+      $downloaded = $true
+      break
+    }
+  }
+
+  if (-not $downloaded) {
+    Write-Warning "curl failed to download pandoc from available mirrors. Pandoc export will be skipped."
+    exit 0
+  }
+} else {
+  Write-Host "Reusing cached pandoc archive at $zipPath"
 }
 
 $stage = Join-Path $env:TEMP "pandoc-$version-extract"
