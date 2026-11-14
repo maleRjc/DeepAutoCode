@@ -153,4 +153,47 @@ describe('ApplyPatch', () => {
     expect(res.content).toContain('new');
     expect(res.content).not.toMatch(/^old/m);
   });
+
+  it('strips markdown code blocks and heredoc wrappers automatically', () => {
+    const original = 'const x = 1;\n';
+    const fencedPatch = [
+      '```patch',
+      '*** Begin Patch',
+      '*** Update File: code.ts',
+      '@@ -1,1 +1,1 @@',
+      '-const x = 1;',
+      '+const x = 2;',
+      '*** End Patch',
+      '```',
+    ].join('\n');
+    const res = applyPatchToContent('code.ts', original, fencedPatch);
+    expect(res.ok).toBe(true);
+    expect(res.content).toBe('const x = 2;\n');
+  });
+
+  it('adapts indentation when patch has different indentation from actual file', () => {
+    const original = [
+      'function test() {',
+      '    const a = 10;',
+      '    return a;',
+      '}',
+      '',
+    ].join('\n');
+
+    // Patch has only 2-space indentation instead of 4
+    const patch = [
+      '--- a/src/fn.ts',
+      '+++ b/src/fn.ts',
+      '@@ -2,2 +2,2 @@',
+      '-  const a = 10;',
+      '-  return a;',
+      '+  const a = 20;',
+      '+  return a * 2;',
+    ].join('\n');
+
+    const res = applyPatchToContent('src/fn.ts', original, patch);
+    expect(res.ok).toBe(true);
+    expect(res.content).toContain('    const a = 20;');
+    expect(res.content).toContain('    return a * 2;');
+  });
 });

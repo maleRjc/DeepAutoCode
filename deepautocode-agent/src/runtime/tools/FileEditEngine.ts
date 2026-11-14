@@ -68,15 +68,33 @@ export function normalizeWorkspaceRelativePath(rawPath: string, workspaceRoot: s
     return cleanRel || '.';
   }
 
+function cleanEditSnippet(raw: string): string {
+  let s = String(raw || '').replace(/^\uFEFF/, '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+  if (s.startsWith('```') && s.endsWith('```')) {
+    s = s.replace(/^```[a-zA-Z0-9_-]*\r?\n/, '').replace(/\r?\n```\s*$/, '');
+  }
+  return s;
+}
+
+function normalizeQuotes(s: string): string {
+  return s
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"');
+}
+
 export function applySmartTextReplacement(
   currentContent: string,
-  oldText: string,
-  newText: string,
+  rawOldText: string,
+  rawNewText: string,
   filePath: string
 ): string {
     if (!currentContent) {
-      return newText;
+      return rawNewText;
     }
+
+    const oldText = cleanEditSnippet(rawOldText);
+    const newText = cleanEditSnippet(rawNewText);
+
     // 1. Exact substring match (using function replacer so '$&' / '$$' in C/bash code are never mangled)
     if (currentContent.includes(oldText)) {
       return currentContent.replace(oldText, () => newText);
@@ -115,6 +133,20 @@ export function applySmartTextReplacement(
           const joined = [...before, normNew, ...after].join('\n');
           return hasCrLf ? joined.replace(/\n/g, '\r\n') : joined;
         }
+      }
+    }
+
+    // 4. Quote normalization match (curly vs straight quotes)
+    const quoteNormContent = normalizeQuotes(normCurrent);
+    const quoteNormOld = normalizeQuotes(normOld);
+    if (quoteNormContent.includes(quoteNormOld)) {
+      // Find actual index in normCurrent
+      const idx = quoteNormContent.indexOf(quoteNormOld);
+      if (idx >= 0) {
+        const before = normCurrent.slice(0, idx);
+        const after = normCurrent.slice(idx + quoteNormOld.length);
+        const joined = `${before}${normNew}${after}`;
+        return hasCrLf ? joined.replace(/\n/g, '\r\n') : joined;
       }
     }
 

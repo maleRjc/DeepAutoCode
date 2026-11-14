@@ -8,6 +8,7 @@ import {
   type WorkspaceFileIndexOptions,
 } from './WorkspaceFileIndex.js';
 import { evaluatePermissionRules, toolNameToAction } from './RulePermission.js';
+import { CodeModeEngine } from './CodeModeEngine.js';
 
 const execAsync = promisify(exec);
 
@@ -64,6 +65,7 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
       run_command: 'allow',
       connect_remote_ssh: 'allow',
       auto_build_and_test: 'allow',
+      execute_code_mode: 'allow',
     };
   }
   if (preset === 'plan') {
@@ -74,6 +76,7 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
       list_files: 'allow',
       search_codebase: 'allow',
       explore_codebase: 'allow',
+      execute_code_mode: 'allow',
       invoke_subagent: 'allow',
       define_subagent: 'allow',
       manage_subagents: 'allow',
@@ -106,6 +109,7 @@ export function createToolPoliciesWithPreset(preset: 'yolo' | 'default' | 'plan'
     list_files: 'allow',
     search_codebase: 'allow',
     explore_codebase: 'allow',
+    execute_code_mode: 'allow',
     invoke_subagent: 'allow',
     define_subagent: 'allow',
     manage_subagents: 'allow',
@@ -485,6 +489,33 @@ export function createBuiltinTools(options: CreateBuiltinToolsOptions): AgentToo
           maxBuffer: 4 * 1024 * 1024,
         });
         return [stdout?.trim(), stderr?.trim()].filter(Boolean).join('\n') || 'Command completed (exit 0).';
+      },
+    })
+  );
+
+  // 5. execute_code_mode (sandboxed high-density JS script with `dac` SDK)
+  const codeModeEngine = new CodeModeEngine(cwd, fileIndex);
+  tools.push(
+    createTool({
+      name: 'execute_code_mode',
+      description:
+        'Execute a sandboxed JavaScript script with the `dac` SDK to perform complex batch searches, file reads, filtering, or aggregations in a single turn without round-trip token waste. Available dac methods: dac.glob(pattern), dac.readFile(path, maxLines?), dac.grep(regex, paths?), dac.outline(path), dac.stat(path). The script can return any JSON-serializable value or print via console.log.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          code: {
+            type: 'string',
+            description: 'JavaScript code to execute. Top-level await is supported.',
+          },
+        },
+        required: ['code'],
+      },
+      execute: async (rawArgs: Record<string, any>) => {
+        const code = String(rawArgs?.code || rawArgs?.script || '');
+        if (!code.trim()) {
+          return { error: 'No code provided to execute_code_mode.' };
+        }
+        return await codeModeEngine.execute(code);
       },
     })
   );

@@ -4292,10 +4292,12 @@ User expects a fix (edit + re-build), NOT English chain-of-thought only.
         /reasoner|r1|pro/i.test(activeModelId)
       );
       const reasoningEffort =
-        request.reasoningEffort ??
-        (tierDecision as { reasoningEffort?: 'low' | 'high' | 'max' | null })
-          .reasoningEffort ??
-        (thinkingEnabled ? 'high' : null);
+        (tierDecision.tier === 'deep-reasoner' && (tierDecision as { reasoningEffort?: 'low' | 'high' | 'max' | null }).reasoningEffort)
+          ? (tierDecision as { reasoningEffort?: 'low' | 'high' | 'max' | null }).reasoningEffort
+          : (request.reasoningEffort ??
+            (tierDecision as { reasoningEffort?: 'low' | 'high' | 'max' | null })
+              .reasoningEffort ??
+            (thinkingEnabled ? 'high' : null));
       const dsControls = isDeepSeekModelId(activeModelId)
         ? buildDeepSeekRequestControls({
           apiModelId: activeModelId,

@@ -12,6 +12,9 @@ export const TOOL_NAME_ALIASES: Record<string, string> = {
   // explore batch
   explore_codebase: 'explore_codebase',
   explore: 'explore_codebase',
+  // codemode
+  execute_code_mode: 'execute_code_mode',
+  code_mode: 'execute_code_mode',
   // reads
   read_file: 'read_file',
   read_files: 'read_files',
@@ -65,6 +68,7 @@ export function applyStandardToolAliases(
   // If only explore exists, also expose search_codebase pointing at a thin wrapper is harder —
   // ensure explore is discoverable under a short name.
   next = withToolAlias(next, 'explore_codebase', 'explore', "Alias of 'explore_codebase'. ");
+  next = withToolAlias(next, 'execute_code_mode', 'code_mode', "Alias of 'execute_code_mode'. ");
   next = withToolAlias(next, 'edit_file', 'str_replace', "Alias of 'edit_file'. ");
   // If search_codebase missing but explore exists, still expose search_codebase as explore-compatible
   // only when search_codebase absent (builtin path usually provides it).

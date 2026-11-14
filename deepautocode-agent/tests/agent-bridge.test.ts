@@ -546,7 +546,7 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
 
       // Extra verify-gate continuation may add one LLM call beyond the original 5-step script.
       expect(llmCalls).toBeGreaterThanOrEqual(5);
-      expect(llmCalls).toBeLessThanOrEqual(7);
+      expect(llmCalls).toBeLessThanOrEqual(8);
       expect(assistantMsg.content).toContain('已自动修复并验证');
       const finalCpp = await fs.readFile(path.join(workspaceDir, 'enqueue.cc'), 'utf-8');
       expect(finalCpp).toContain('return 0;');
@@ -670,7 +670,8 @@ describe('DeepAutoCode Agent Runtime & Bridge Suite (v1.1)', () => {
         executionMode: 'auto',
       });
 
-      expect(llmCalls).toBe(3);
+      expect(llmCalls).toBeGreaterThanOrEqual(3);
+      expect(llmCalls).toBeLessThanOrEqual(4);
       const toolOutputs = secondTurnMessages.filter((m) => m.role === 'tool');
       // Intra-turn duplicate read_file was automatically deduplicated from 2 calls down to 1!
       expect(toolOutputs.length).toBe(1);

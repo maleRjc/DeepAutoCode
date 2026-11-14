@@ -231,6 +231,28 @@ export async function requestOpenAiChatCompletion(params: {
           const chunks: Buffer[] = [];
           res.on('data', (c) => chunks.push(Buffer.from(c)));
           res.on('end', () => {
+            if (status >= 200 && status < 300) {
+              const text = Buffer.concat(chunks).toString('utf-8');
+              try {
+                const data = JSON.parse(text || '{}') as any;
+                const msg = data?.choices?.[0]?.message ?? {};
+                finish({
+                  ok: true,
+                  status,
+                  message: msg,
+                  usage: data?.usage,
+                  reasoningContent:
+                    typeof msg.reasoning_content === 'string'
+                      ? msg.reasoning_content
+                      : typeof msg.reasoning === 'string'
+                        ? msg.reasoning
+                        : undefined,
+                });
+                return;
+              } catch {
+                // fall through to runNonStream retry if parsing fails
+              }
+            }
             void runNonStream().then(finish).catch(reject);
           });
           return;

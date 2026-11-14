@@ -84,11 +84,24 @@ function ensureFile(
   return found;
 }
 
+export function stripHeredocAndFences(raw: string): string {
+  let text = String(raw || '').trim();
+  const heredocMatch = text.match(/^(?:cat\s+<<\s*['"]?([A-Za-z0-9_]+)['"]?.*?\n)([\s\S]*?)(?:\n\1\s*$)/i);
+  if (heredocMatch) {
+    text = heredocMatch[2].trim();
+  }
+  if (text.startsWith('```')) {
+    text = text.replace(/^```[a-zA-Z0-9_-]*\r?\n/, '').replace(/\r?\n```\s*$/, '').trim();
+  }
+  return text;
+}
+
 /**
  * Parse a unified diff / Cursor-like patch into per-file hunks.
  */
 export function parseUnifiedPatch(patchText: string): ParsedPatchFile[] {
-  const lines = String(patchText || '').replace(/\r\n/g, '\n').split('\n');
+  const cleaned = stripHeredocAndFences(patchText);
+  const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
   const files: ParsedPatchFile[] = [];
   let current: ParsedPatchFile | null = null;
   let i = 0;
@@ -202,11 +215,13 @@ function linesEqualTrimEnd(a: string[], b: string[], start: number): boolean {
   return true;
 }
 
+export type MatchMode = 'exact' | 'rstrip' | 'trim' | 'normalized';
+
 function findFirstBlockIndex(
   fileLines: string[],
   oldLines: string[],
   preferStart: number,
-  trimEnd: boolean
+  mode: MatchMode
 ): number {
   if (oldLines.length === 0) return -1;
   const eq = (i: number) => {
@@ -214,7 +229,15 @@ function findFirstBlockIndex(
     for (let j = 0; j < oldLines.length; j++) {
       const a = fileLines[i + j];
       const b = oldLines[j];
-      if (trimEnd ? a.trimEnd() !== b.trimEnd() : a !== b) return false;
+      if (mode === 'exact') {
+        if (a !== b) return false;
+      } else if (mode === 'rstrip') {
+        if (a.trimEnd() !== b.trimEnd()) return false;
+      } else if (mode === 'trim') {
+        if (a.trim() !== b.trim()) return false;
+      } else if (mode === 'normalized') {
+        if (a.replace(/\s+/g, ' ').trim() !== b.replace(/\s+/g, ' ').trim()) return false;
+      }
     }
     return true;
   };
@@ -255,10 +278,22 @@ function applyHunkToContent(
   }
 
   // 1. Exact match near declared oldStart, then first exact elsewhere (never replace-all)
-  let matchAt = findFirstBlockIndex(fileLines, hunk.oldLines, startIdx, false);
+  let matchAt = findFirstBlockIndex(fileLines, hunk.oldLines, startIdx, 'exact');
+  let matchMode: MatchMode = 'exact';
   if (matchAt < 0) {
-    // 2. Trim-tolerant (trailing whitespace / CRLF already normalized)
-    matchAt = findFirstBlockIndex(fileLines, hunk.oldLines, startIdx, true);
+    // 2. Trailing-whitespace tolerant
+    matchAt = findFirstBlockIndex(fileLines, hunk.oldLines, startIdx, 'rstrip');
+    matchMode = 'rstrip';
+  }
+  if (matchAt < 0) {
+    // 3. Trim-tolerant (leading & trailing indentation difference)
+    matchAt = findFirstBlockIndex(fileLines, hunk.oldLines, startIdx, 'trim');
+    matchMode = 'trim';
+  }
+  if (matchAt < 0) {
+    // 4. Normalized whitespace match
+    matchAt = findFirstBlockIndex(fileLines, hunk.oldLines, startIdx, 'normalized');
+    matchMode = 'normalized';
   }
   if (matchAt < 0) {
     return {
@@ -267,9 +302,31 @@ function applyHunkToContent(
     };
   }
 
+  // Indentation adaptation if matched via trim or normalized
+  let finalNewLines = hunk.newLines;
+  if ((matchMode === 'trim' || matchMode === 'normalized') && hunk.oldLines.length > 0) {
+    const actualFirstLine = fileLines[matchAt];
+    const patternFirstLine = hunk.oldLines[0];
+    const actualIndent = actualFirstLine.match(/^\s*/)?.[0] ?? '';
+    const patternIndent = patternFirstLine.match(/^\s*/)?.[0] ?? '';
+    if (actualIndent !== patternIndent) {
+      const delta = actualIndent.length - patternIndent.length;
+      finalNewLines = hunk.newLines.map((line) => {
+        if (!line.trim()) return line;
+        if (delta > 0) {
+          return ' '.repeat(delta) + line;
+        } else if (delta < 0) {
+          const cut = Math.min(-delta, (line.match(/^\s*/)?.[0] ?? '').length);
+          return line.slice(cut);
+        }
+        return line;
+      });
+    }
+  }
+
   const next = [
     ...fileLines.slice(0, matchAt),
-    ...hunk.newLines,
+    ...finalNewLines,
     ...fileLines.slice(matchAt + hunk.oldLines.length),
   ].join('\n');
   return { ok: true, content: hasCrLf ? next.replace(/\n/g, '\r\n') : next };

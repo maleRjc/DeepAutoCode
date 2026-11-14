@@ -449,5 +449,71 @@ export {
   type ContextMessage,
 } from './ComposerContextRouter.js';
 
+export {
+  resolveModelCapability,
+  adaptToolsForModel,
+  adaptRequestBodyForModel,
+  type ModelCapabilityProfile,
+  type ModelFamily,
+  type ToolDialect,
+} from './ModelCapabilityRegistry.js';
+
+export {
+  CodeModeEngine,
+  type CodeModeOptions,
+  type CodeModeResult,
+  type CodeModeWorkspaceApi,
+  type CodeModeGrepMatch,
+} from './CodeModeEngine.js';
+
+export {
+  PersistentPtyManager,
+  PersistentTerminalSession,
+  type TerminalSessionOptions,
+  type TerminalExecutionResult,
+} from './PersistentPtyManager.js';
+
+export {
+  WorktreeManager,
+  type WorktreeInfo,
+  type CreateWorktreeOptions,
+  type MergeWorktreeOptions,
+  type RemoveWorktreeOptions,
+} from './WorktreeManager.js';
+
+export {
+  StructuredSessionStorage,
+  type StoredSessionRecord,
+  type StoredMessageRecord,
+  type StoredDiffRecord,
+  type MessageQueryOptions,
+} from './StructuredSessionStorage.js';
+
+export {
+  SshRemoteManager,
+  type SshTargetConfig,
+  type SshExecutionResult,
+  type SshTunnelHandle,
+} from './SshRemoteManager.js';
+
+export {
+  ReflexionBacktracker,
+  type HypothesisRecord,
+  type ReflexionBacktrackerOptions,
+} from './ReflexionBacktracker.js';
+
+export {
+  ReproFirstTddLoop,
+  type TddPhase,
+  type TddStateSnapshot,
+} from './ReproFirstTddLoop.js';
+
+export {
+  CrashTraceAnalyzer,
+  type CrashSignal,
+  type CrashReport,
+  type StackFrame,
+} from './CrashTraceAnalyzer.js';
+
 
 

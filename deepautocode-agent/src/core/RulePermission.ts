@@ -30,7 +30,7 @@ const ACTION_ALIASES: Record<string, string[]> = {
   edit: ['edit', 'edit_file', 'apply_patch', 'editor'],
   delete: ['delete', 'delete_file', 'rm'],
   shell: ['shell', 'run_command', 'run_commands', 'run-build', 'auto_build_and_test'],
-  read: ['read', 'read_file', 'read_files', 'outline_file', 'list_files', 'search_codebase', 'explore_codebase'],
+  read: ['read', 'read_file', 'read_files', 'outline_file', 'list_files', 'search_codebase', 'explore_codebase', 'execute_code_mode', 'code_mode'],
 };
 
 /**
