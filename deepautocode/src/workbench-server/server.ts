@@ -221,7 +221,9 @@ export async function createWorkbenchServer(options?: {
 }) {
   const dataRoot = options?.storageDir
     ? path.resolve(options.storageDir, '..')
-    : path.join(REPO_ROOT, '.deepautocode-data');
+    : process.env.DEEPAUTOCODE_DATA_DIR
+      ? path.resolve(process.env.DEEPAUTOCODE_DATA_DIR)
+      : path.join(REPO_ROOT, '.deepautocode-data');
   const storageDir = options?.storageDir ?? path.join(dataRoot, 'agent-runtime');
   const emptyWorkspaceDir = path.join(dataRoot, 'empty-workspace');
   await fs.mkdir(emptyWorkspaceDir, { recursive: true });

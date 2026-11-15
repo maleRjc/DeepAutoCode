@@ -9,6 +9,8 @@ node_modules/
 dist/
 **/dist/
 build/out/
+release/
+**/release/
 
 # Runtime & user session data (contains local secrets, SSH mirrors, sessions)
 .deepautocode-data/

@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_draft:
+        description: 'Release as Draft (发布为草稿)'
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Prerelease (预发布版本)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build & Test @deepautocode/agent
+        working-directory: deepautocode-agent
+        run: |
+          npm install
+          npm run build
+          npm test
+
+      - name: Build DeepAutoCode IDE
+        working-directory: deepautocode
+        run: |
+          npm install --ignore-scripts
+          npm run build
+

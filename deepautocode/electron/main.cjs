@@ -14,9 +14,20 @@ try {
   // ignore
 }
 
+function getIdeDataDir() {
+  if (process.env.DEEPAUTOCODE_DATA_DIR) {
+    return path.resolve(process.env.DEEPAUTOCODE_DATA_DIR);
+  }
+  const localDevData = path.resolve(__dirname, '../.deepautocode-data');
+  if (!app.isPackaged) {
+    return localDevData;
+  }
+  return path.join(app.getPath('userData'), 'deepautocode-data');
+}
+
 function readSavedIdeTheme() {
   try {
-    const settingsPath = path.resolve(__dirname, '../.deepautocode-data/ide-settings.json');
+    const settingsPath = path.join(getIdeDataDir(), 'ide-settings.json');
     if (fs.existsSync(settingsPath)) {
       const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
       const t = parsed?.editor?.theme;
@@ -61,9 +72,21 @@ async function ensureBackendServer() {
     // start embedded server
   }
 
+  const dataDir = getIdeDataDir();
+  process.env.DEEPAUTOCODE_DATA_DIR = dataDir;
+  if (!process.env.DEEPAUTOCODE_REPO_ROOT) {
+    const parentRoot = path.resolve(__dirname, '../..');
+    if (fs.existsSync(path.join(parentRoot, '.tools'))) {
+      process.env.DEEPAUTOCODE_REPO_ROOT = parentRoot;
+    }
+  }
+
   const serverModulePath = path.resolve(__dirname, '../dist/src/workbench-server/server.js');
   const { createWorkbenchServer } = await import(pathToFileURL(serverModulePath).href);
-  serverHandle = await createWorkbenchServer({ port: preferredPort });
+  serverHandle = await createWorkbenchServer({
+    port: preferredPort,
+    storageDir: path.join(dataDir, 'agent-runtime'),
+  });
   return serverHandle.url;
 }
 

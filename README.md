@@ -18,6 +18,12 @@
 - **Remote SSH**：镜像树 + 打开强制 pull + 写入 push；占位 stub 不再伪装成已同步内容
 - **安全基线**：路径边界、审批卡、CSP、加密凭据存储
 
+## 安装包下载 (Signed Release v1.1.0)
+
+- **Windows 安装包 (EV/OV 数字签名 · 武汉定点网络技术有限责任公司)**：
+  - [GitHub Releases (`DeepAutoCode-Setup-v1.1.0.exe`)](https://github.com/maleRjc/DeepAutoCode/releases/latest)
+  - [官方镜像直链 (`DeepAutoCode-Setup-v1.1.0.exe`)](https://www.aireadcode.com/downloads/DeepAutoCode-Setup-v1.1.0.exe)
+
 ## 快速开始
 
 ### 1. 构建并测试 `deepautocode-agent`
@@ -36,6 +42,13 @@ npm run build
 npm run desktop        # 启动 Electron 桌面端 IDE
 # 或启动 Web 工作台 (默认 http://127.0.0.1:3840)
 npm run dev:workbench
+```
+
+### 3. 打包、数字签名与发布
+```bash
+cd deepautocode
+npm run build:win      # Windows 编译、组装、NSIS 打包与 signtool 数字签名
+npm run publish:win    # 上传签名安装包至 GitHub Releases 与官方下载服务器
 ```
 
 ## 许可证

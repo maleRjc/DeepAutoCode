@@ -106,8 +106,8 @@ function matchSimpleGlob(relPath: string, pattern: string): boolean {
 export class CodeModeEngine {
   private fileIndex: WorkspaceFileIndex;
 
-  constructor(private readonly cwd: string) {
-    this.fileIndex = new WorkspaceFileIndex(cwd);
+  constructor(private readonly cwd: string, fileIndex?: WorkspaceFileIndex) {
+    this.fileIndex = fileIndex ?? new WorkspaceFileIndex(cwd);
   }
 
   /**
@@ -203,7 +203,8 @@ export class CodeModeEngine {
 
       outline: async (filePath: string) => {
         const full = path.isAbsolute(filePath) ? filePath : path.resolve(this.cwd, filePath);
-        return await extractCodeOutlineForPath(full);
+        const raw = await fs.readFile(full, 'utf-8');
+        return extractCodeOutlineForPath(full, raw);
       },
 
       exists: async (filePath: string) => {
